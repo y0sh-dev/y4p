@@ -52,6 +52,12 @@ y4-clipboard list 0-50 --id    # 不変IDを使用して履歴を表示
 y4-clipboard copy-to --id 42   # IPC経由で特定のアイテムを復元
 ```
 
+### 4. シェル補完
+Zsh補完は`completions/_y4clipboard`として同梱されています。`compinit`実行前に対象ディレクトリを`fpath`に追加してください。
+```zsh
+fpath+=(/path/to/y4-clipboardMN/completions)
+```
+
 ---
 
 ## コマンドリファレンス
@@ -67,6 +73,7 @@ y4-clipboard copy-to --id 42   # IPC経由で特定のアイテムを復元
 | `paste-from` | DBを介さず、現在のシステムクリップボードに直接アクセスして出力。 |
 | `delete` | 特定のレコードを永続ストレージから物理的に削除。 |
 | `wipe` | 全履歴を消去し、SQLiteのVACUUMを実行してストレージを最適化。`--force`（`-f`）が必須。 |
+| `status` | IPC経由でデーモンに稼働状況を問い合わせて表示。 |
 
 ---
 
