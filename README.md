@@ -75,7 +75,7 @@ y4-clipboard copy-to --id 42   # Restore a specific item via IPC
 | `search` | Keyword scan across history using SQLite indexing. |
 | `paste-from` | Direct OS clipboard access, bypassing the database. |
 | `delete` | Physically remove a specific record from storage. |
-| `wipe` | Purge all history and optimize storage via VACUUM. |
+| `wipe` | Purge all history and optimize storage via VACUUM. Non-interactive (no confirmation prompt) — requires `--force`/`-f`; runs without it fail with exit code 1. |
 
 ---
 
