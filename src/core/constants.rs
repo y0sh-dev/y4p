@@ -16,6 +16,9 @@ pub const IPC_CMD_STATUS:  u8 = 0x03;
 pub const IPC_DELIMITER:   u8 = b'\n';
 
 pub const RECONNECT_DELAY_MS: u64 = 500;
+// Bounds the CLI's read of a `status` response so a stuck/misbehaving
+// daemon can't hang the client indefinitely.
+pub const IPC_STATUS_TIMEOUT_MS: u64 = 1000;
 
 // Filename of the IPC control socket. Resolution of the *directory* it lives
 // in (XDG_RUNTIME_DIR preferred, /tmp as a last-resort fallback) is handled

@@ -28,7 +28,10 @@ pub fn print_help() {
     println!("\nCORE COMMANDS:");
     println!("    daemon             - Initialize background monitor and IPC socket listener.");
     println!("                         Flags: --verbose (-v).");
-    
+
+    println!("    status             - Query the running daemon and print its status.");
+    println!("                         No flags or arguments.");
+
     println!("    list [range]       - Display history metadata. Supports range (e.g., 0-50).");
     println!("                         Flags: --raw (-R), --full (-A), --id (-i).");
     

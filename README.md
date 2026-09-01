@@ -61,6 +61,12 @@ y4-clipboard list 0-50 --id    # List history with persistent IDs
 y4-clipboard copy-to --id 42   # Restore a specific item via IPC
 ```
 
+### 4. Shell Completions
+Zsh completion is provided at `completions/_y4clipboard`. Add its directory to your `fpath` before `compinit`, e.g.:
+```zsh
+fpath+=(/path/to/y4-clipboardMN/completions)
+```
+
 ---
 
 ## Command Reference
@@ -76,6 +82,7 @@ y4-clipboard copy-to --id 42   # Restore a specific item via IPC
 | `paste-from` | Direct OS clipboard access, bypassing the database. |
 | `delete` | Physically remove a specific record from storage. |
 | `wipe` | Purge all history and optimize storage via VACUUM. Requires `--force`/`-f`. |
+| `status` | Query the running daemon via IPC and print its status. |
 
 ---
 

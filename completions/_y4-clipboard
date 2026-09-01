@@ -8,6 +8,7 @@ _y4_clipboard() {
     local -a _y4_subcommands
     _y4_subcommands=(
         'daemon:Monitor clipboard changes in background'
+        'status:Query the running daemon and print its status'
         'list:Display history metadata records'
         'search:Keyword scan across text history'
         'copy-to:Restore a history entry to system clipboard'
