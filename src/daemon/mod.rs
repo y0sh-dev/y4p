@@ -3,17 +3,24 @@
 
 // src/daemon/mod.rs
 
+mod ipc;
+mod metrics;
+mod worker;
+
 use crate::storage::{ClipboardDb, ContentLocation};
 use crate::wayland;
-use crate::wayland::state::{WaylandState, ClipboardJob, SourceMetadata, SourcePayload};
+use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
 use crate::core::constants::*;
 use crate::core::SocketGuard;
+use ipc::Command;
+use metrics::DaemonMetrics;
+use worker::DbWorker;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::Duration;
-use std::sync::mpsc;
+use std::sync::Arc;
 
 /// Initialize and run the clipboard daemon with a unified, high-performance event loop.
 ///
@@ -24,6 +31,9 @@ use std::sync::mpsc;
 /// accurate status instead of the previous unconditional "daemon process
 /// terminated." (which was printed even on a startup failure that never
 /// served a single request).
+// `mut` is unused post-refactor (ownership moves straight into `DbWorker`)
+// but kept to preserve this fn's exact external signature.
+#[allow(unused_mut)]
 pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
     let socket_path = crate::core::get_socket_path();
 
@@ -31,7 +41,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         let _ = stream.write_all(&[IPC_CMD_EXIT]);
         std::thread::sleep(Duration::from_millis(RECONNECT_DELAY_MS));
     }
-    
+
     let _ = fs::remove_file(&socket_path);
 
     // BUGFIX: was `.expect(...)`, which — combined with `panic = "abort"` in
@@ -49,28 +59,15 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
     let _ = listener.set_nonblocking(true);
     let _guard = SocketGuard::new(socket_path);
 
-    // Initialize Database Worker Thread
-    let (job_tx, job_rx) = mpsc::channel::<ClipboardJob>();
-    let is_verbose = verbose;
-
-    std::thread::spawn(move || {
-        // The worker thread owns the mutable reference to the database.
-        while let Ok(job) = job_rx.recv() {
-            match db.insert_with_hash(&job.mime, &job.data, &job.hash) {
-                Ok(_) if is_verbose => println!("{}", log_save(&job.mime, job.data.len())),
-                Ok(_) => {}
-                Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { libc::malloc_trim(0); }
-        }
-    });
+    let metrics = Arc::new(DaemonMetrics::new());
+    let writer = DbWorker::spawn(db, metrics.clone(), verbose);
 
     let (conn, mut event_queue) = wayland::create_connection();
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
-    // Initialize state with the job sender and a secondary DB handle for reads.
+    // Read-side connection, separate from the worker's writer connection.
+    // WAL mode lets the two run concurrently without any in-process lock.
     let read_db = match ClipboardDb::open() {
         Ok(d) => d,
         Err(e) => {
@@ -78,10 +75,10 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
             return false;
         }
     };
-    let mut state = WaylandState::new_daemon(read_db, job_tx, verbose);
-    
+    let mut state = WaylandState::new_daemon(read_db, writer.sender(), verbose);
+
     // Pre-load last data for deduplication.
-    state.last_data = state.db.as_ref().and_then(|d| d.lock().ok()).and_then(|d| d.get_latest_data()).unwrap_or_default();
+    state.last_data = state.db.as_ref().and_then(|d| d.get_latest_data()).unwrap_or_default();
     state.target_mime = DEFAULT_MIME.to_string();
 
     if event_queue.roundtrip(&mut state).is_err() {
@@ -120,25 +117,14 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
 
         if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 
-        // 3. IPC Ingress Handling
+        // IPC Ingress Handling: Status replies inline via `accept_and_dispatch`;
+        // Exit/Restore are dispatched here, same as before.
         if poll_fds[1].revents & libc::POLLIN != 0
-            && let Ok((stream, _)) = listener.accept() {
-                let mut reader = std::io::BufReader::new(stream);
-                let mut buf = Vec::new();
-
-                if reader.read_until(IPC_DELIMITER, &mut buf).is_ok()
-                    && buf.len() > 1 {
-                        let n = buf.len() - 1; 
-                        match buf[0] {
-                            IPC_CMD_EXIT => crate::core::request_exit(),
-                            IPC_CMD_RESTORE => {
-                                let id_str = String::from_utf8_lossy(&buf[1..n]);
-                                if let Ok(real_id) = id_str.trim().parse::<i64>() {
-                                    handle_restore_request(&mut state, &qh, real_id, &conn);
-                                }
-                            }
-                            _ => {}
-                        }
+            && let Some(cmd) = ipc::accept_and_dispatch(&listener, || metrics.format_status()) {
+                match cmd {
+                    Command::Exit => crate::core::request_exit(),
+                    Command::Restore(real_id) => handle_restore_request(&mut state, &qh, real_id, &conn, &metrics),
+                    Command::Status => {}
                 }
         }
 
@@ -173,7 +159,7 @@ fn bind_data_device(
     }
 }
 
-/// Serve a historical record with narrow lock scope and broad MIME compatibility.
+/// Serve a historical record with broad MIME compatibility.
 ///
 /// Kernel-level egress: uses `locate_content` instead of always
 /// materializing the payload into memory. Large binaries (images) living in
@@ -184,14 +170,14 @@ fn bind_data_device(
 /// (text) still go through the existing `get_content_by_id` (`Vec<u8>`) path,
 /// since by construction (see `insert_with_hash`) they're never the
 /// large-payload case this exists for.
-fn handle_restore_request(state: &mut WaylandState, qh: &wayland_client::QueueHandle<WaylandState>, real_id: i64, conn: &wayland_client::Connection) {
-    let resolved = {
-        if let Some(ref db_mutex) = state.db {
-            if let Ok(db) = db_mutex.lock() {
-                db.locate_content(real_id)
-            } else { None }
-        } else { None }
-    };
+fn handle_restore_request(
+    state: &mut WaylandState,
+    qh: &wayland_client::QueueHandle<WaylandState>,
+    real_id: i64,
+    conn: &wayland_client::Connection,
+    metrics: &DaemonMetrics,
+) {
+    let resolved = state.db.as_ref().and_then(|db| db.locate_content(real_id));
 
     if let Some((mime, location)) = resolved
         && let Some(ref manager) = state.manager {
@@ -199,13 +185,10 @@ fn handle_restore_request(state: &mut WaylandState, qh: &wayland_client::QueueHa
 
         let payload = match location {
             ContentLocation::InlineBlob(id) => {
-                let data = {
-                    if let Some(ref db_mutex) = state.db {
-                        if let Ok(db) = db_mutex.lock() {
-                            db.get_content_by_id(id).map(|(_, d)| d)
-                        } else { None }
-                    } else { None }
-                }.unwrap_or_default();
+                let data = state.db.as_ref()
+                    .and_then(|db| db.get_content_by_id(id))
+                    .map(|(_, d)| d)
+                    .unwrap_or_default();
                 SourcePayload::Owned(data)
             }
             ContentLocation::CacheFile(path) => SourcePayload::File(path),
@@ -214,7 +197,7 @@ fn handle_restore_request(state: &mut WaylandState, qh: &wayland_client::QueueHa
         let meta = SourceMetadata { mime: mime.clone(), payload };
 
         let source = manager.create_data_source(qh, meta);
-        
+
         // Broadcaster Strategy: Advertise multiple compatible MIMEs
         source.offer(mime.clone());
 
@@ -239,8 +222,9 @@ fn handle_restore_request(state: &mut WaylandState, qh: &wayland_client::QueueHa
         }
 
         state.current_source = Some(source);
-        if state.verbose { 
-            println!("{}", log_restore(real_id as usize)); 
+        metrics.record_egress();
+        if state.verbose {
+            println!("{}", log_restore(real_id as usize));
         }
     }
 }
