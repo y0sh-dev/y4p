@@ -68,10 +68,7 @@ pub fn wipe_run(args: &[String], db: &mut ClipboardDb) {
         return;
     }
 
-    // Non-interactive by design: 'wipe' never prompts for confirmation, so it
-    // is safe to call from scripts/pipelines without stdin attached.
-    // --force/-f is mandatory instead — it is the only way to authorize this
-    // irreversible operation.
+    // --force is mandatory; wipe never prompts (script-safe).
     if !ctx.force {
         eprintln!("{}refusing to wipe without confirmation.", LOG_ERROR);
         eprintln!("usage: y4-clipboard wipe --force");
