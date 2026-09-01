@@ -6,7 +6,6 @@
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
 use crate::cli::utils::ArgContext;
-use std::io::{self, Write};
 
 /// Remove a history record by its MRU index or persistent database ID.
 pub fn delete_run(args: &[String], db: &mut ClipboardDb) {
@@ -69,21 +68,14 @@ pub fn wipe_run(args: &[String], db: &mut ClipboardDb) {
         return;
     }
 
+    // Non-interactive by design: 'wipe' never prompts for confirmation, so it
+    // is safe to call from scripts/pipelines without stdin attached.
+    // --force/-f is mandatory instead — it is the only way to authorize this
+    // irreversible operation.
     if !ctx.force {
-        print!("confirm database purge? [y/N]: ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            eprintln!("{}input stream read failure.", LOG_ERROR);
-            return;
-        }
-
-        let res = input.trim().to_lowercase();
-        if res != "y" && res != "yes" {
-            println!("{}wipe operation aborted.", LOG_INFO);
-            return;
-        }
+        eprintln!("{}refusing to wipe without confirmation.", LOG_ERROR);
+        eprintln!("usage: y4-clipboard wipe --force");
+        std::process::exit(1);
     }
 
     match db.wipe() {
