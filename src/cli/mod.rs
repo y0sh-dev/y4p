@@ -12,6 +12,7 @@ mod store;
 mod search;
 mod cleaning;
 mod help;
+mod status;
 pub mod formatter;
 mod utils;
 
@@ -61,6 +62,7 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
 
         // --- Utilities ---
         "paste-from" => paste_from::run(args),
+        "status"     => status::run(args),
         "help"       => help::print_help(),
         "version"    => help::print_version(),
 
