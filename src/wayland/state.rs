@@ -52,7 +52,11 @@ pub struct WaylandState {
     pub seat: Option<WlSeat>,
     pub seat_id: Option<u32>,
     pub device: Option<ExtDataControlDeviceV1>,
-    pub db: Option<Arc<Mutex<ClipboardDb>>>,
+    // Only ever touched from the thread that owns `WaylandState` (the main
+    // event loop), so no Arc<Mutex<_>> is needed here — see daemon::mod for
+    // the separate, single-writer connection that runs concurrently under
+    // SQLite's WAL mode.
+    pub db: Option<ClipboardDb>,
     pub job_tx: Option<mpsc::Sender<ClipboardJob>>,
     pub verbose: bool,
     pub target_mime: String,
@@ -71,7 +75,7 @@ impl WaylandState {
             seat: None,
             seat_id: None,
             device: None,
-            db: Some(Arc::new(Mutex::new(db))),
+            db: Some(db),
             job_tx: Some(job_tx),
             verbose,
             target_mime: String::new(),

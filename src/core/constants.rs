@@ -12,6 +12,7 @@ pub const SQLITE_TIMEOUT_MS: u64 = 5000;
 // --- IPC Protocol ---
 pub const IPC_CMD_RESTORE: u8 = 0x01;
 pub const IPC_CMD_EXIT:    u8 = 0x02;
+pub const IPC_CMD_STATUS:  u8 = 0x03;
 pub const IPC_DELIMITER:   u8 = b'\n';
 
 pub const RECONNECT_DELAY_MS: u64 = 500;
