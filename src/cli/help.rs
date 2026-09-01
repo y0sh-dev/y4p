@@ -52,8 +52,7 @@ pub fn print_help() {
     println!("    delete <target>    - Physically remove a specific record from persistent storage.");
     println!("                         Flags: --id (-i).");
     
-    println!("    wipe               - Purge all history and execute SQLite VACUUM. Non-interactive");
-    println!("                         (no confirmation prompt); fails without --force.");
+    println!("    wipe               - Purge all history and execute SQLite VACUUM.");
     println!("                         Flags: --force (-f) [REQUIRED].");
 
     println!("\nGLOBAL OPTIONS:");
