@@ -40,7 +40,7 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
         eprintln!("{}invalid command format: '{}'", LOG_ERROR, cmd);
         // BUGFIX: was "y1-clip" — leftover placeholder name, inconsistent
         // with the actual product name used everywhere else.
-        println!("usage: y4-clipboard <command> [options]");
+        println!("usage: y4p <command> [options]");
         std::process::exit(1);
     }
 
@@ -68,7 +68,7 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
 
         _ => {
             eprintln!("{}unknown command: '{}'", LOG_ERROR, cmd);
-            println!("consult 'y4-clipboard help' for valid operations.");
+            println!("consult 'y4p help' for valid operations.");
             std::process::exit(1);
         }
     }

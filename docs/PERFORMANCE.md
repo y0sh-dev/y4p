@@ -1,7 +1,7 @@
 
-# y4-clipboardMN: Optimization Philosophy and Implementation
+# y4p: Optimization Philosophy and Implementation
 
-This document defines the concept of "Optimization" within the `y4-clipboardMN` project and details how the system interacts with hardware to minimize friction when handling massive datasets (e.g., 70MB+ lossless images).
+This document defines the concept of "Optimization" within the `y4p` project and details how the system interacts with hardware to minimize friction when handling massive datasets (e.g., 70MB+ lossless images).
 
 ---
 
@@ -92,7 +92,7 @@ The integration of these strategies results in the following streamlined data pa
           /                         \
     (Text/Meta)                 (Binary Assets)
          |                             |
-    [ SQLite 3 ]               [ ~/.cache/y4-clipboard/ ]
+    [ SQLite 3 ]               [ ~/.cache/y4p/ ]
 ```
 
 ---

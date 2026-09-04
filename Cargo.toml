@@ -1,6 +1,6 @@
 [package]
-name = "y4-clipboard"
-version = "1.0.0"
+name = "y4p"
+version = "0.1.0"
 edition = "2024"
 description = "A robust, unified clipboard manager for Wayland with SQLite storage."
 license = "GPL-3.0-or-later"

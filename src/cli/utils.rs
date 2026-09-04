@@ -106,7 +106,7 @@ pub fn parse_range(arg: Option<&String>, default_limit: usize) -> Result<RangeSe
             (Some(start), Some(end)) => Ok(RangeSelection::Range(start.min(end), start.max(end))),
             // BUGFIX: was `start + default_limit`, an unchecked usize
             // addition. `parse::<usize>()` happily accepts values close to
-            // usize::MAX (e.g. "y4-clipboard list 18446744073709551615-"),
+            // usize::MAX (e.g. "y4p list 18446744073709551615-"),
             // so this could overflow: a panic in debug builds, silent
             // wraparound in release. `saturating_add` makes the ceiling
             // "however far a usize can go" instead of undefined/panicking

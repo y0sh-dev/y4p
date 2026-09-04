@@ -22,7 +22,7 @@ pub fn run(args: &[String], db: &ClipboardDb) {
     if ctx.positionals.is_empty() {
         eprintln!("{}missing required search keyword.", LOG_ERROR);
         // BUGFIX: was "y1-clip" — leftover placeholder name.
-        println!("usage: y4-clipboard search <keyword> [--raw | -R]");
+        println!("usage: y4p search <keyword> [--raw | -R]");
         return;
     }
 

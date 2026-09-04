@@ -1,7 +1,7 @@
 
-# y4-clipboardMN Architecture
+# y4p Architecture
 
-This document provides a detailed overview of the internal mechanisms of `y4-clipboardMN` and the design choices made to ensure stability and performance in a Wayland environment.
+This document provides a detailed overview of the internal mechanisms of `y4p` and the design choices made to ensure stability and performance in a Wayland environment.
 
 ---
 
@@ -50,7 +50,7 @@ Text data is stored in a **SQLite 3** database for fast searching, while large b
 
 We generate a unique "fingerprint" for every piece of data using the **SHA3-256** algorithm.
 - If identical content is copied, the system simply updates the "Last Used" timestamp of the existing record (MRU promotion).
-- For images, the hash value is used as the filename in `~/.cache/y4-clipboard/`. This ensures that duplicate images do not occupy redundant disk space.
+- For images, the hash value is used as the filename in `~/.cache/y4p/`. This ensures that duplicate images do not occupy redundant disk space.
 
 ```rust
 // Check for existing content

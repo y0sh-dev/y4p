@@ -53,7 +53,7 @@ pub fn get_cache_dir() -> PathBuf {
         PathBuf::from(".")
     };
 
-    path.push(DB_DIR_NAME); // "y4-clipboard"
+    path.push(DB_DIR_NAME); // "y4p"
 
     if !path.exists() {
         let mut builder = DirBuilder::new();
@@ -66,7 +66,7 @@ pub fn get_cache_dir() -> PathBuf {
 /// Resolve the path of the IPC control socket.
 ///
 /// SECURITY FIX: the previous implementation always placed the socket at a
-/// predictable path directly under `/tmp` (`/tmp/y4-clipboard.<uid>.sock`).
+/// predictable path directly under `/tmp` (`/tmp/y4p.<uid>.sock`).
 /// `/tmp` is world-writable; a predictable path in a world-writable
 /// directory is a classic local symlink/TOCTOU target — another local user
 /// can pre-place a symlink at that exact path before the daemon starts, and

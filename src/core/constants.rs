@@ -4,8 +4,8 @@
 // src/core/constants.rs
 
 // --- System & Storage Configuration ---
-pub const DB_DIR_NAME:  &str = "y4-clipboard";
-pub const DB_FILE_NAME: &str = "y4_clipboard.sqlite";
+pub const DB_DIR_NAME:  &str = "y4p";
+pub const DB_FILE_NAME: &str = "y4p.sqlite";
 pub const MAX_HISTORY: usize = 256;
 pub const SQLITE_TIMEOUT_MS: u64 = 5000;
 
@@ -24,7 +24,7 @@ pub const IPC_STATUS_TIMEOUT_MS: u64 = 1000;
 // in (XDG_RUNTIME_DIR preferred, /tmp as a last-resort fallback) is handled
 // by `crate::core::get_socket_path()`, since that decision depends on
 // runtime environment, not just a fixed string.
-pub const SOCKET_FILE_NAME: &str = "y4-clipboard.sock";
+pub const SOCKET_FILE_NAME: &str = "y4p.sock";
 
 // --- Security & Privacy Configuration ---
 // Clipboard security: MIME types to exclude from persistent storage
@@ -80,7 +80,7 @@ pub const INTERFACE_SEAT:    &str = "wl_seat";
 pub const LOG_INFO:  &str = "info: ";
 pub const LOG_ERROR: &str = "error: ";
 
-pub const MSG_DAEMON_START: &str = "starting y4-clipboard daemon...";
+pub const MSG_DAEMON_START: &str = "starting y4p daemon...";
 // Emitted once the daemon has actually bound the Wayland data-control
 // manager + seat and entered its serving loop. Distinct from
 // MSG_DAEMON_START so a startup *failure* (bad socket bind, no compositor,

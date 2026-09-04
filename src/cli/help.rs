@@ -5,7 +5,7 @@
 
 /// Display the application version and primary system description.
 pub fn print_version() {
-    println!("y4-clipboard v1.0.0");
+    println!("y4p v1.0.0");
     println!("Unified Wayland Clipboard Infrastructure.");
 }
 
@@ -15,15 +15,15 @@ pub fn print_help() {
 
     // BUGFIX: every example below previously invoked "y4-clip", a binary
     // name that does not exist anywhere else in the project — Cargo.toml
-    // names the package (and therefore the built binary) "y4-clipboard",
+    // names the package (and therefore the built binary) "y4p",
     // matching the README's own install instructions
-    // (`cp target/release/y4-clipboard /usr/local/bin/`). Other files used
+    // (`cp target/release/y4p /usr/local/bin/`). Other files used
     // yet a *third*, different placeholder ("y1-clip"; fixed separately in
     // cli/mod.rs, cli/daemon.rs, cli/search.rs). Every copy-pasted example
     // command in this help text would have failed with "command not
-    // found". All examples below now consistently say "y4-clipboard".
+    // found". All examples below now consistently say "y4p".
     println!("\nUSAGE:");
-    println!("    y4-clipboard <COMMAND> [ARGS] [OPTIONS]");
+    println!("    y4p <COMMAND> [ARGS] [OPTIONS]");
 
     println!("\nCORE COMMANDS:");
     println!("    daemon             - Initialize background monitor and IPC socket listener.");
@@ -66,21 +66,21 @@ pub fn print_help() {
 
     println!("\nPRACTICAL EXAMPLES:");
     println!("    # 1. High-speed selection with fzf using Stable IDs:");
-    println!("    $ y4-clipboard list 0-100 --raw --id | fzf | awk '{{print $1}}' | xargs -r y4-clipboard copy-to --id");
+    println!("    $ y4p list 0-100 --raw --id | fzf | awk '{{print $1}}' | xargs -r y4p copy-to --id");
     
     println!("\n    # 2. Extracting binary content from history:");
-    println!("    $ y4-clipboard show 12 --id --raw > recovered_asset.webp");
+    println!("    $ y4p show 12 --id --raw > recovered_asset.webp");
     
     println!("\n    # 3. Manual ingestion with custom MIME:");
-    println!("    $ cat data.json | y4-clipboard store application/json");
+    println!("    $ cat data.json | y4p store application/json");
 
     println!("\nTECHNICAL NOTES:");
-    println!("    - Storage: Secured at ~/.local/share/y4-clipboard/ (mode 600).");
-    // BUGFIX: was documented as a fixed "/tmp/y4-clipboard.<uid>.sock" path;
+    println!("    - Storage: Secured at ~/.local/share/y4p/ (mode 600).");
+    // BUGFIX: was documented as a fixed "/tmp/y4p.<uid>.sock" path;
     // the socket now prefers $XDG_RUNTIME_DIR (see core::get_socket_path)
     // and only falls back to /tmp when no session runtime dir is set.
-    println!("    - IPC: Communication via $XDG_RUNTIME_DIR/y4-clipboard/y4-clipboard.sock");
-    println!("           (falls back to /tmp/y4-clipboard.<uid>.sock if $XDG_RUNTIME_DIR is unset).");
+    println!("    - IPC: Communication via $XDG_RUNTIME_DIR/y4p/y4p.sock");
+    println!("           (falls back to /tmp/y4p.<uid>.sock if $XDG_RUNTIME_DIR is unset).");
     // BUGFIX: was documented as "MD5-based deduplication" — the actual
     // implementation (storage/mod.rs, matching the README/ARCHITECTURE.md)
     // uses SHA3-256, not MD5.

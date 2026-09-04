@@ -24,7 +24,7 @@ pub fn run(args: &[String], db: ClipboardDb) {
         // BUGFIX: was "y1-clip", a leftover placeholder inconsistent with
         // the actual binary/package name used everywhere else (README,
         // --version, DB_DIR_NAME, ...).
-        println!("usage: y4-clipboard daemon [--verbose | -v]");
+        println!("usage: y4p daemon [--verbose | -v]");
         return;
     }
 

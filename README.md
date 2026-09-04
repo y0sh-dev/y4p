@@ -1,16 +1,16 @@
 
 <div align="center">
 
-# y4-clipboardMN
+# y4p
 
 **Unified Wayland Clipboard Infrastructure.**
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/y0sh-dev/y4-clipboardMN/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.1.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
-`y4-clipboardMN` is a high-performance, standalone clipboard manager engineered for Wayland. It consolidates monitoring (Ingress), serving (Egress), and persistence into a single binary, eliminating the instability inherent in fragmented toolchains.
+`y4p` is a high-performance, standalone clipboard manager engineered for Wayland. It consolidates monitoring (Ingress), serving (Egress), and persistence into a single binary, eliminating the instability inherent in fragmented toolchains.
 
 Built with a focus on **Absolute Integrity** and **Resource Efficiency**, it handles everything from tiny text snippets to massive 70MB+ lossless images with zero-latency response.
 
@@ -21,7 +21,7 @@ Built with a focus on **Absolute Integrity** and **Resource Efficiency**, it han
 ## Design Philosophy
 
 ### 1. Unified Lifecycle Management
-By integrating the monitor and the provider into a single daemon process, `y4-clipboardMN` eliminates synchronization drift and zombie processes. Communication is handled via a strict IPC model over Unix Domain Sockets.
+By integrating the monitor and the provider into a single daemon process, `y4p` eliminates synchronization drift and zombie processes. Communication is handled via a strict IPC model over Unix Domain Sockets.
 
 ### 2. High-Capacity Resilience
 Engineered to handle extreme payloads. Utilizing page-aligned memory buffers and single-pass SHA3-256 hashing, the system processes large binary data at near-kernel speeds while maintaining a minimal memory footprint.
@@ -34,7 +34,7 @@ Powered by SQLite in WAL mode. The hybrid storage strategy ensures that metadata
 ## Key Features
 
 - **Unified Daemon**: Centralized management of all clipboard operations.
-- **Hybrid Storage**: Metadata and text in SQLite; large binaries in `~/.cache/y4-clipboard/`.
+- **Hybrid Storage**: Metadata and text in SQLite; large binaries in `~/.cache/y4p/`.
 - **Stable ID System**: Persistent database identifiers for seamless integration with external scripts (e.g., Rofi, Fzf).
 - **Strict CLI**: A "Prosecutor-style" argument parser that rejects malformed or unauthorized inputs.
 - **Security Focused**: Enforced filesystem permissions (700/600) and sensitive MIME type filtering.
@@ -46,25 +46,25 @@ Powered by SQLite in WAL mode. The hybrid storage strategy ensures that metadata
 ### 1. Build from Source
 ```bash
 cargo build --release
-sudo cp target/release/y4-clipboard /usr/local/bin/
+sudo cp target/release/y4p /usr/local/bin/
 ```
 
 ### 2. Start the Daemon
 Initialize the monitor and IPC listener:
 ```bash
-y4-clipboard daemon
+y4p daemon
 ```
 
 ### 3. Basic Operations
 ```bash
-y4-clipboard list 0-50 --id    # List history with persistent IDs
-y4-clipboard copy-to --id 42   # Restore a specific item via IPC
+y4p list 0-50 --id    # List history with persistent IDs
+y4p copy-to --id 42   # Restore a specific item via IPC
 ```
 
 ### 4. Shell Completions
-Zsh completion is provided at `completions/_y4clipboard`. Add its directory to your `fpath` before `compinit`, e.g.:
+Zsh completion is provided at `completions/_y4p`. Add its directory to your `fpath` before `compinit`, e.g.:
 ```zsh
-fpath+=(/path/to/y4-clipboardMN/completions)
+fpath+=(/path/to/y4p/completions)
 ```
 
 ---
@@ -107,5 +107,5 @@ Copyright (c) 2026 yosana (y0sh-dev)
 ## AI Usage Disclosure
 
 For our policy on using Generative AI (LLMs), please refer to 
-the shared guidelines documented in [AI.md](AI.md).
+the shared guidelines documented in [AI.md](docs/AI_POLICY.md).
 
