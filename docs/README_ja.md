@@ -1,9 +1,9 @@
 
-# y4-clipboardMN
+# y4p
 
 **Wayland統合型クリップボード・インフラストラクチャ**
 
-`y4-clipboardMN` は、Wayland環境向けに設計された高性能かつスタンドアロンのクリップボードマネージャーです。監視（Ingress）、提供（Egress）、および永続化（Persistence）を単一のバイナリに統合し、断片化されたツールチェーンに起因する不安定性を排除します。
+`y4p` は、Wayland環境向けに設計された高性能かつスタンドアロンのクリップボードマネージャーです。監視（Ingress）、提供（Egress）、および永続化（Persistence）を単一のバイナリに統合し、断片化されたツールチェーンに起因する不安定性を排除します。
 
 「絶対的な整合性」と「リソース効率」に焦点を当てて構築されており、数バイトのテキストから、70MBを超える巨大なロスレス画像まで、ゼロ・レイテンシのレスポンスで処理します。
 
@@ -18,7 +18,7 @@
 極限の負荷に耐える設計を採用。ページアライメント（4KB境界）されたメモリバッファと、シングルパスでのSHA3-256ハッシュ計算により、メモリフットプリントを最小限に抑えつつ、カーネル空間に近い速度で巨大なバイナリデータを処理します。
 
 ### 3. 鉄壁の永続化
-SQLite 3（WALモード）をバックエンドに採用。ハイブリッドストレージ戦略により、メタデータとテキストは高速なインデックス検索が可能なデータベースへ、巨大なバイナリ資産は重複排除された専用のファイルシステムキャッシュ（`~/.cache/y4-clipboard/`）へと自動的に振り分けられます。
+SQLite 3（WALモード）をバックエンドに採用。ハイブリッドストレージ戦略により、メタデータとテキストは高速なインデックス検索が可能なデータベースへ、巨大なバイナリ資産は重複排除された専用のファイルシステムキャッシュ（`~/.cache/y4p/`）へと自動的に振り分けられます。
 
 ---
 
@@ -37,25 +37,25 @@ SQLite 3（WALモード）をバックエンドに採用。ハイブリッドス
 ### 1. ソースからのビルド
 ```bash
 cargo build --release
-sudo cp target/release/y4-clipboard /usr/local/bin/
+sudo cp target/release/y4p /usr/local/bin/
 ```
 
 ### 2. デーモンの起動
 監視およびIPCリスナーを初期化します。
 ```bash
-y4-clipboard daemon
+y4p daemon
 ```
 
 ### 3. 基本操作
 ```bash
-y4-clipboard list 0-50 --id    # 不変IDを使用して履歴を表示
-y4-clipboard copy-to --id 42   # IPC経由で特定のアイテムを復元
+y4p list 0-50 --id    # 不変IDを使用して履歴を表示
+y4p copy-to --id 42   # IPC経由で特定のアイテムを復元
 ```
 
 ### 4. シェル補完
-Zsh補完は`completions/_y4clipboard`として同梱されています。`compinit`実行前に対象ディレクトリを`fpath`に追加してください。
+Zsh補完は`completions/_y4p`として同梱されています。`compinit`実行前に対象ディレクトリを`fpath`に追加してください。
 ```zsh
-fpath+=(/path/to/y4-clipboardMN/completions)
+fpath+=(/path/to/y4p/completions)
 ```
 
 ---

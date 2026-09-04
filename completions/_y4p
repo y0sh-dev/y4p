@@ -1,6 +1,6 @@
-#compdef y4-clipboard
+#compdef y4p
 
-_y4_clipboard() {
+_y4p() {
     local context state state_descr line
     typeset -A opt_args
 
@@ -32,7 +32,7 @@ _y4_clipboard() {
 
     case $state in
         cmds)
-            _describe -t commands 'y4-clipboard commands' _y4_subcommands
+            _describe -t commands 'y4p commands' _y4_subcommands
             ;;
         args)
             case $words[1] in
@@ -88,4 +88,4 @@ _y4_clipboard() {
     esac
 }
 
-_y4_clipboard "$@"
+_y4p "$@"
