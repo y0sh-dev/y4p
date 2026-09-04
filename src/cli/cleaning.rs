@@ -71,7 +71,7 @@ pub fn wipe_run(args: &[String], db: &mut ClipboardDb) {
     // --force is mandatory; wipe never prompts (script-safe).
     if !ctx.force {
         eprintln!("{}refusing to wipe without confirmation.", LOG_ERROR);
-        eprintln!("usage: y4-clipboard wipe --force");
+        eprintln!("usage: y4p wipe --force");
         std::process::exit(1);
     }
 
