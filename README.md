@@ -107,5 +107,5 @@ Copyright (c) 2026 yosana (y0sh-dev)
 ## AI Usage Disclosure
 
 For our policy on using Generative AI (LLMs), please refer to 
-the shared guidelines documented in [AI.md](AI.md).
+the shared guidelines documented in [AI.md](docs/AI_POLICY.md).
 
