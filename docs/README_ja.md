@@ -79,6 +79,19 @@ fpath+=(/path/to/y4p/completions)
 
 ---
 
+## 環境変数
+
+| 変数名 | デフォルト | 説明 |
+| :--- | :--- | :--- |
+| `Y4P_MAX_HISTORY` | `256` | 保持するクリップボード履歴件数の上限。不正値・0・負数の場合はデフォルト値にフォールバック。 |
+
+```bash
+export Y4P_MAX_HISTORY=500
+y4p daemon
+```
+
+---
+
 ## 技術仕様
 
 - **Language**: Rust (Zero-cost abstractions)

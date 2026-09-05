@@ -88,6 +88,19 @@ fpath+=(/path/to/y4p/completions)
 
 ---
 
+## Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `Y4P_MAX_HISTORY` | `256` | Maximum number of clipboard records retained. Invalid, zero, or negative values fall back to the default. |
+
+```bash
+export Y4P_MAX_HISTORY=500
+y4p daemon
+```
+
+---
+
 ## Technical Specifications
 
 - **Language**: Rust (Zero-cost abstractions)
