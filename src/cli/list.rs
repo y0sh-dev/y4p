@@ -36,7 +36,8 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         }
     };
     
-    let all_items = db.fetch_metadata(MAX_HISTORY);
+    let max_history = crate::core::get_max_history();
+    let all_items = db.fetch_metadata(max_history);
     let total_stored = db.get_total_count();
     let len = all_items.len();
 
@@ -73,17 +74,18 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         return;
     }
 
-    render_list("Clipboard History", &target_items, total_stored, ctx.raw, ctx.use_id);
+    render_list("Clipboard History", &target_items, total_stored, ctx.raw, ctx.use_id, max_history);
 }
 
 /// Render metadata items in a structured table layout.
 /// Items are expected as a pair of (original_index, metadata_reference).
 pub fn render_list(
-    title: &str, 
-    items: &[IndexItem], 
-    total_stored: usize, 
+    title: &str,
+    items: &[IndexItem],
+    total_stored: usize,
     is_raw: bool,
-    use_id: bool
+    use_id: bool,
+    max_history: usize,
 ) {
     let label_width = 6;
     let total_width = WIDTH_ID + WIDTH_WHEN + WIDTH_SIZE + PREVIEW_WIDTH + label_width + (TABLE_SEP.len() * 3);
@@ -145,7 +147,7 @@ pub fn render_list(
         println!("{}", TABLE_LINE_CHAR.repeat(total_width));
         println!(
             "{}shown {} items | history: {} / {} entries", 
-            LOG_INFO, items.len(), total_stored, MAX_HISTORY
+            LOG_INFO, items.len(), total_stored, max_history
         );
     }
 }

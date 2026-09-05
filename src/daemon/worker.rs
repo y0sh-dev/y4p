@@ -17,12 +17,12 @@ pub struct DbWorker {
 }
 
 impl DbWorker {
-    pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool) -> Self {
+    pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
         let (tx, rx) = mpsc::channel::<ClipboardJob>();
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                match db.insert_with_hash(&job.mime, &job.data, &job.hash) {
+                match db.insert_with_hash(&job.mime, &job.data, &job.hash, max_history) {
                     Ok(_) => {
                         metrics.record_ingress();
                         if verbose { println!("{}", log_save(&job.mime, job.data.len())); }

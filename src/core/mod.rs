@@ -9,9 +9,21 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::core::constants::{DB_DIR_NAME, DB_FILE_NAME, SOCKET_FILE_NAME};
+use crate::core::constants::{DB_DIR_NAME, DB_FILE_NAME, SOCKET_FILE_NAME, DEFAULT_MAX_HISTORY, ENV_MAX_HISTORY};
 
 pub static SIG_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Resolve the effective history retention cap: `Y4P_MAX_HISTORY` when it
+/// parses as a positive integer, `DEFAULT_MAX_HISTORY` otherwise (unset,
+/// non-numeric, zero, or negative) — never panics, always usable.
+pub fn get_max_history() -> usize {
+    std::env::var(ENV_MAX_HISTORY)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_HISTORY)
+}
 
 /// Securely resolve and initialize the database path following XDG Data Home specs.
 /// Returns PathBuf to ensure platform-native path encoding stability.

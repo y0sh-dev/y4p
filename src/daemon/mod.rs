@@ -60,7 +60,8 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
     let _guard = SocketGuard::new(socket_path);
 
     let metrics = Arc::new(DaemonMetrics::new());
-    let writer = DbWorker::spawn(db, metrics.clone(), verbose);
+    let max_history = crate::core::get_max_history();
+    let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history);
 
     let (conn, mut event_queue) = wayland::create_connection();
     let qh = event_queue.handle();

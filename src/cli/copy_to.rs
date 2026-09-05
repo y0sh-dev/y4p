@@ -24,7 +24,7 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
     };
     let val = input_str.parse::<i64>().unwrap_or(-1);
     let real_id = if ctx.use_id { val } else {
-        let meta = db.fetch_metadata(MAX_HISTORY);
+        let meta = db.fetch_metadata(crate::core::get_max_history());
         meta.get(val as usize).map(|m| m.0).unwrap_or(-1)
     };
 

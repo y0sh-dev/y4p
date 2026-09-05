@@ -6,7 +6,13 @@
 // --- System & Storage Configuration ---
 pub const DB_DIR_NAME:  &str = "y4p";
 pub const DB_FILE_NAME: &str = "y4p.sqlite";
-pub const MAX_HISTORY: usize = 256;
+pub const DEFAULT_MAX_HISTORY: usize = 256;
+// Back-compat alias: kept so any external/out-of-scope reference to the old
+// name still resolves to the same default.
+#[allow(dead_code)]
+pub const MAX_HISTORY: usize = DEFAULT_MAX_HISTORY;
+// G-04: env var that overrides DEFAULT_MAX_HISTORY at runtime.
+pub const ENV_MAX_HISTORY: &str = "Y4P_MAX_HISTORY";
 pub const SQLITE_TIMEOUT_MS: u64 = 5000;
 
 // --- IPC Protocol ---
