@@ -13,6 +13,8 @@ pub const SQLITE_TIMEOUT_MS: u64 = 5000;
 pub const IPC_CMD_RESTORE: u8 = 0x01;
 pub const IPC_CMD_EXIT:    u8 = 0x02;
 pub const IPC_CMD_STATUS:  u8 = 0x03;
+pub const IPC_CMD_PAUSE:   u8 = 0x04;
+pub const IPC_CMD_RESUME:  u8 = 0x05;
 pub const IPC_DELIMITER:   u8 = b'\n';
 
 pub const RECONNECT_DELAY_MS: u64 = 500;
@@ -89,6 +91,8 @@ pub const MSG_DAEMON_READY: &str = "daemon operational; listening for clipboard 
 pub const MSG_DAEMON_STOP:  &str = "daemon process terminated.";
 pub const MSG_DAEMON_START_FAILED: &str = "daemon failed to start (see error above).";
 pub const MSG_WAYLAND_CONN_FAIL: &str = "failed to connect to wayland compositor. is DISPLAY/WAYLAND_DISPLAY set?";
+pub const MSG_MONITOR_PAUSED:  &str = "clipboard monitoring paused.";
+pub const MSG_MONITOR_RESUMED: &str = "clipboard monitoring resumed.";
 
 pub fn log_save(mime: &str, size: usize) -> String {
     format!("{}saved: {} ({} bytes)", LOG_INFO, mime, size)

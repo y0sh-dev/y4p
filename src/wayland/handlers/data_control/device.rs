@@ -27,6 +27,11 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 return;
             }
 
+            // Private mode: bypass ingestion entirely (no offer.receive, no DB Worker job).
+            if state.paused {
+                return;
+            }
+
             let Some(offer) = id else { return };
 
             // Extract all available MIME types for this specific offer

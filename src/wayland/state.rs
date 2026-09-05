@@ -65,6 +65,9 @@ pub struct WaylandState {
     pub provider_locks: u32,
     pub selection_received: bool,
     pub current_source: Option<ExtDataControlSourceV1>,
+    // Private mode: same single-thread-owned field as the rest of this
+    // struct (see `db` above), toggled by IPC Pause/Resume.
+    pub paused: bool,
 }
 
 impl WaylandState {
@@ -84,6 +87,7 @@ impl WaylandState {
             provider_locks: 0,
             selection_received: false,
             current_source: None,
+            paused: false,
         }
     }
 
@@ -103,6 +107,7 @@ impl WaylandState {
             provider_locks: 0,
             selection_received: false,
             current_source: None,
+            paused: false,
         }
     }
 }

@@ -40,14 +40,17 @@ impl DaemonMetrics {
         self.last_event_at_ms.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// Structured status text for IPC `Command::Status` responses.
-    pub fn format_status(&self) -> String {
+    /// Structured status text for IPC `Command::Status` responses. `paused`
+    /// comes from `WaylandState` (private mode), which this type has no
+    /// access to on its own.
+    pub fn format_status(&self, paused: bool) -> String {
         let last = self.last_event_at_ms.load(Ordering::Relaxed);
         format!(
-            "uptime_ms={} ingress={} egress={} last_event_ms_ago={}\n",
+            "uptime_ms={} ingress={} egress={} paused={} last_event_ms_ago={}\n",
             now_ms() - self.started_at_ms,
             self.ingress_count.load(Ordering::Relaxed),
             self.egress_count.load(Ordering::Relaxed),
+            paused,
             if last == 0 { -1 } else { now_ms() - last },
         )
     }
