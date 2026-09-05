@@ -39,7 +39,8 @@ pub fn run(args: &[String], db: &ClipboardDb) {
     // "Nth search hit" index, so a displayed index here means the same
     // thing it does in `list`, and can be safely fed into `copy-to`/
     // `delete`/`show` without `--id`.
-    let results = db.search_metadata(query, MAX_HISTORY);
+    let max_history = crate::core::get_max_history();
+    let results = db.search_metadata(query, max_history);
     let total_stored = db.get_total_count();
 
     if results.is_empty() {
@@ -52,5 +53,5 @@ pub fn run(args: &[String], db: &ClipboardDb) {
 
     let title = format!("search: '{}' ({} hits)", query, results.len());
     
-    list::render_list(&title, &refs, total_stored, ctx.raw, ctx.use_id);
+    list::render_list(&title, &refs, total_stored, ctx.raw, ctx.use_id, max_history);
 }

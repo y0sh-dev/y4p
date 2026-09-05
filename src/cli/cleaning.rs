@@ -36,7 +36,7 @@ pub fn delete_run(args: &[String], db: &mut ClipboardDb) {
     let real_id = if ctx.use_id {
         val
     } else {
-        let meta = db.fetch_metadata(MAX_HISTORY);
+        let meta = db.fetch_metadata(crate::core::get_max_history());
         match meta.get(val as usize) {
             Some(&(id, ..)) => id,
             None => {
