@@ -74,6 +74,8 @@ fpath+=(/path/to/y4p/completions)
 | `delete` | 特定のレコードを永続ストレージから物理的に削除。 |
 | `wipe` | 全履歴を消去し、SQLiteのVACUUMを実行してストレージを最適化。`--force`（`-f`）が必須。 |
 | `status` | IPC経由でデーモンに稼働状況を問い合わせて表示。 |
+| `pause` | クリップボードの監視（Ingress）を一時停止する（プライベートモード）。 |
+| `resume` | クリップボードの監視を再開する。 |
 
 ---
 

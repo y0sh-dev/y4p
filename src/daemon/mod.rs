@@ -120,11 +120,19 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         // IPC Ingress Handling: Status replies inline via `accept_and_dispatch`;
         // Exit/Restore are dispatched here, same as before.
         if poll_fds[1].revents & libc::POLLIN != 0
-            && let Some(cmd) = ipc::accept_and_dispatch(&listener, || metrics.format_status()) {
+            && let Some(cmd) = ipc::accept_and_dispatch(&listener, || metrics.format_status(state.paused)) {
                 match cmd {
                     Command::Exit => crate::core::request_exit(),
                     Command::Restore(real_id) => handle_restore_request(&mut state, &qh, real_id, &conn, &metrics),
                     Command::Status => {}
+                    Command::Pause => {
+                        state.paused = true;
+                        if state.verbose { println!("{}{}", LOG_INFO, MSG_MONITOR_PAUSED); }
+                    }
+                    Command::Resume => {
+                        state.paused = false;
+                        if state.verbose { println!("{}{}", LOG_INFO, MSG_MONITOR_RESUMED); }
+                    }
                 }
         }
 

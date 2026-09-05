@@ -9,6 +9,8 @@ _y4p() {
     _y4_subcommands=(
         'daemon:Monitor clipboard changes in background'
         'status:Query the running daemon and print its status'
+        'pause:Suspend clipboard monitoring (private mode)'
+        'resume:Resume clipboard monitoring'
         'list:Display history metadata records'
         'search:Keyword scan across text history'
         'copy-to:Restore a history entry to system clipboard'
@@ -82,6 +84,12 @@ _y4p() {
                 paste-from)
                     _arguments \
                         '1:mime type:(text/plain image/png image/jpeg image/webp image/gif text/html)'
+                    ;;
+                pause)
+                    _arguments -s -S
+                    ;;
+                resume)
+                    _arguments -s -S
                     ;;
             esac
             ;;

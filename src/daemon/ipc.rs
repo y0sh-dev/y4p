@@ -12,6 +12,8 @@ pub enum Command {
     Restore(i64),
     Exit,
     Status,
+    Pause,
+    Resume,
 }
 
 impl Command {
@@ -21,6 +23,8 @@ impl Command {
         match buf[0] {
             IPC_CMD_EXIT => Some(Command::Exit),
             IPC_CMD_STATUS => Some(Command::Status),
+            IPC_CMD_PAUSE => Some(Command::Pause),
+            IPC_CMD_RESUME => Some(Command::Resume),
             IPC_CMD_RESTORE => String::from_utf8_lossy(&buf[1..n])
                 .trim()
                 .parse::<i64>()
