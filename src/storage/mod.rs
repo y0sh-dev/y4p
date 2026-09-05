@@ -103,7 +103,7 @@ impl ClipboardDb {
         let mut hasher = Sha3_256::new();
         hasher.update(data);
         let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-        self.insert_with_hash(mime, data, &hash)
+        self.insert_with_hash(mime, data, &hash, crate::core::get_max_history())
     }
 
     /// Optimized insertion utilizing a pre-computed hash and atomic transactions.
@@ -122,7 +122,7 @@ impl ClipboardDb {
     /// Skipped inserts (empty payload, sensitive MIME) return `Ok(-1)` as an
     /// explicit "nothing to reference" sentinel — there is no record for a
     /// caller to act on in that case.
-    pub fn insert_with_hash(&mut self, mime: &str, data: &[u8], hash: &str) -> Result<i64, String> {
+    pub fn insert_with_hash(&mut self, mime: &str, data: &[u8], hash: &str, max_history: usize) -> Result<i64, String> {
         if data.is_empty() { return Ok(-1); }
         if SENSITIVE_MIME_HINTS.iter().any(|&hint| mime.contains(hint)) { return Ok(-1); }
 
@@ -174,14 +174,14 @@ impl ClipboardDb {
             let mut stmt = tx.prepare(
                 "SELECT hash FROM clipboard WHERE id NOT IN (SELECT id FROM clipboard ORDER BY timestamp DESC LIMIT ?1)"
             ).map_err(|e| e.to_string())?;
-            let rows = stmt.query_map(params![MAX_HISTORY as i64], |row| row.get::<_, String>(0))
+            let rows = stmt.query_map(params![max_history as i64], |row| row.get::<_, String>(0))
                 .map_err(|e| e.to_string())?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
         tx.execute(
             "DELETE FROM clipboard WHERE id NOT IN (SELECT id FROM clipboard ORDER BY timestamp DESC LIMIT ?1)",
-            params![MAX_HISTORY as i64]
+            params![max_history as i64]
         ).map_err(|e| e.to_string())?;
 
         tx.commit().map_err(|e| e.to_string())?;
