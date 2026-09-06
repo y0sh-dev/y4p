@@ -35,6 +35,20 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         return;
     }
 
+    // Smart AND search: drop keywords absent from any record up front so a
+    // single typo doesn't zero out an otherwise-good query, and tell the
+    // user (on stderr, so --raw/--id piping stays clean) which ones it ignored.
+    let (valid, invalid) = db.validate_keywords(&keywords);
+
+    if valid.is_empty() {
+        println!("{}no entries matching '{}' were found.", LOG_INFO, keywords.join(" "));
+        return;
+    }
+
+    if !invalid.is_empty() {
+        eprintln!("{}ignored non-existent keywords: '{}'", LOG_WARN, invalid.join(" "));
+    }
+
     // Execute metadata-level search via indexed SQLite query. Each hit now
     // carries its ABSOLUTE position in the full MRU history (see the
     // `search_metadata` doc comment in storage/mod.rs) rather than a local
@@ -42,18 +56,18 @@ pub fn run(args: &[String], db: &ClipboardDb) {
     // thing it does in `list`, and can be safely fed into `copy-to`/
     // `delete`/`show` without `--id`.
     let max_history = crate::core::get_max_history();
-    let results = db.search_metadata(&keywords, max_history);
+    let results = db.search_metadata(&valid, max_history);
     let total_stored = db.get_total_count();
 
     if results.is_empty() {
-        println!("{}no entries matching '{}' were found.", LOG_INFO, keywords.join(" "));
+        println!("{}no entries matching '{}' were found.", LOG_INFO, valid.join(" "));
         return;
     }
 
     let refs: Vec<(usize, &(i64, i64, String, i64, Option<String>))> =
         results.iter().map(|(abs_idx, item)| (*abs_idx, item)).collect();
 
-    let title = format!("search: '{}' ({} hits)", keywords.join(" AND "), results.len());
+    let title = format!("search: '{}' ({} hits)", valid.join(" AND "), results.len());
 
     list::render_list(&title, &refs, total_stored, ctx.raw, ctx.use_id, max_history);
 }
