@@ -41,7 +41,8 @@ pub fn print_help() {
     println!("    list [range]       - Display history metadata. Supports range (e.g., 0-50).");
     println!("                         Flags: --raw (-R), --full (-A), --id (-i).");
     
-    println!("    search <query>     - Keyword scan metadata using SQLite indexing.");
+    println!("    search <keywords...> - Keyword scan metadata using SQLite indexing.");
+    println!("                         Multiple keywords AND-match (space-separated or repeated args).");
     println!("                         Flags: --raw (-R), --id (-i).");
     
     println!("    copy-to <target>   - Restore record to clipboard via IPC synchronization.");

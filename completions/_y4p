@@ -53,7 +53,7 @@ _y4p() {
                     _arguments -s -S \
                         '(-R --raw)'{-R,--raw}'[Clean output for scripting]' \
                         '(-i --id)'{-i,--id}'[Output persistent database IDs]' \
-                        '1:query text:'
+                        '*:query text:'
                     ;;
                 show)
                     _arguments -s -S \
