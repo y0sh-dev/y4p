@@ -145,6 +145,12 @@ impl ClipboardDb {
         self.store.search_metadata(queries, limit)
     }
 
+    /// Sorts keywords into (valid, invalid) so the CLI can drop typos before
+    /// running the full AND search. See `SqliteStore::validate_keywords`.
+    pub fn validate_keywords(&self, keywords: &[String]) -> (Vec<String>, Vec<String>) {
+        self.store.validate_keywords(keywords)
+    }
+
     pub fn fetch_metadata(&self, limit: usize) -> Vec<MetaRow> {
         self.store.fetch_metadata(limit)
     }

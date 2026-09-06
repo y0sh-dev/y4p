@@ -133,6 +133,30 @@ impl SqliteStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Pre-sorts keywords into (valid, invalid) by a cheap `LIMIT 1`
+    /// existence check per word, so `search_metadata`'s AND query only ever
+    /// runs against words actually present. Same text/mime filter as the
+    /// real search, minus the ROW_NUMBER/ordering machinery it doesn't need.
+    pub fn validate_keywords(&self, keywords: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut valid = Vec::new();
+        let mut invalid = Vec::new();
+
+        for kw in keywords {
+            let pattern = format!("%{}%", kw);
+            let exists = self.conn.query_row(
+                "SELECT 1 FROM clipboard
+                 WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
+                   AND (preview LIKE ?1 OR (preview IS NULL AND CAST(content AS TEXT) LIKE ?1))
+                 LIMIT 1",
+                params![pattern], |_| Ok(())
+            ).is_ok();
+
+            if exists { valid.push(kw.clone()); } else { invalid.push(kw.clone()); }
+        }
+
+        (valid, invalid)
+    }
+
     pub fn fetch_metadata(&self, limit: usize) -> Vec<MetaRow> {
         let mut stmt = match self.conn.prepare(
             "SELECT id, timestamp, mime, size, preview FROM clipboard ORDER BY timestamp DESC LIMIT ?1"
