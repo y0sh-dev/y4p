@@ -140,8 +140,9 @@ impl ClipboardDb {
     /// (ORDER BY timestamp DESC) - 1`, matching exactly how `list.rs`
     /// derives it) over the *whole* table before filtering, so a search
     /// result's displayed index is always consistent with `list`'s.
-    pub fn search_metadata(&self, query: &str, limit: usize) -> Vec<(usize, MetaRow)> {
-        self.store.search_metadata(query, limit)
+    pub fn search_metadata(&self, queries: &[String], limit: usize) -> Vec<(usize, MetaRow)> {
+        if queries.is_empty() { return Vec::new(); }
+        self.store.search_metadata(queries, limit)
     }
 
     pub fn fetch_metadata(&self, limit: usize) -> Vec<MetaRow> {

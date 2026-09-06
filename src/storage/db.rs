@@ -89,23 +89,40 @@ impl SqliteStore {
     }
 
     /// See `ClipboardDb::search_metadata` doc: each hit carries its absolute
-    /// MRU index, matching `fetch_metadata`'s ordering.
-    pub fn search_metadata(&self, query: &str, limit: usize) -> Vec<(usize, MetaRow)> {
-        let mut stmt = match self.conn.prepare(
+    /// MRU index, matching `fetch_metadata`'s ordering. Assumes `queries` is
+    /// non-empty — the facade returns early otherwise.
+    ///
+    /// AND-combines one `(preview LIKE ?i OR ...)` clause per keyword; the
+    /// WHERE clause is built dynamically (clause count depends on N) but
+    /// every value is still bound through a placeholder, never interpolated.
+    pub fn search_metadata(&self, queries: &[String], limit: usize) -> Vec<(usize, MetaRow)> {
+        let and_clauses: Vec<String> = (1..=queries.len())
+            .map(|i| format!("(preview LIKE ?{i} OR (preview IS NULL AND CAST(content AS TEXT) LIKE ?{i}))"))
+            .collect();
+        let limit_idx = queries.len() + 1;
+
+        let sql = format!(
             "SELECT abs_idx, id, timestamp, mime, size, preview FROM (
                 SELECT id, timestamp, mime, size, preview, content,
                        ROW_NUMBER() OVER (ORDER BY timestamp DESC) - 1 AS abs_idx
                 FROM clipboard
              ) WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
-               AND (preview LIKE ?1 OR (preview IS NULL AND CAST(content AS TEXT) LIKE ?1))
-             ORDER BY timestamp DESC LIMIT ?2"
-        ) {
+               AND {}
+             ORDER BY timestamp DESC LIMIT ?{}",
+            and_clauses.join(" AND "), limit_idx
+        );
+
+        let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
 
-        let query_param = format!("%{}%", query);
-        let rows = match stmt.query_map(params![query_param, limit as i64], |row| {
+        let wildcarded: Vec<String> = queries.iter().map(|q| format!("%{}%", q)).collect();
+        let limit_param = limit as i64;
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = wildcarded.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        bindings.push(&limit_param);
+
+        let rows = match stmt.query_map(bindings.as_slice(), |row| {
             let abs_idx: i64 = row.get(0)?;
             Ok((abs_idx as usize, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
         }) {
