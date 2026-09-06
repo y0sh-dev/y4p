@@ -95,9 +95,15 @@ impl SqliteStore {
     /// AND-combines one `(preview LIKE ?i OR ...)` clause per keyword; the
     /// WHERE clause is built dynamically (clause count depends on N) but
     /// every value is still bound through a placeholder, never interpolated.
+    ///
+    /// BUGFIX: the content branch was previously guarded by `preview IS
+    /// NULL`, but every text/uri-list record gets a non-null preview (see
+    /// `upsert_record`), so that branch was dead and a match past the first
+    /// `PREVIEW_CHARS` characters was silently missed. Checking `content`
+    /// unconditionally makes the full body actually searchable.
     pub fn search_metadata(&self, queries: &[String], limit: usize) -> Vec<(usize, MetaRow)> {
         let and_clauses: Vec<String> = (1..=queries.len())
-            .map(|i| format!("(preview LIKE ?{i} OR (preview IS NULL AND CAST(content AS TEXT) LIKE ?{i}))"))
+            .map(|i| format!("(preview LIKE ?{i} OR CAST(content AS TEXT) LIKE ?{i})"))
             .collect();
         let limit_idx = queries.len() + 1;
 
@@ -146,7 +152,7 @@ impl SqliteStore {
             let exists = self.conn.query_row(
                 "SELECT 1 FROM clipboard
                  WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
-                   AND (preview LIKE ?1 OR (preview IS NULL AND CAST(content AS TEXT) LIKE ?1))
+                   AND (preview LIKE ?1 OR CAST(content AS TEXT) LIKE ?1)
                  LIMIT 1",
                 params![pattern], |_| Ok(())
             ).is_ok();
