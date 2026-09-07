@@ -77,45 +77,60 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             // Offload ingestion and persistence to the worker thread
             if let Some(ref tx) = state.job_tx {
                 let job_tx_clone = tx.clone();
-                
+                // S-07: uri-list must be fully buffered and normalized before
+                // hashing (the fingerprint has to match what's actually
+                // persisted), so it can't share the other MIMEs' single-pass
+                // hash-while-read below.
+                let is_uri_list = mime_to_get == MIME_URI_LIST;
+
                 std::thread::spawn(move || {
                     use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    
-                    let mut payload = Vec::with_capacity(1048576); 
+
+                    let mut payload = Vec::with_capacity(1048576);
                     let mut reader = read_file.take(268435456);
-                    
+
                     let mut chunk_buffer = super::AlignedBuffer::new(65536, 4096);
                     let chunk = chunk_buffer.as_mut_slice();
 
-                    // Single-pass ingestion and SHA3-256 calculation
+                    let mut hasher = (!is_uri_list).then(Sha3_256::new);
+
                     while let Ok(n) = reader.read(chunk) {
                         if n == 0 { break; }
                         let data = &chunk[..n];
-                        hasher.update(data);
+                        if let Some(h) = hasher.as_mut() { h.update(data); }
                         payload.extend_from_slice(data);
                     }
 
                     if payload.is_empty() { return; }
                     let mut final_mime = mime_to_get;
 
-                    // Heuristic MIME identification via magic bytes
-                    if payload.len() >= 4 {
-                        let detected = match &payload[0..4] {
-                            [0x89, 0x50, 0x4E, 0x47] => Some("image/png"),
-                            [0xFF, 0xD8, 0xFF, _]    => Some("image/jpeg"),
-                            [0x47, 0x49, 0x46, 0x38] => Some("image/gif"),
-                            b"RIFF" if payload.len() >= 12 && &payload[8..12] == b"WEBP" => Some("image/webp"),
-                            _ => None,
-                        };
-                        if let Some(m) = detected { final_mime = m.to_string(); }
+                    if is_uri_list {
+                        payload = crate::core::utils::normalize_uri_list(&payload);
+                        if payload.is_empty() { return; }
+                    } else {
+                        // Heuristic MIME identification via magic bytes
+                        if payload.len() >= 4 {
+                            let detected = match &payload[0..4] {
+                                [0x89, 0x50, 0x4E, 0x47] => Some("image/png"),
+                                [0xFF, 0xD8, 0xFF, _]    => Some("image/jpeg"),
+                                [0x47, 0x49, 0x46, 0x38] => Some("image/gif"),
+                                b"RIFF" if payload.len() >= 12 && &payload[8..12] == b"WEBP" => Some("image/webp"),
+                                _ => None,
+                            };
+                            if let Some(m) = detected { final_mime = m.to_string(); }
+                        }
                     }
 
-                    // SHA3-256 finalize() returns a GenericArray. 
-                    let hash = hasher.finalize()
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>();
+                    // SHA3-256 finalize() returns a GenericArray.
+                    let hash = match hasher {
+                        Some(h) => h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                        // uri-list: fingerprint the normalized bytes actually being persisted.
+                        None => {
+                            let mut h = Sha3_256::new();
+                            h.update(&payload);
+                            h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                        }
+                    };
 
                     // Send the completed payload and its SHA3 fingerprint to the persistent worker.
                     let _ = job_tx_clone.send(ClipboardJob {
