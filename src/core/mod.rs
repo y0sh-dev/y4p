@@ -4,6 +4,7 @@
 // src/core/mod.rs
 
 pub mod constants;
+pub mod utils;
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
