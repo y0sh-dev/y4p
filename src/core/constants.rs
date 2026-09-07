@@ -86,6 +86,7 @@ pub const INTERFACE_SEAT:    &str = "wl_seat";
 
 // --- Logging & Notification Messages ---
 pub const LOG_INFO:  &str = "info: ";
+pub const LOG_WARN:  &str = "warn: ";
 pub const LOG_ERROR: &str = "error: ";
 
 pub const MSG_DAEMON_START: &str = "starting y4p daemon...";
