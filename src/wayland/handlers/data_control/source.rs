@@ -39,23 +39,14 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
                                 send_via_sendfile(&path, fd);
                             });
                         }
+                        // S-07: uri-list is normalized to plain paths at ingest
+                        // (see core::utils::normalize_uri_list), so the
+                        // per-offer file:// rewrite this used to do on egress
+                        // is no longer needed — every consumer gets the same
+                        // already-clean bytes.
                         SourcePayload::Owned(data) => {
                             let mut file = std::fs::File::from(fd);
-
-                            // Avoid the unconditional clone the old code did
-                            // here: only actually copy when the URI-list ->
-                            // plain-text rewrite applies.
-                            let data_to_send: std::borrow::Cow<[u8]> =
-                                if meta.mime == MIME_URI_LIST && mime_type.contains("text/plain") {
-                                    let content = String::from_utf8_lossy(data);
-                                    let stripped: Vec<String> = content.lines()
-                                        .map(|l| l.trim_start_matches("file://").to_string())
-                                        .collect();
-                                    std::borrow::Cow::Owned(stripped.join("\n").into_bytes())
-                                } else {
-                                    std::borrow::Cow::Borrowed(data.as_slice())
-                                };
-                            let data_to_send = data_to_send.into_owned();
+                            let data_to_send = data.clone();
 
                             std::thread::spawn(move || {
                                 if let Err(e) = file.write_all(&data_to_send) {
