@@ -3,28 +3,48 @@
 
 // src/core/utils.rs
 
-use percent_encoding::percent_decode_str;
+use percent_encoding::percent_decode;
+
+/// Strips a `file:` URI down to its path, handling a non-empty Authority
+/// (e.g. `file://localhost/path`) by skipping to its own next `/` instead
+/// of leaking the host into the path like a naive prefix strip would.
+fn strip_file_scheme(line: &[u8]) -> &[u8] {
+    let Some(rest) = line.strip_prefix(b"file:") else { return line; };
+
+    match rest.strip_prefix(b"//") {
+        // Empty authority ("file:///path") — already rooted.
+        Some(after) if after.starts_with(b"/") => after,
+        // Non-empty authority ("file://host/path") — skip past it to its own '/'.
+        Some(after) => after.iter().position(|&b| b == b'/').map(|i| &after[i..]).unwrap_or(b""),
+        // No "//" at all ("file:/path" or "file:path") — path's own leading
+        // '/', if any, is preserved since only "file:" itself was consumed.
+        None => rest,
+    }
+}
 
 /// Normalizes a raw `text/uri-list` payload (RFC 2483) into a plain,
 /// newline-joined list of filesystem paths: comment/blank lines dropped,
-/// the `file:` scheme stripped, and percent-encoding decoded.
+/// the `file:` scheme (and Authority) stripped, percent-decoded.
 ///
-/// Strips `file://` (authority form) first, then falls back to bare `file:`
-/// (no slash consumed) rather than a literal `file:/` — a `file:/path` URI's
-/// own leading slash is part of the path, not the prefix, so this keeps the
-/// result rooted (`/home/user/x`) instead of losing the leading `/`.
+/// Stays on raw bytes end to end — no `url` crate, no `String`/
+/// `decode_utf8_lossy` — since a Linux path is an arbitrary byte sequence
+/// and isn't guaranteed to be valid UTF-8; lossy-decoding it would silently
+/// corrupt it (replace the offending bytes with U+FFFD).
 pub fn normalize_uri_list(data: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(data);
+    let mut out = Vec::with_capacity(data.len());
+    let mut wrote_any = false;
 
-    let paths: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let path = line.strip_prefix("file://").or_else(|| line.strip_prefix("file:")).unwrap_or(line);
-            percent_decode_str(path).decode_utf8_lossy().into_owned()
-        })
-        .collect();
+    for raw_line in data.split(|&b| b == b'\n') {
+        let line = raw_line.trim_ascii();
+        if line.is_empty() || line[0] == b'#' { continue; }
 
-    paths.join("\n").into_bytes()
+        let decoded: Vec<u8> = percent_decode(strip_file_scheme(line)).collect();
+        if decoded.is_empty() { continue; }
+
+        if wrote_any { out.push(b'\n'); }
+        out.extend_from_slice(&decoded);
+        wrote_any = true;
+    }
+
+    out
 }
