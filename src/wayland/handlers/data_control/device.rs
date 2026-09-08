@@ -43,18 +43,8 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 
             if mimes.is_empty() || is_sensitive(&mimes) { return; }
 
-            // Determine optimal MIME type based on modern format priority
-            let priority: &[&str] = &[
-                "image/webp",
-                "image/png",
-                "image/jpeg",
-                "image/gif",
-                MIME_URI_LIST,
-                "text/plain;charset=utf-8",
-                "text/plain",
-            ];
-
-            let mime_to_get = priority.iter()
+            // Determine optimal MIME type based on MIME_PRIORITY_ORDER (richest/most-reproducible first).
+            let mime_to_get = MIME_PRIORITY_ORDER.iter()
                 .find_map(|&p| mimes.iter().find(|&m| m == p || m.starts_with(&format!("{};", p))))
                 .cloned()
                 .or_else(|| mimes.iter().find(|m| m.starts_with("image/")).cloned())
@@ -109,16 +99,24 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                         if payload.is_empty() { return; }
                     } else {
                         // Heuristic MIME identification via magic bytes
-                        if payload.len() >= 4 {
-                            let detected = match &payload[0..4] {
+                        let detected = if payload.len() >= 4 {
+                            match &payload[0..4] {
                                 [0x89, 0x50, 0x4E, 0x47] => Some("image/png"),
                                 [0xFF, 0xD8, 0xFF, _]    => Some("image/jpeg"),
                                 [0x47, 0x49, 0x46, 0x38] => Some("image/gif"),
                                 b"RIFF" if payload.len() >= 12 && &payload[8..12] == b"WEBP" => Some("image/webp"),
                                 _ => None,
-                            };
-                            if let Some(m) = detected { final_mime = m.to_string(); }
-                        }
+                            }
+                        } else {
+                            None
+                        };
+                        // SVG has no fixed magic bytes (it's XML text), so it
+                        // only gets checked once the binary signatures above miss.
+                        let detected = detected.or_else(|| {
+                            let head = payload.trim_ascii_start();
+                            (head.starts_with(b"<?xml") || head.starts_with(b"<svg")).then_some("image/svg+xml")
+                        });
+                        if let Some(m) = detected { final_mime = m.to_string(); }
                     }
 
                     // SHA3-256 finalize() returns a GenericArray.
