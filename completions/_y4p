@@ -19,6 +19,8 @@ _y4p() {
         'paste-from:Stream system clipboard directly to stdout'
         'delete:Physically remove a specific record'
         'wipe:Purge all history and optimize storage'
+        'pin:Protect a record from automatic history rotation'
+        'unpin:Clear a record pin, restoring normal rotation'
         'version:Display version information'
         'help:Display help information'
     )
@@ -75,6 +77,16 @@ _y4p() {
                 wipe)
                     _arguments -s -S \
                         '(-f --force)'{-f,--force}'[Bypass confirmation prompt]'
+                    ;;
+                pin)
+                    _arguments -s -S \
+                        '(-i --id)'{-i,--id}'[Target entry by stable database ID]' \
+                        '1:id or index:'
+                    ;;
+                unpin)
+                    _arguments -s -S \
+                        '(-i --id)'{-i,--id}'[Target entry by stable database ID]' \
+                        '1:id or index:'
                     ;;
                 store)
                     _arguments -s -S \

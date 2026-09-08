@@ -36,6 +36,7 @@ Powered by SQLite in WAL mode. The hybrid storage strategy ensures that metadata
 - **Unified Daemon**: Centralized management of all clipboard operations.
 - **Hybrid Storage**: Metadata and text in SQLite; large binaries in `~/.cache/y4p/`.
 - **Stable ID System**: Persistent database identifiers for seamless integration with external scripts (e.g., Rofi, Fzf).
+- **Pin Protection**: `pin`/`unpin` records to exempt them from automatic history rotation, even when `Y4P_MAX_HISTORY` is exceeded.
 - **Strict CLI**: A "Prosecutor-style" argument parser that rejects malformed or unauthorized inputs.
 - **Security Focused**: Enforced filesystem permissions (700/600) and sensitive MIME type filtering.
 
@@ -80,8 +81,10 @@ fpath+=(/path/to/y4p/completions)
 | `store` | Ingest stdin to database and sync with the active daemon. |
 | `search` | Keyword scan across history using SQLite indexing. Supports multi-keyword AND search. |
 | `paste-from` | Direct OS clipboard access, bypassing the database. |
-| `delete` | Physically remove a specific record from storage. |
-| `wipe` | Purge all history and optimize storage via VACUUM. Requires `--force`/`-f`. |
+| `delete` | Physically remove a specific record from storage. Works regardless of pin state. |
+| `wipe` | Purge all history and optimize storage via VACUUM. Requires `--force`/`-f`. Erases pinned records too. |
+| `pin` | Protect a record from automatic history rotation. Accepts index or stable ID (via `--id`). |
+| `unpin` | Clear a record's pinned protection, returning it to normal rotation. |
 | `status` | Query the running daemon via IPC and print its status. |
 | `pause` | Suspend clipboard monitoring (private mode). |
 | `resume` | Resume clipboard monitoring. |
@@ -98,6 +101,20 @@ fpath+=(/path/to/y4p/completions)
 export Y4P_MAX_HISTORY=500
 y4p daemon
 ```
+
+---
+
+## Pin Protection
+
+Pinned records are permanently exempt from the automatic rotation that trims history down to `Y4P_MAX_HISTORY` — they never get evicted no matter how many unpinned entries accumulate, and they never eat into the unpinned quota either. `delete <target>` and `wipe --force` are unaffected by pin state and can still remove pinned records explicitly.
+
+```bash
+y4p pin 3            # pin by MRU index
+y4p pin --id 118      # pin by stable ID
+y4p unpin 3           # release the pin
+```
+
+In `list`/`search` output, pinned entries are marked with a leading `*` next to the type label (e.g. `*[TXT]`); unpinned entries show a blank space in that column so the table stays aligned. In `--raw` output the same position holds a stable `*`/`-` token for scripting.
 
 ---
 
