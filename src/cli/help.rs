@@ -4,8 +4,12 @@
 // src/cli/help.rs
 
 /// Display the application version and primary system description.
+///
+/// v0.2.0: reads the version from Cargo.toml via `env!("CARGO_PKG_VERSION")`
+/// (baked in at compile time) instead of a separately hand-maintained
+/// string literal, so a version bump only ever needs to touch one place.
 pub fn print_version() {
-    println!("y4p v1.0.0");
+    println!("y4p v{}", env!("CARGO_PKG_VERSION"));
     println!("Unified Wayland Clipboard Infrastructure.");
 }
 
