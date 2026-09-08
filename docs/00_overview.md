@@ -1,75 +1,104 @@
 # y4p Internals — Overview
 
-This is the entry point for `y4p`'s internal documentation. The [README](../README.md) tells you *what* the tool does and how to run it; everything under `docs/` tells you *why* it's built the way it is. Each file below is a self-contained theme — read the one your question actually falls under, not all four in order.
+This is the entry point for `y4p`'s internal documentation.
+
+The [README](../README.md) tells you *what* the tool does, and how to run it. Everything under `docs/` tells you *why* it's built the way it is.
+
+Each file below is a self-contained theme. Read the one your question actually falls under — you don't need to read all four in order.
 
 ---
 
-## 1. System Layer Architecture
+## 1. Two Faces, One Binary
 
-`y4p` is one binary with two faces. Invoked as `y4p daemon`, it becomes a long-lived background process that owns the Wayland connection and the SQLite write path. Invoked as anything else (`list`, `copy-to`, `pin`, ...), it's a short-lived CLI process that either reads the database directly or sends a one-shot IPC command to the daemon and exits.
+`y4p` is one binary that behaves differently depending on how you invoke it.
 
-```
-                         ┌────────────────────────────────────────┐
-                         │              y4p daemon                │
-                         │                                        │
-   Wayland compositor ───┼──▶ wayland::handlers  ──▶  daemon::worker (mpsc, single writer)
-   (ext-data-control-v1) │        (Ingress)                │
-                         │                                 ▼
-   $XDG_RUNTIME_DIR ─────┼──▶ daemon::ipc          storage::ClipboardDb ──▶ SQLite (WAL) + ~/.cache/y4p/
-   /y4p.sock (IPC)       │   (Exit/Restore/Status)         ▲
-                         │        │ (Egress: handle_restore_request)
-                         │        └──▶ wayland::handlers::data_control::source
-                         └────────────────────────────────────────┘
-                                          ▲
-                                          │ IPC (one-shot, e.g. `copy-to`)
-                         ┌────────────────┴───────────────────────┐
-                         │        y4p <command>  (CLI process)    │
-                         │   cli::* ──▶ storage::ClipboardDb       │
-                         │   (reads DB directly for list/search/   │
-                         │    show; talks IPC only for daemon-     │
-                         │    owned actions like copy-to/pause)    │
-                         └──────────────────────────────────────┘
-```
+Run it as `y4p daemon`, and it becomes a long-lived background process. It owns the Wayland connection. It owns the SQLite write path. It just sits there, quietly, until something happens.
 
-Four layers, each with one job:
+Run it as anything else — `list`, `copy-to`, `pin`, whatever — and it's a short-lived CLI process. Most of the time it just reads the database directly and prints something. Occasionally, for actions only the daemon can perform, it sends a one-shot command over a Unix socket and exits.
 
-- **`cli/`** — argument parsing, validation, and human-readable output. Never touches Wayland. Talks to `storage` directly for anything that's just a database read, and to the daemon over IPC only for actions the daemon must perform itself (restoring to the live clipboard, pausing ingestion).
-- **`daemon/`** — process lifecycle, the IPC socket, and `DbWorker`, the single thread allowed to hold a write connection to SQLite (see [03](03_concurrency_and_memory.md)).
-- **`wayland/`** — everything that speaks `ext-data-control-v1` to the compositor: ingesting new clipboard offers, serving history back out, and the low-level pipe/buffer plumbing in between (see [01](01_wayland_streaming_io.md)).
-- **`storage/`** — a facade (`ClipboardDb`) over two things that must never touch each other's concerns: `db.rs` (pure SQL, no filesystem I/O) and `cache.rs` (the on-disk binary cache, no SQLite). Schema migrations live in `schema.rs` (see [02](02_hybrid_storage_and_pin.md)).
+Here's roughly how that looks:
 
-`core/` sits underneath all four as shared, dependency-free plumbing (XDG path resolution, the history-limit env var, the exit flag) — it depends on nothing else in the project, which is what keeps it usable from any layer without creating a cycle.
+```text
+                     y4p daemon  (long-lived background process)
 
-## 2. Module Dependency Diagram
+  Wayland compositor                                    $XDG_RUNTIME_DIR
+  (ext-data-control-v1)                                 /y4p.sock  (IPC)
+          |                                                    |
+          v                                                    v
+   wayland::handlers  ---(mpsc)-->  daemon::worker      daemon::ipc
+     (Ingress)                    (single DB writer)   (Exit / Restore / Status)
+          ^                              |                     |
+          |                              v                     |
+          |                     storage::ClipboardDb <---------+
+          |                       SQLite (WAL)  +
+          |                       ~/.cache/y4p/
+          |                              |
+          +----(Egress: handle_restore_request)-------+
+                data_control::source
 
-```mermaid
-graph TD
-    main --> core
-    main --> storage
-    main --> wayland
-    main --> daemon
-    main --> cli
 
-    cli --> storage
-    cli --> core
+                     y4p <command>  (short-lived CLI process)
 
-    daemon --> storage
-    daemon --> wayland
-    daemon --> core
+          cli::*  ------------------->  storage::ClipboardDb
+                                          (direct read for
+                                           list / search / show)
 
-    wayland --> core
-    wayland --> storage_types["storage::ContentLocation"]
-
-    storage --> core
-
-    storage_types -.-> storage
+          cli::*  --(IPC, one-shot)-->  the daemon above
+                                          (for copy-to / pause /
+                                           anything daemon-owned)
 ```
 
-The direction that matters is `wayland --> storage_types`: the Wayland egress path (`data_control::source`) needs to know whether a record's payload lives inline in SQLite or in the file cache, so it depends on `storage::ContentLocation` — but only that one type, not the rest of the storage module's internals. Nothing under `storage/` or `core/` ever imports from `wayland/`, `daemon/`, or `cli/`; dependencies only flow inward toward `core`. That's a deliberate constraint, not an accident: it's what lets `storage` be exercised (and reasoned about) without ever standing up a Wayland connection.
+Four layers. Each with one job.
+
+`cli/` handles argument parsing, validation, and human-readable output. It never touches Wayland directly. For a plain read — `list`, `search`, `show` — it talks to `storage` on its own. For an action only the daemon can perform — restoring to the live clipboard, pausing ingestion — it goes through IPC instead.
+
+`daemon/` owns process lifecycle, the IPC socket, and `DbWorker` — the one thread allowed to hold a write connection to SQLite. More on why that matters in [03](03_concurrency_and_memory.md).
+
+`wayland/` speaks `ext-data-control-v1` to the compositor. Ingesting new offers, serving history back out, and the pipe/buffer plumbing in between. See [01](01_wayland_streaming_io.md).
+
+`storage/` is a facade — `ClipboardDb` — over two things kept deliberately apart: `db.rs` (pure SQL, no filesystem I/O) and `cache.rs` (the on-disk binary cache, no SQLite at all). Schema migrations live in `schema.rs`. See [02](02_hybrid_storage_and_pin.md).
+
+`core/` sits underneath all four, as shared plumbing — XDG paths, the history-limit env var, the exit flag. It depends on nothing else in the project. That's what keeps it usable from any layer, without ever creating a cycle back into one.
+
+---
+
+## 2. How the Modules Depend on Each Other
+
+```text
+                              main
+                 (wires everything together at startup)
+                  /        |          |          \
+                 v         v          v           v
+              core     storage     wayland      daemon
+                          ^           |            |
+                          |           |            |
+                          |     storage::           |
+                          |   ContentLocation        |
+                          |     (one type)           |
+                          +-----------<--------------+
+
+              cli  ------------------>  storage
+              cli  ------------------>  core
+              daemon  ---------------->  wayland
+```
+
+The one direction worth noticing is `wayland --> storage::ContentLocation`.
+
+The egress path needs to know whether a record's payload lives inline in SQLite, or out in the file cache. So it depends on that one type — not on the rest of storage's internals.
+
+Nothing under `storage/` or `core/` ever imports from `wayland/`, `daemon/`, or `cli/`. Dependencies only flow inward, toward `core`.
+
+That's a deliberate constraint. It's what lets `storage` be tested and reasoned about without ever having to stand up a real Wayland connection.
+
+---
 
 ## 3. What to Read Next
 
-- **[01 — Wayland Protocol & Streaming I/O](01_wayland_streaming_io.md)**: why the daemon multiplexes Wayland and IPC on one thread via `libc::poll`, why ingestion hashes and buffers in a single pass over 4KB-aligned memory, and how `provider_locks` stops the daemon from re-ingesting its own restores.
-- **[02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md)**: why text/metadata and large binaries live in two different storage engines, how `PRAGMA user_version` lets the schema evolve without ever touching existing rows, and how Pin protection carves pinned records out of the rotation limit without shrinking anyone else's quota.
-- **[03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md)**: why every database write funnels through one `mpsc`-fed worker thread, and why the daemon calls `malloc_trim(0)` after handling large payloads instead of trusting the allocator.
-- **[04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md)**: why display order (MRU) and identity (stable ID) are deliberately two different numbers, and why the CLI parser treats an unrecognized flag as an error instead of a best-effort guess.
+Pick the row that matches what's actually on your mind. Each one is a self-contained theme — there's no need to read the others first.
+
+| What you want to know | File to read |
+| :--- | :--- |
+| Why the daemon multiplexes Wayland and IPC on a single thread, why ingestion hashes and buffers in one pass, and how `provider_locks` stops the daemon from re-ingesting its own restores | [01 — Wayland Protocol & Streaming I/O](01_wayland_streaming_io.md) |
+| Why text and large binaries live in two different storage engines, how schema migrations stay safe across upgrades, and how Pin protection carves pinned records out of the rotation limit | [02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md) |
+| Why every database write funnels through one worker thread, and why the daemon explicitly returns memory to the OS after a large payload | [03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md) |
+| Why display order (MRU) and identity (stable ID) are deliberately two different numbers, and why the CLI treats an unrecognized flag as an error, never a guess | [04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md) |
