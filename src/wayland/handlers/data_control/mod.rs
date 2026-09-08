@@ -84,9 +84,13 @@ fn mime_is_compatible(requested: &str, target: &str) -> bool {
         "TEXT",
         "COMPOUND_TEXT",
     ];
+    // text/html already matches via the text/* rule above; application/xhtml+xml
+    // is HTML in an XML wrapper and needs the same "requestable as plain text" treatment.
     let req_is_text_alias = TEXT_ALIASES.contains(&requested);
-    let tgt_is_text_alias = TEXT_ALIASES.contains(&target) || target.starts_with("text/");
-    
+    let tgt_is_text_alias = TEXT_ALIASES.contains(&target)
+        || target.starts_with("text/")
+        || target == "application/xhtml+xml";
+
     req_is_text_alias && tgt_is_text_alias
 }
 

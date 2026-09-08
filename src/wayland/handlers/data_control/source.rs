@@ -46,7 +46,18 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
                         // already-clean bytes.
                         SourcePayload::Owned(data) => {
                             let mut file = std::fs::File::from(fd);
-                            let data_to_send = data.clone();
+
+                            // Rich markup requested as plain text: strip tags
+                            // so a non-HTML consumer gets readable text instead
+                            // of raw markup; requesting the markup mime itself
+                            // still gets the original bytes untouched.
+                            let is_rich_markup = meta.mime == "text/html" || meta.mime == "application/xhtml+xml";
+                            let wants_markup = mime_type.starts_with("text/html") || mime_type.starts_with("application/xhtml");
+                            let data_to_send = if is_rich_markup && !wants_markup {
+                                strip_html_tags(data)
+                            } else {
+                                data.clone()
+                            };
 
                             std::thread::spawn(move || {
                                 if let Err(e) = file.write_all(&data_to_send) {
@@ -70,6 +81,25 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
             _ => {}
         }
     }
+}
+
+/// Minimal `<tag>` remover for rich markup saved as-is but requested as
+/// plain text — not a parser, just a `<`/`>` toggle over the raw bytes per
+/// the project's no-extra-crates policy. Angle brackets inside a quoted
+/// attribute value aren't special-cased; fine for a readable fallback, not
+/// a renderer.
+fn strip_html_tags(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut in_tag = false;
+    for &b in data {
+        match b {
+            b'<' => in_tag = true,
+            b'>' => in_tag = false,
+            _ if !in_tag => out.push(b),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Transfer `path`'s entire contents into `dest` (a Wayland-provided pipe

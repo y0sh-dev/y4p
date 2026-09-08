@@ -56,6 +56,54 @@ pub const TEXT_MIME_ALTS: &[&str] = &[
 
 pub const MIME_URI_LIST: &str = "text/uri-list";
 
+// Ingress selection priority (highest first) when a compositor offers
+// several MIME types for one selection — see device.rs's `mime_to_get`.
+pub const MIME_PRIORITY_ORDER: &[&str] = &[
+    // Lossless / high-fidelity images first.
+    "image/png",
+    "image/webp",
+    "image/jpeg",
+    "image/gif",
+    "image/svg+xml",
+    "image/avif",
+    "image/bmp",
+    // File lists.
+    MIME_URI_LIST,
+    // Rich text / structured markup.
+    "text/html",
+    "application/xhtml+xml",
+    "text/rtf",
+    "text/markdown",
+    "application/json",
+    "application/xml",
+    // Plain text.
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+// Egress Broadcaster groups: MIMEs offered alongside the stored one so the
+// paste target can pick whichever it understands — see
+// daemon::handle_restore_request.
+pub const HTML_MIME_ALTS: &[&str] = &[
+    "text/html",
+    "application/xhtml+xml",
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+pub const IMAGE_MIME_ALTS: &[&str] = &[
+    "image/png",
+    "image/webp",
+    "image/jpeg",
+    "image/gif",
+];
+
 // --- UI Layout & Formatting Settings ---
 pub const WIDTH_ID: usize      = 6;
 pub const WIDTH_WHEN: usize    = 8;

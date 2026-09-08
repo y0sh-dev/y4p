@@ -57,14 +57,18 @@ pub fn preview_content(text: &str) -> String {
 
 /// Retrieve the appropriate label corresponding to the given MIME type.
 pub fn get_label(mime: &str) -> &'static str {
+    // application/* rich-markup siblings (xhtml/json/xml) don't contain
+    // "text", unlike text/html, text/rtf and text/markdown, which the
+    // substring check below already catches.
+    const RICH_MARKUP_ALTS: &[&str] = &["application/xhtml+xml", "application/json", "application/xml"];
+
     if mime == MIME_URI_LIST {
         LABEL_FILE
     } else if mime.starts_with("image/") {
         LABEL_IMAGE
-    } else if mime.contains("text") || mime.contains("UTF8") {
+    } else if mime.contains("text") || mime.contains("UTF8") || RICH_MARKUP_ALTS.contains(&mime) {
         LABEL_TEXT
     } else {
         LABEL_DATA
     }
 }
-
