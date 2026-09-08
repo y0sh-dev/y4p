@@ -8,37 +8,22 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
-`y4p` is a high-performance, standalone clipboard manager engineered for Wayland. It consolidates monitoring (Ingress), serving (Egress), and persistence into a single binary, eliminating the instability inherent in fragmented toolchains.
-
-Built with a focus on **Absolute Integrity** and **Resource Efficiency**, it handles everything from tiny text snippets to massive 70MB+ lossless images with zero-latency response.
+`y4p` is a high-performance, standalone clipboard manager engineered natively for Wayland's `ext-data-control-v1`. It consolidates monitoring, serving, and persistence into a single binary — zero-copy `sendfile(2)` egress and a SQLite WAL-backed history mean it handles everything from a one-line snippet to a 70MB+ lossless image without becoming the reason your desktop stutters.
 
 </div>
 
 ---
 
-## Design Philosophy
-
-### 1. Unified Lifecycle Management
-By integrating the monitor and the provider into a single daemon process, `y4p` eliminates synchronization drift and zombie processes. Communication is handled via a strict IPC model over Unix Domain Sockets.
-
-### 2. High-Capacity Resilience
-Engineered to handle extreme payloads. Utilizing page-aligned memory buffers and single-pass SHA3-256 hashing, the system processes large binary data at near-kernel speeds while maintaining a minimal memory footprint.
-
-### 3. Ironclad Persistence
-Powered by SQLite in WAL mode. The hybrid storage strategy ensures that metadata remains searchable and fast, while large binary assets are offloaded to a dedicated, deduplicated filesystem cache.
-
----
-
 ## Key Features
 
-- **Unified Daemon**: Centralized management of all clipboard operations.
-- **Hybrid Storage**: Metadata and text in SQLite; large binaries in `~/.cache/y4p/`.
-- **Stable ID System**: Persistent database identifiers for seamless integration with external scripts (e.g., Rofi, Fzf).
-- **Pin Protection**: `pin`/`unpin` records to exempt them from automatic history rotation, even when `Y4P_MAX_HISTORY` is exceeded.
-- **Strict CLI**: A "Prosecutor-style" argument parser that rejects malformed or unauthorized inputs.
-- **Security Focused**: Enforced filesystem permissions (700/600) and sensitive MIME type filtering.
+- **Unified Daemon**: One background process owns clipboard monitoring, serving, and storage — no synchronization drift between separate tools.
+- **Hybrid Storage**: Metadata and text live in a fast, searchable SQLite database; large binaries are offloaded to a deduplicated cache at `~/.cache/y4p/`.
+- **Pin Protection**: `pin`/`unpin` records to exempt them from automatic history rotation, permanently — even when `Y4P_MAX_HISTORY` is exceeded.
+- **Stable ID System**: Persistent database identifiers, independent of display order, for race-free integration with external scripts (Rofi, Fzf, `awk`).
+- **Strict CLI**: A "Prosecutor-style" argument parser that rejects malformed or unrecognized flags outright instead of guessing — safer for scripted, unattended use.
+- **Security Focused**: Enforced filesystem permissions (700/600) and automatic filtering of sensitive clipboard MIME types (password manager offers, etc.).
 
 ---
 
@@ -58,12 +43,14 @@ y4p daemon
 
 ### 3. Basic Operations
 ```bash
-y4p list 0-50 --id    # List history with persistent IDs
-y4p copy-to --id 42   # Restore a specific item via IPC
+y4p list 0-50 --id      # List history with persistent IDs
+y4p copy-to --id 42     # Restore a specific item via IPC
+y4p pin 3               # Protect the most recent-but-2 entry from rotation
+y4p search "invoice" -i # Keyword search, printing stable IDs
 ```
 
 ### 4. Shell Completions
-Zsh completion is provided at `completions/_y4p`. Add its directory to your `fpath` before `compinit`, e.g.:
+Zsh completion is provided at `completions/_y4p`. Add its directory to your `fpath` before `compinit`:
 ```zsh
 fpath+=(/path/to/y4p/completions)
 ```
@@ -75,19 +62,19 @@ fpath+=(/path/to/y4p/completions)
 | Command | Description |
 | :--- | :--- |
 | `daemon` | Start background monitor and IPC socket listener. |
-| `list` | Display history metadata. Supports ranges and raw output. |
-| `copy-to` | Restore a record to the clipboard via IPC. Supports MRU logic. |
-| `show` | Inspect record content. Supports `--raw` for binary extraction. |
-| `store` | Ingest stdin to database and sync with the active daemon. |
-| `search` | Keyword scan across history using SQLite indexing. Supports multi-keyword AND search. |
-| `paste-from` | Direct OS clipboard access, bypassing the database. |
-| `delete` | Physically remove a specific record from storage. Works regardless of pin state. |
-| `wipe` | Purge all history and optimize storage via VACUUM. Requires `--force`/`-f`. Erases pinned records too. |
-| `pin` | Protect a record from automatic history rotation. Accepts index or stable ID (via `--id`). |
-| `unpin` | Clear a record's pinned protection, returning it to normal rotation. |
 | `status` | Query the running daemon via IPC and print its status. |
-| `pause` | Suspend clipboard monitoring (private mode). |
-| `resume` | Resume clipboard monitoring. |
+| `pause` / `resume` | Suspend/resume clipboard monitoring (private mode). |
+| `list` | Display history metadata. Supports ranges, `--raw`, `--id`. |
+| `search` | Keyword scan across history via SQLite indexing. Multi-keyword AND search. |
+| `copy-to` | Restore a record to the clipboard via IPC. Accepts index or `--id`. |
+| `show` | Inspect record content. `--raw` extracts exact binary data. |
+| `store` | Ingest stdin to the database and sync with the active daemon. |
+| `paste-from` | Direct OS clipboard access, bypassing the database. |
+| `pin` / `unpin` | Protect/unprotect a record from automatic history rotation. |
+| `delete` | Physically remove a specific record from storage (works on pinned records too). |
+| `wipe` | Purge **all** history (including pinned) and run SQLite `VACUUM`. Requires `--force`/`-f`. |
+
+Run `y4p help` for the full flag reference per command.
 
 ---
 
@@ -95,7 +82,7 @@ fpath+=(/path/to/y4p/completions)
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `Y4P_MAX_HISTORY` | `256` | Maximum number of clipboard records retained. Invalid, zero, or negative values fall back to the default. |
+| `Y4P_MAX_HISTORY` | `256` | Maximum number of unpinned clipboard records retained. Invalid, zero, or negative values fall back to the default. |
 
 ```bash
 export Y4P_MAX_HISTORY=500
@@ -104,27 +91,9 @@ y4p daemon
 
 ---
 
-## Pin Protection
+## Architecture & Design
 
-Pinned records are permanently exempt from the automatic rotation that trims history down to `Y4P_MAX_HISTORY` — they never get evicted no matter how many unpinned entries accumulate, and they never eat into the unpinned quota either. `delete <target>` and `wipe --force` are unaffected by pin state and can still remove pinned records explicitly.
-
-```bash
-y4p pin 3            # pin by MRU index
-y4p pin --id 118      # pin by stable ID
-y4p unpin 3           # release the pin
-```
-
-In `list`/`search` output, pinned entries are marked with a leading `*` next to the type label (e.g. `*[TXT]`); unpinned entries show a blank space in that column so the table stays aligned. In `--raw` output the same position holds a stable `*`/`-` token for scripting.
-
----
-
-## Technical Specifications
-
-- **Language**: Rust (Zero-cost abstractions)
-- **Storage**: SQLite 3 (WAL mode, Memory-mapped I/O)
-- **Hashing**: SHA3-256 (FIPS 202)
-- **Protocol**: Wayland `ext-data-control-v1`
-- **Memory**: Page-aligned I/O, `malloc_trim` optimization
+This README is a quick-start guide. The reasoning behind `y4p`'s internals — why the daemon multiplexes I/O on one thread, how Pin protection interacts with history rotation, why stable IDs exist, and more — lives in [`docs/00_overview.md`](docs/00_overview.md).
 
 ---
 
@@ -138,6 +107,5 @@ Copyright (c) 2026 yosana (y0sh-dev)
 
 ## AI Usage Disclosure
 
-For our policy on using Generative AI (LLMs), please refer to 
+For our policy on using Generative AI (LLMs), please refer to
 the shared guidelines documented in [docs/AI_POLICY.md](docs/AI_POLICY.md).
-
