@@ -207,21 +207,28 @@ fn handle_restore_request(
 
         let source = manager.create_data_source(qh, meta);
 
-        // Broadcaster Strategy: Advertise multiple compatible MIMEs
+        // Broadcaster Strategy: advertise compatible MIMEs alongside the
+        // stored one so the paste target can pick whichever it understands.
         source.offer(mime.clone());
 
         if mime.starts_with("image/") {
-            let image_alts = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-            for alt in image_alts {
+            if mime == "image/png" {
+                for alt in IMAGE_MIME_ALTS {
+                    if *alt != mime { source.offer(alt.to_string()); }
+                }
+            } else {
+                // Non-PNG images: PNG is the broadest-compatibility fallback.
+                source.offer("image/png".to_string());
+            }
+        } else if mime == "text/html" || mime == "application/xhtml+xml" {
+            for alt in HTML_MIME_ALTS {
                 if *alt != mime { source.offer(alt.to_string()); }
             }
-        } else if mime.contains("text") || mime == MIME_URI_LIST {
+        } else if mime.contains("text") || mime.contains("UTF8") {
+            // Covers the text/plain family and text/uri-list (already
+            // contains "text") with the same plain-text alternates.
             for alt in TEXT_MIME_ALTS {
                 if *alt != mime { source.offer(alt.to_string()); }
-            }
-            // Ensure URI lists can be consumed by standard text editors
-            if mime == MIME_URI_LIST {
-                source.offer("text/plain".to_string());
             }
         }
 
