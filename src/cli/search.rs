@@ -64,7 +64,7 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         return;
     }
 
-    let refs: Vec<(usize, &(i64, i64, String, i64, Option<String>))> =
+    let refs: Vec<(usize, &(i64, i64, String, i64, Option<String>, bool))> =
         results.iter().map(|(abs_idx, item)| (*abs_idx, item)).collect();
 
     let title = format!("search: '{}' ({} hits)", valid.join(" AND "), results.len());
