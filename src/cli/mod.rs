@@ -11,6 +11,8 @@ mod paste_from;
 mod store;
 mod search;
 mod cleaning;
+mod pin;
+mod unpin;
 mod help;
 mod status;
 mod pause;
@@ -61,6 +63,8 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
         // --- Management ---
         "delete"     => cleaning::delete_run(args, &mut db),
         "wipe"       => cleaning::wipe_run(args, &mut db),
+        "pin"        => pin::run(args, &mut db),
+        "unpin"      => unpin::run(args, &mut db),
 
         // --- Utilities ---
         "paste-from" => paste_from::run(args),

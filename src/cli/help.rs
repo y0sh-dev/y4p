@@ -65,6 +65,12 @@ pub fn print_help() {
     println!("    wipe               - Purge all history and execute SQLite VACUUM.");
     println!("                         Flags: --force (-f) [REQUIRED].");
 
+    println!("    pin <target>       - Protect a record from automatic history rotation.");
+    println!("                         Flags: --id (-i).");
+
+    println!("    unpin <target>     - Clear a record's pinned protection.");
+    println!("                         Flags: --id (-i).");
+
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help         - Show this help information.");
     println!("    -V, --version      - Show version information.");
@@ -80,6 +86,9 @@ pub fn print_help() {
     
     println!("\n    # 3. Manual ingestion with custom MIME:");
     println!("    $ cat data.json | y4p store application/json");
+
+    println!("\n    # 4. Pin an important entry, then release it later:");
+    println!("    $ y4p pin 3 && y4p unpin --id 118");
 
     println!("\nTECHNICAL NOTES:");
     println!("    - Storage: Secured at ~/.local/share/y4p/ (mode 600).");

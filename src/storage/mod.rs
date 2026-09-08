@@ -21,8 +21,8 @@ use crate::core::constants::SQLITE_TIMEOUT_MS;
 
 /// A single metadata row, shared by `fetch_metadata` and `search_metadata` so
 /// callers (and future callers) don't have to keep re-deriving the same
-/// 5-tuple shape by hand.
-pub type MetaRow = (i64, i64, String, i64, Option<String>);
+/// 6-tuple shape by hand. The trailing `bool` is `is_pinned` (G-10).
+pub type MetaRow = (i64, i64, String, i64, Option<String>, bool);
 
 /// Identifies where a record's binary payload currently lives.
 ///
@@ -208,5 +208,12 @@ impl ClipboardDb {
     /// Safely retrieve total record count. Removed unwrap() to prevent daemon panics.
     pub fn get_total_count(&self) -> usize {
         self.store.get_total_count()
+    }
+
+    /// G-10: pin/unpin a record by its immutable ID. Pinned records are
+    /// exempt from `upsert_record`'s automatic rotation eviction; `delete`
+    /// and `wipe` remain unaffected by pin state (see `cli::pin`/`cli::cleaning`).
+    pub fn set_pin_by_id(&mut self, id: i64, is_pinned: bool) -> Result<bool, String> {
+        self.store.set_pinned(id, is_pinned)
     }
 }

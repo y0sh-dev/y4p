@@ -69,9 +69,15 @@ impl SqliteStore {
             tx.last_insert_rowid()
         };
 
+        // G-10: rotation only ever counts/evicts unpinned rows — both the
+        // outer candidate filter and the inner "keep newest N" subquery are
+        // scoped to `is_pinned = 0`, so pinned rows are never candidates for
+        // eviction AND never consume the unpinned history quota.
         let expired_hashes: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT hash FROM clipboard WHERE id NOT IN (SELECT id FROM clipboard ORDER BY timestamp DESC LIMIT ?1)"
+                "SELECT hash FROM clipboard
+                 WHERE is_pinned = 0
+                   AND id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)"
             ).map_err(|e| e.to_string())?;
             let rows = stmt.query_map(params![max_history as i64], |row| row.get::<_, String>(0))
                 .map_err(|e| e.to_string())?;
@@ -79,7 +85,9 @@ impl SqliteStore {
         };
 
         tx.execute(
-            "DELETE FROM clipboard WHERE id NOT IN (SELECT id FROM clipboard ORDER BY timestamp DESC LIMIT ?1)",
+            "DELETE FROM clipboard
+             WHERE is_pinned = 0
+               AND id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)",
             params![max_history as i64]
         ).map_err(|e| e.to_string())?;
 
@@ -108,8 +116,8 @@ impl SqliteStore {
         let limit_idx = queries.len() + 1;
 
         let sql = format!(
-            "SELECT abs_idx, id, timestamp, mime, size, preview FROM (
-                SELECT id, timestamp, mime, size, preview, content,
+            "SELECT abs_idx, id, timestamp, mime, size, preview, is_pinned FROM (
+                SELECT id, timestamp, mime, size, preview, content, is_pinned,
                        ROW_NUMBER() OVER (ORDER BY timestamp DESC) - 1 AS abs_idx
                 FROM clipboard
              ) WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
@@ -130,7 +138,7 @@ impl SqliteStore {
 
         let rows = match stmt.query_map(bindings.as_slice(), |row| {
             let abs_idx: i64 = row.get(0)?;
-            Ok((abs_idx as usize, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+            Ok((abs_idx as usize, (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))
         }) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -165,13 +173,13 @@ impl SqliteStore {
 
     pub fn fetch_metadata(&self, limit: usize) -> Vec<MetaRow> {
         let mut stmt = match self.conn.prepare(
-            "SELECT id, timestamp, mime, size, preview FROM clipboard ORDER BY timestamp DESC LIMIT ?1"
+            "SELECT id, timestamp, mime, size, preview, is_pinned FROM clipboard ORDER BY timestamp DESC LIMIT ?1"
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         let rows = match stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
         }) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -236,6 +244,17 @@ impl SqliteStore {
              PRAGMA journal_mode = WAL;",
         );
         Ok(())
+    }
+
+    /// G-10: flips a single record's pin flag by its immutable ID. Returns
+    /// whether a row was actually affected, so the CLI can distinguish
+    /// "not found" from success rather than reporting a false positive.
+    pub fn set_pinned(&mut self, id: i64, is_pinned: bool) -> Result<bool, String> {
+        let affected = self.conn.execute(
+            "UPDATE clipboard SET is_pinned = ?1 WHERE id = ?2",
+            params![is_pinned, id],
+        ).map_err(|e| e.to_string())?;
+        Ok(affected > 0)
     }
 
     pub fn get_total_count(&self) -> usize {

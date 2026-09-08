@@ -8,7 +8,7 @@ use super::formatter;
 use super::utils::{self, RangeSelection, ArgContext};
 use crate::core::constants::*;
 
-type ItemData = (i64, i64, String, i64, Option<String>);
+type ItemData = (i64, i64, String, i64, Option<String>, bool);
 type IndexItem<'a> = (usize, &'a ItemData);
 
 /// Entry point for the 'list' command.
@@ -87,7 +87,10 @@ pub fn render_list(
     use_id: bool,
     max_history: usize,
 ) {
-    let label_width = 6;
+    // G-10: +1 over the label's own width for a fixed one-char pin-indicator
+    // slot prepended to the label (see formatter::pin_marker) — reserved for
+    // every row, pinned or not, so the table's column alignment never shifts.
+    let label_width = 7;
     let total_width = WIDTH_ID + WIDTH_WHEN + WIDTH_SIZE + PREVIEW_WIDTH + label_width + (TABLE_SEP.len() * 3);
 
     if !is_raw {
@@ -107,7 +110,7 @@ pub fn render_list(
     }
 
     for (abs_idx, item) in items {
-        let (real_id, ts, mime, size, preview) = *item;
+        let (real_id, ts, mime, size, preview, is_pinned) = *item;
         let label = formatter::get_label(mime);
 
         // Use absolute history index 'abs_idx' instead of local loop counter
@@ -122,17 +125,24 @@ pub fn render_list(
         let formatted_preview = formatter::preview_content(&raw_preview);
 
         if is_raw {
+            // G-10: pin marker is its own space-delimited field ("*"/"-"),
+            // always present, so awk/fzf pipelines get a stable field count
+            // regardless of pin state.
             println!(
-                "[{:>wid_id$}] {} {}",
-                id_to_display, label, formatted_preview,
+                "[{:>wid_id$}] {} {} {}",
+                id_to_display, formatter::pin_marker_raw(*is_pinned), label, formatted_preview,
                 wid_id = WIDTH_ID / 2
             );
         } else {
+            // G-10: the one-char pin marker is prepended directly to the
+            // label, inside the label_width budget reserved above, so table
+            // alignment is identical whether or not the row is pinned.
             println!(
-                "[{:>wid_id$}]{sep}{:>wid_when$}{sep}{:>wid_size$} B{sep}{} {}",
+                "[{:>wid_id$}]{sep}{:>wid_when$}{sep}{:>wid_size$} B{sep}{}{} {}",
                 id_to_display,
                 formatter::format_time(*ts as u64),
                 size,
+                formatter::pin_marker(*is_pinned),
                 label,
                 formatted_preview,
                 wid_id = WIDTH_ID - 2,

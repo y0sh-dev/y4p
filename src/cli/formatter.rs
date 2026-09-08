@@ -55,6 +55,22 @@ pub fn preview_content(text: &str) -> String {
     result
 }
 
+/// G-10: fixed-width pin indicator for the table view. Always occupies
+/// exactly one character (space when unpinned) so the label block's total
+/// width — and therefore the whole table's column alignment — never shifts
+/// depending on pin state.
+pub fn pin_marker(is_pinned: bool) -> &'static str {
+    if is_pinned { "*" } else { " " }
+}
+
+/// G-10: machine-readable pin indicator for `--raw` output. Unlike
+/// `pin_marker`, this always emits a non-space, non-empty token ("*" or "-")
+/// so field-splitting tools (awk, fzf) see a stable field count and never
+/// mistake an unpinned row's marker for missing/trailing whitespace.
+pub fn pin_marker_raw(is_pinned: bool) -> &'static str {
+    if is_pinned { "*" } else { "-" }
+}
+
 /// Retrieve the appropriate label corresponding to the given MIME type.
 pub fn get_label(mime: &str) -> &'static str {
     // application/* rich-markup siblings (xhtml/json/xml) don't contain
