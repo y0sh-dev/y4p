@@ -43,17 +43,26 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 
             if mimes.is_empty() || is_sensitive(&mimes) { return; }
 
-            // Determine optimal MIME type based on MIME_PRIORITY_ORDER (richest/most-reproducible first).
+            // Determine optimal MIME type based on MIME_PRIORITY_ORDER
+            // (richest/most-reproducible first). Matching is case- and
+            // whitespace-insensitive on the base type (see
+            // core::utils::mime_base_eq), so a sender announcing e.g.
+            // "TEXT/Plain" or "text/plain; charset=utf-8" (space after ';')
+            // still hits its intended priority entry instead of falling
+            // through to a generic category fallback. `.cloned()` always
+            // takes the string as the sender actually offered it — the
+            // compositor request below needs that exact original form, not
+            // the normalized one.
             let mime_to_get = MIME_PRIORITY_ORDER.iter()
-                .find_map(|&p| mimes.iter().find(|&m| m == p || m.starts_with(&format!("{};", p))))
+                .find_map(|&p| mimes.iter().find(|m| crate::core::utils::mime_base_eq(m, p)))
                 .cloned()
-                .or_else(|| mimes.iter().find(|m| m.starts_with("image/")).cloned())
-                .or_else(|| mimes.iter().find(|m| m.starts_with("text/")).cloned())
+                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("image/")).cloned())
+                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("text/")).cloned())
                 .or_else(|| mimes.first().cloned())
                 .unwrap_or_else(|| DEFAULT_MIME.to_string());
 
             // Initialize data transfer pipe
-            let is_image = mime_to_get.starts_with("image/");
+            let is_image = mime_to_get.to_ascii_lowercase().starts_with("image/");
             let (read_file, write_fd) = match make_pipe(is_image) {
                 Some(p) => p,
                 None => return,
