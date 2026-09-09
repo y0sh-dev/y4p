@@ -4,8 +4,10 @@
 // src/storage/db.rs
 
 use rusqlite::{params, Connection, Result};
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::core::constants::{SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
+use crate::core::utils::strip_html_tags;
 use super::MetaRow;
 
 /// Result of `upsert_record`: `real_id == -1` means the payload was
@@ -54,8 +56,20 @@ impl SqliteStore {
                 .map_err(|e| e.to_string())?;
             id
         } else {
-            let preview = if mime.contains("text") || mime.contains("uri-list") {
-                let s = String::from_utf8_lossy(data);
+            // "application/xhtml+xml" doesn't contain "text" itself (unlike
+            // text/html), so it needs its own check here to get a preview at
+            // all rather than falling through to `None`.
+            let is_markup = mime == "text/html" || mime.contains("xhtml");
+            let preview = if mime.contains("text") || mime.contains("uri-list") || is_markup {
+                // Rich markup's raw tags aren't a readable preview — strip
+                // them first so the preview column always shows plain,
+                // scannable text instead of leaking `<div>`/`<strong>` etc.
+                let text_data: Cow<[u8]> = if is_markup {
+                    Cow::Owned(strip_html_tags(data))
+                } else {
+                    Cow::Borrowed(data)
+                };
+                let s = String::from_utf8_lossy(&text_data);
                 Some(s.chars().take(PREVIEW_CHARS).collect::<String>().replace('\n', " "))
             } else { None };
 
