@@ -48,3 +48,22 @@ pub fn normalize_uri_list(data: &[u8]) -> Vec<u8> {
 
     out
 }
+
+/// Minimal `<tag>` remover for rich markup (e.g. `text/html`) that needs to
+/// be shown or matched as plain text — not a parser, just a `<`/`>` toggle
+/// over the raw bytes, per the project's no-extra-crates policy. Angle
+/// brackets inside a quoted attribute value aren't special-cased; fine for a
+/// readable fallback/preview, not a renderer.
+pub fn strip_html_tags(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut in_tag = false;
+    for &b in data {
+        match b {
+            b'<' => in_tag = true,
+            b'>' => in_tag = false,
+            _ if !in_tag => out.push(b),
+            _ => {}
+        }
+    }
+    out
+}

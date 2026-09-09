@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
 use super::mime_is_compatible;
 use crate::core::constants::*;
+use crate::core::utils::strip_html_tags;
 
 // --- ExtDataControlSourceV1 ---
 
@@ -81,25 +82,6 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
             _ => {}
         }
     }
-}
-
-/// Minimal `<tag>` remover for rich markup saved as-is but requested as
-/// plain text — not a parser, just a `<`/`>` toggle over the raw bytes per
-/// the project's no-extra-crates policy. Angle brackets inside a quoted
-/// attribute value aren't special-cased; fine for a readable fallback, not
-/// a renderer.
-fn strip_html_tags(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut in_tag = false;
-    for &b in data {
-        match b {
-            b'<' => in_tag = true,
-            b'>' => in_tag = false,
-            _ if !in_tag => out.push(b),
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Transfer `path`'s entire contents into `dest` (a Wayland-provided pipe

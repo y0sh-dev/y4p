@@ -58,6 +58,16 @@ pub const MIME_URI_LIST: &str = "text/uri-list";
 
 // Ingress selection priority (highest first) when a compositor offers
 // several MIME types for one selection — see device.rs's `mime_to_get`.
+//
+// Plain text ranks above rich markup: Electron/Chromium apps (Discord,
+// Slack, ...) routinely announce text/html alongside text/plain even for a
+// plain-text selection, but only serialize actual HTML on request — a
+// non-rich selection gets an empty payload for text/html, which used to
+// make ingestion discard the whole clipboard event (see device.rs's
+// `if payload.is_empty()` check). Plain text is present whenever anything
+// is, so trying it first make that failure mode structurally impossible;
+// text/html is still reachable as a fallback when no plain-text alternative
+// was offered at all (e.g. a deliberate rich-text/source copy).
 pub const MIME_PRIORITY_ORDER: &[&str] = &[
     // Lossless / high-fidelity images first.
     "image/png",
@@ -69,19 +79,19 @@ pub const MIME_PRIORITY_ORDER: &[&str] = &[
     "image/bmp",
     // File lists.
     MIME_URI_LIST,
-    // Rich text / structured markup.
+    // Standard plain text.
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+    // Rich text / structured markup — fallback only.
     "text/html",
     "application/xhtml+xml",
     "text/rtf",
     "text/markdown",
     "application/json",
     "application/xml",
-    // Plain text.
-    "text/plain;charset=utf-8",
-    "text/plain",
-    "UTF8_STRING",
-    "STRING",
-    "TEXT",
 ];
 
 // Egress Broadcaster groups: MIMEs offered alongside the stored one so the
