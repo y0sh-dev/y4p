@@ -24,6 +24,10 @@ mod wayland;
 mod daemon;
 mod cli;
 
+use std::io::Write;
+use crate::cli::CliAction;
+use crate::core::constants::*;
+
 fn main() {
     // Ignore SIGPIPE: a reader disappearing mid-write (e.g. a Wayland client
     // closing the destination fd of an offer.receive()) must surface as an
@@ -62,10 +66,46 @@ fn main() {
     let db = match storage::ClipboardDb::open() {
         Ok(database) => database,
         Err(e) => {
-            eprintln!("{}critical: {}", crate::core::constants::LOG_ERROR, e);
+            eprintln!("{}critical: {}", LOG_ERROR, e);
             std::process::exit(1);
         }
     };
 
-    cli::handle_command(&args, db);
+    // `cli` only parses/validates "daemon" and "paste-from"; as the sole
+    // composition root allowed to depend on every module, `main` performs
+    // their actual backend calls.
+    match cli::handle_command(&args, db) {
+        CliAction::None => {}
+        CliAction::RunDaemon(db, verbose) => {
+            let started = daemon::start_daemon(db, verbose);
+            // BUGFIX: previously this message was printed unconditionally, even
+            // when `start_daemon` failed before ever binding the socket or
+            // reaching the compositor — misleadingly implying a daemon had been
+            // running and then stopped, when in fact it never started.
+            if started {
+                eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_STOP);
+            } else {
+                eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_START_FAILED);
+            }
+        }
+        CliAction::PasteFrom(mime) => {
+            // Synchronous data extraction from the Wayland compositor.
+            let raw = wayland::paste_from_os(&mime);
+
+            if raw.is_empty() {
+                eprintln!("{}null or empty payload retrieved for MIME: {}", LOG_ERROR, mime);
+                std::process::exit(1);
+            }
+
+            // Direct byte-stream output to the standard output buffer.
+            let mut stdout = std::io::stdout();
+            if let Err(e) = stdout.write_all(&raw) {
+                eprintln!("{}standard output stream failure: {}", LOG_ERROR, e);
+                return;
+            }
+
+            // Explicit flush to ensure complete data transmission before process exit.
+            let _ = stdout.flush();
+        }
+    }
 }
