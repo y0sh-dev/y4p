@@ -69,35 +69,50 @@ const F_SETPIPE_SZ: libc::c_int = 1031;
 const PIPE_CAPACITY_IMAGE: libc::c_int = 4 * 1024 * 1024;
 
 /// Evaluates if the requested MIME type is compatible with the target type.
-/// Supports category-level matching for text and image groups.
+/// Supports category-level matching for text and image groups. Both sides
+/// are compared via their normalized base type (case- and
+/// whitespace-insensitive, parameters stripped — see
+/// `core::utils::parse_mime`), so `TEXT/PLAIN`, `text/plain; charset=utf-8`
+/// and `text/plain;charset=UTF-8` are all treated identically.
 fn mime_is_compatible(requested: &str, target: &str) -> bool {
-    if requested == target { return true; }
-    if requested.starts_with("text/") && target.starts_with("text/") { return true; }
-    if requested.starts_with("image/") && target.starts_with("image/") { return true; }
-    
+    let req_base = crate::core::utils::parse_mime(requested).0;
+    let tgt_base = crate::core::utils::parse_mime(target).0;
+
+    if req_base == tgt_base { return true; }
+    if req_base.starts_with("text/") && tgt_base.starts_with("text/") { return true; }
+    if req_base.starts_with("image/") && tgt_base.starts_with("image/") { return true; }
+
+    // Already-lowercased base forms — the old list's charset-suffixed
+    // variants are redundant now that params are stripped before comparing.
     const TEXT_ALIASES: &[&str] = &[
         "text/plain",
-        "text/plain;charset=utf-8",
-        "text/plain;charset=UTF-8",
-        "UTF8_STRING",
-        "STRING",
-        "TEXT",
-        "COMPOUND_TEXT",
+        "utf8_string",
+        "string",
+        "text",
+        "compound_text",
     ];
     // text/html already matches via the text/* rule above; application/xhtml+xml
     // is HTML in an XML wrapper and needs the same "requestable as plain text" treatment.
-    let req_is_text_alias = TEXT_ALIASES.contains(&requested);
-    let tgt_is_text_alias = TEXT_ALIASES.contains(&target)
-        || target.starts_with("text/")
-        || target == "application/xhtml+xml";
+    let req_is_text_alias = TEXT_ALIASES.contains(&req_base.as_str());
+    let tgt_is_text_alias = TEXT_ALIASES.contains(&tgt_base.as_str())
+        || tgt_base.starts_with("text/")
+        || tgt_base == "application/xhtml+xml";
 
     req_is_text_alias && tgt_is_text_alias
 }
 
 /// Checks if any offered MIME type matches the sensitive hints blacklist.
+///
+/// BUGFIX: both the haystack (offered MIME) and the hint now go through
+/// `to_ascii_lowercase()`. Previously only the MIME was lowercased while
+/// `SENSITIVE_MIME_HINTS` mixes case (`x-kde-passwordManagerHint`) — a
+/// lowercased haystack can never contain that hint's own uppercase letters
+/// verbatim, so this specific hint could never actually match anything,
+/// silently defeating the KDE password-manager filter it exists for.
 fn is_sensitive(mimes: &[String]) -> bool {
     SENSITIVE_MIME_HINTS.iter().any(|&hint| {
-        mimes.iter().any(|m| m.to_lowercase().contains(hint))
+        let hint_lower = hint.to_ascii_lowercase();
+        mimes.iter().any(|m| m.to_ascii_lowercase().contains(&hint_lower))
     })
 }
 
