@@ -23,18 +23,29 @@ mod utils;
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
 
+/// Signal handed back to `main.rs` for the two commands whose real backend
+/// call (`daemon::start_daemon`, `wayland::paste_from_os`) would otherwise
+/// pull `daemon`/`wayland` into this storage+core-only frontend module.
+/// `cli` only parses/validates; `main.rs` (the composition root) performs
+/// the actual call.
+pub enum CliAction {
+    None,
+    RunDaemon(ClipboardDb, bool),
+    PasteFrom(String),
+}
+
 /// Central command dispatcher. Standardized to use mutable references for database
 /// operations to prevent ownership move conflicts across match arms.
-pub fn handle_command(args: &[String], mut db: ClipboardDb) {
+pub fn handle_command(args: &[String], mut db: ClipboardDb) -> CliAction {
     // 1. Intercept global flags and help requests early
     if args.len() < 2 || utils::has_flag(args, "--help", "-h") {
         help::print_help();
-        return;
+        return CliAction::None;
     }
 
     if utils::has_flag(args, "--version", "-V") {
         help::print_version();
-        return;
+        return CliAction::None;
     }
 
     let cmd = args[1].as_str();
@@ -42,18 +53,21 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
     // 2. Prevent option-formatted strings from being interpreted as commands
     if utils::is_option(cmd) {
         eprintln!("{}invalid command format: '{}'", LOG_ERROR, cmd);
-        // BUGFIX: was "y1-clip" — leftover placeholder name, inconsistent
-        // with the actual product name used everywhere else.
         println!("usage: y4p <command> [options]");
         std::process::exit(1);
     }
 
     // 3. Dispatch execution to specific command modules
-    // Using references (&db / &mut db) allows mod.rs to retain ownership 
+    // Using references (&db / &mut db) allows mod.rs to retain ownership
     // and ensures clean resource management.
     match cmd {
         // --- System Operations ---
-        "daemon"     => daemon::run(args, db), // daemon consumes db as it is the final owner
+        // "daemon"/"paste-from" only resolve their arguments here; starting
+        // the daemon / talking to wayland is deferred to `main.rs`.
+        "daemon"     => return match daemon::run(args) {
+            Some(verbose) => CliAction::RunDaemon(db, verbose),
+            None => CliAction::None,
+        },
         "list"       => list::run(args, &db),
         "search"     => search::run(args, &db),
         "show"       => show::run(args, &db),
@@ -67,7 +81,10 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
         "unpin"      => unpin::run(args, &mut db),
 
         // --- Utilities ---
-        "paste-from" => paste_from::run(args),
+        "paste-from" => return match paste_from::run(args) {
+            Some(mime) => CliAction::PasteFrom(mime),
+            None => CliAction::None,
+        },
         "status"     => status::run(args),
         "pause"      => pause::run(args),
         "resume"     => resume::run(args),
@@ -80,4 +97,6 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) {
             std::process::exit(1);
         }
     }
+
+    CliAction::None
 }
