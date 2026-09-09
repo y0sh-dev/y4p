@@ -25,24 +25,11 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         }
     };
 
-    let val = match input_str.parse::<i64>() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("{}invalid numerical value: '{}'", LOG_ERROR, input_str);
+    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{}{}", LOG_ERROR, e);
             return;
-        }
-    };
-
-    let real_id = if ctx.use_id {
-        val
-    } else {
-        let meta = db.fetch_metadata(crate::core::get_max_history());
-        match meta.get(val as usize) {
-            Some(&(id, ..)) => id,
-            None => {
-                eprintln!("{}index [{}] is out of bounds.", LOG_ERROR, val);
-                return;
-            }
         }
     };
 

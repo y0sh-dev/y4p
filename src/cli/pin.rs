@@ -34,26 +34,11 @@ pub(crate) fn set_pin_state(args: &[String], db: &mut ClipboardDb, is_pinned: bo
         }
     };
 
-    let val = match input_str.parse::<i64>() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("{}invalid numerical value: '{}'", LOG_ERROR, input_str);
+    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{}{}", LOG_ERROR, e);
             return;
-        }
-    };
-
-    // Resolve real_id: directly from input or via metadata offset (identical
-    // to cleaning::delete_run's resolution logic).
-    let real_id = if ctx.use_id {
-        val
-    } else {
-        let meta = db.fetch_metadata(crate::core::get_max_history());
-        match meta.get(val as usize) {
-            Some(&(id, ..)) => id,
-            None => {
-                eprintln!("{}index [{}] is out of bounds.", LOG_ERROR, val);
-                return;
-            }
         }
     };
 
