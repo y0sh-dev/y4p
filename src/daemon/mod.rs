@@ -69,6 +69,8 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
 
     // Read-side connection, separate from the worker's writer connection.
     // WAL mode lets the two run concurrently without any in-process lock.
+    // Kept as a local here (rather than inside `WaylandState`, per the
+    // module-boundary fix) and threaded explicitly to whatever needs it.
     let read_db = match ClipboardDb::open() {
         Ok(d) => d,
         Err(e) => {
@@ -76,10 +78,10 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
             return false;
         }
     };
-    let mut state = WaylandState::new_daemon(read_db, writer.sender(), verbose);
+    let mut state = WaylandState::new_daemon(writer.sender(), verbose);
 
     // Pre-load last data for deduplication.
-    state.last_data = state.db.as_ref().and_then(|d| d.get_latest_data()).unwrap_or_default();
+    state.last_data = read_db.get_latest_data().unwrap_or_default();
     state.target_mime = DEFAULT_MIME.to_string();
 
     if event_queue.roundtrip(&mut state).is_err() {
@@ -124,7 +126,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
             && let Some(cmd) = ipc::accept_and_dispatch(&listener, || metrics.format_status(state.paused)) {
                 match cmd {
                     Command::Exit => crate::core::request_exit(),
-                    Command::Restore(real_id) => handle_restore_request(&mut state, &qh, real_id, &conn, &metrics),
+                    Command::Restore(real_id) => handle_restore_request(&mut state, &qh, real_id, &conn, &metrics, &read_db),
                     Command::Status => {}
                     Command::Pause => {
                         state.paused = true;
@@ -179,14 +181,18 @@ fn bind_data_device(
 /// (text) still go through the existing `get_content_by_id` (`Vec<u8>`) path,
 /// since by construction (see `insert_with_hash`) they're never the
 /// large-payload case this exists for.
+///
+/// `read_db` is passed explicitly rather than stored on `WaylandState` (the
+/// wayland sensor layer must not depend on `storage`).
 fn handle_restore_request(
     state: &mut WaylandState,
     qh: &wayland_client::QueueHandle<WaylandState>,
     real_id: i64,
     conn: &wayland_client::Connection,
     metrics: &DaemonMetrics,
+    read_db: &ClipboardDb,
 ) {
-    let resolved = state.db.as_ref().and_then(|db| db.locate_content(real_id));
+    let resolved = read_db.locate_content(real_id);
 
     if let Some((mime, location)) = resolved
         && let Some(ref manager) = state.manager {
@@ -194,8 +200,7 @@ fn handle_restore_request(
 
         let payload = match location {
             ContentLocation::InlineBlob(id) => {
-                let data = state.db.as_ref()
-                    .and_then(|db| db.get_content_by_id(id))
+                let data = read_db.get_content_by_id(id)
                     .map(|(_, d)| d)
                     .unwrap_or_default();
                 SourcePayload::Owned(data)

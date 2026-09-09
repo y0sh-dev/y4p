@@ -3,7 +3,6 @@
 
 // src/wayland/state.rs
 
-use crate::storage::ClipboardDb;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::ExtDataControlDeviceV1,
@@ -52,11 +51,6 @@ pub struct WaylandState {
     pub seat: Option<WlSeat>,
     pub seat_id: Option<u32>,
     pub device: Option<ExtDataControlDeviceV1>,
-    // Only ever touched from the thread that owns `WaylandState` (the main
-    // event loop), so no Arc<Mutex<_>> is needed here — see daemon::mod for
-    // the separate, single-writer connection that runs concurrently under
-    // SQLite's WAL mode.
-    pub db: Option<ClipboardDb>,
     pub job_tx: Option<mpsc::Sender<ClipboardJob>>,
     pub verbose: bool,
     pub target_mime: String,
@@ -66,19 +60,22 @@ pub struct WaylandState {
     pub selection_received: bool,
     pub current_source: Option<ExtDataControlSourceV1>,
     // Private mode: same single-thread-owned field as the rest of this
-    // struct (see `db` above), toggled by IPC Pause/Resume.
+    // struct, toggled by IPC Pause/Resume.
     pub paused: bool,
 }
 
 impl WaylandState {
-    pub fn new_daemon(db: ClipboardDb, job_tx: mpsc::Sender<ClipboardJob>, verbose: bool) -> Self {
+    // `db` no longer lives here (architecture boundary: this I/O sensor
+    // layer must not depend on `storage`) — the daemon keeps its read-side
+    // `ClipboardDb` handle in its own scope and passes it explicitly to
+    // whatever needs it (see `daemon::handle_restore_request`).
+    pub fn new_daemon(job_tx: mpsc::Sender<ClipboardJob>, verbose: bool) -> Self {
         Self {
             manager: None,
             manager_id: None,
             seat: None,
             seat_id: None,
             device: None,
-            db: Some(db),
             job_tx: Some(job_tx),
             verbose,
             target_mime: String::new(),
@@ -98,7 +95,6 @@ impl WaylandState {
             seat: None,
             seat_id: None,
             device: None,
-            db: None,
             job_tx: None,
             verbose,
             target_mime,
