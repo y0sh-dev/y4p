@@ -3,6 +3,8 @@
 
 // src/cli/utils.rs
 
+use crate::storage::ClipboardDb;
+
 /// Categories for history range selection.
 #[derive(Debug, PartialEq)]
 pub enum RangeSelection {
@@ -120,4 +122,33 @@ pub fn parse_range(arg: Option<&String>, default_limit: usize) -> Result<RangeSe
 
     let n = s.parse::<usize>().map_err(|_| format!("invalid ID: {}", s))?;
     Ok(RangeSelection::Single(n))
+}
+
+/// Parses a single CLI positional argument into a target's persistent
+/// database ID, shared by every subcommand that accepts "an MRU index, or
+/// `--id`/`-i` for a stable ID" (`pin`, `unpin`, `show`, `delete`, `copy-to`).
+///
+/// Parses as `i64` (not `usize`) specifically so a negative value like "-1"
+/// is caught and rejected here — every call site used to `as usize` its own
+/// parsed value directly, which silently underflows a negative number into
+/// something near `usize::MAX` instead of failing.
+///
+/// `use_id` selects the interpretation of the parsed value: taken directly
+/// as the immutable ID when true, otherwise resolved as an offset into the
+/// current MRU history via `fetch_metadata`.
+pub fn resolve_target_id(input: &str, use_id: bool, db: &ClipboardDb) -> Result<i64, String> {
+    let val = input.parse::<i64>().map_err(|_| format!("invalid numerical value: '{}'", input))?;
+    if val < 0 {
+        return Err(format!("index cannot be negative: {}", val));
+    }
+
+    if use_id {
+        return Ok(val);
+    }
+
+    let meta = db.fetch_metadata(crate::core::get_max_history());
+    match meta.get(val as usize) {
+        Some(&(id, ..)) => Ok(id),
+        None => Err(format!("index [{}] is out of bounds.", val)),
+    }
 }
