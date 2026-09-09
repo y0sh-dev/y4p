@@ -22,13 +22,14 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
         Some(s) => s,
         None => { eprintln!("{}missing ID.", LOG_ERROR); return; }
     };
-    let val = input_str.parse::<i64>().unwrap_or(-1);
-    let real_id = if ctx.use_id { val } else {
-        let meta = db.fetch_metadata(crate::core::get_max_history());
-        meta.get(val as usize).map(|m| m.0).unwrap_or(-1)
-    };
 
-    if real_id == -1 { eprintln!("{}invalid ID.", LOG_ERROR); return; }
+    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("{}{}", LOG_ERROR, e);
+            return;
+        }
+    };
 
     // 3. Update MRU in DB
     let _ = db.update_timestamp(real_id);
@@ -42,7 +43,9 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
             
             if stream.write_all(&payload).is_ok() {
                 let _ = stream.flush();
-                if ctx.verbose { println!("{}", log_restore(val as usize)); }
+                // Logs the resolved persistent ID (not the raw CLI input,
+                // which may have been an MRU offset rather than an ID at all).
+                if ctx.verbose { println!("{}", log_restore(real_id as usize)); }
             }
         }
         Err(_) => {
