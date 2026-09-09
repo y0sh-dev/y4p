@@ -41,6 +41,19 @@ impl SchemaManager {
                 .map_err(|e| e.to_string())?;
         }
 
+        // Deliberately outside the `version` gate, unlike the migrations
+        // above: a DB that already reached version 2 before idx_pinned_ts
+        // existed would otherwise keep the stale single-column idx_pinned
+        // forever, since `migrate_to_v2` never runs again for it. Both
+        // statements are cheap no-ops once the index is already correct, so
+        // running them unconditionally on every startup costs nothing and
+        // self-heals regardless of migration history.
+        conn.execute("DROP INDEX IF EXISTS idx_pinned", []).ok();
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pinned_ts ON clipboard(is_pinned, timestamp DESC)",
+            [],
+        ).ok();
+
         Ok(())
     }
 
@@ -76,7 +89,8 @@ impl SchemaManager {
                 .map_err(|e| format!("v2 migration failed: {}", e))?;
         }
 
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pinned ON clipboard(is_pinned)", []).ok();
+        // Index creation for is_pinned lives in `initialize` (unconditional,
+        // outside the version gate) rather than here — see its comment.
         Ok(())
     }
 }
