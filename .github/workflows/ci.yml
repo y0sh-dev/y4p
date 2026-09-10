@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run Miri on Pure Rust Utils
-        run: cargo miri test --lib core::utils
+        run: cargo miri test --bin y4p core::utils
 
   asan:
     name: AddressSanitizer (Memory Safety)
@@ -86,4 +86,4 @@ jobs:
         # -Zbuild-std: the sanitizer must also instrument std itself (libc
         # FFI, allocator) for ASan to see across the crate/std boundary —
         # `-Zsanitizer=address` alone only instruments this crate's own code.
-        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- --nocapture
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --bin y4p -- --nocapture
