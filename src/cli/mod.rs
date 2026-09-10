@@ -3,6 +3,12 @@
 
 // src/cli/mod.rs
 
+// `cli` is the CLI entry point: exiting with a clear error/exit code on an
+// unrecoverable input is the correct behavior here, unlike the resident
+// daemon/storage/wayland layers this crate otherwise denies unwrap/expect/
+// panic in (see [lints.clippy] in Cargo.toml).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod daemon;
 mod list;
 mod show;

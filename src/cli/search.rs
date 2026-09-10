@@ -7,7 +7,7 @@ use crate::storage::ClipboardDb;
 use crate::core::constants::*;
 use crate::cli::utils::ArgContext;
 use std::collections::HashSet;
-use super::list;
+use super::list::{self, IndexItem};
 
 /// Search through metadata history and render results using strict argument validation.
 pub fn run(args: &[String], db: &ClipboardDb) {
@@ -64,8 +64,7 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         return;
     }
 
-    let refs: Vec<(usize, &(i64, i64, String, i64, Option<String>, bool))> =
-        results.iter().map(|(abs_idx, item)| (*abs_idx, item)).collect();
+    let refs: Vec<IndexItem> = results.iter().map(|(abs_idx, item)| (*abs_idx, item)).collect();
 
     let title = format!("search: '{}' ({} hits)", valid.join(" AND "), results.len());
 
