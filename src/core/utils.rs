@@ -96,6 +96,7 @@ pub fn mime_base_eq(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

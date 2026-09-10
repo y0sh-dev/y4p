@@ -109,6 +109,7 @@ pub fn get_socket_path() -> PathBuf {
     }
 
     // Fallback: still per-user (uid-suffixed) to avoid cross-user collisions.
+    // SAFETY: `getuid()` takes no arguments and cannot fail.
     PathBuf::from(format!("/tmp/{}.{}.sock", DB_DIR_NAME, unsafe { libc::getuid() }))
 }
 

@@ -24,13 +24,20 @@ pub struct AlignedBuffer {
 }
 
 impl AlignedBuffer {
-    pub fn new(size: usize, align: usize) -> Self {
-        let layout = Layout::from_size_align(size, align).expect("invalid alignment layout");
+    /// `None` on an invalid size/align combination — the caller (a spawned
+    /// ingestion thread) skips this job instead of unwinding; with
+    /// `panic = "abort"` in the release profile, a panic here would have
+    /// taken down the whole daemon process, not just this one thread.
+    pub fn new(size: usize, align: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(size, align).ok()?;
+        // SAFETY: `layout` has a non-zero size (always 65536 at the only
+        // call site) and `align` (4096) is a valid power-of-two alignment,
+        // satisfying `GlobalAlloc::alloc`'s preconditions.
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        Self { ptr, layout }
+        Some(Self { ptr, layout })
     }
 
     /// SOUNDNESS BUGFIX: the previous signature was
@@ -53,12 +60,18 @@ impl AlignedBuffer {
     /// lifetime to `&mut self` as normal Rust elision would, which is what
     /// was clearly intended.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `self.ptr` was allocated by `alloc` in `new` with exactly
+        // `self.layout`, is never null (checked at allocation time), and
+        // this `&mut self` borrow means no other slice into it can be alive.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
     }
 }
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
+        // SAFETY: `self.ptr`/`self.layout` are exactly the pointer and
+        // layout `alloc` returned/was given in `new`, and `drop` runs at
+        // most once.
         unsafe { dealloc(self.ptr, self.layout); }
     }
 }
@@ -120,17 +133,23 @@ fn is_sensitive(mimes: &[String]) -> bool {
 /// Implements immediate RAII wrapping to prevent FD leaks during setup failures.
 fn make_pipe(is_image: bool) -> Option<(std::fs::File, OwnedFd)> {
     let mut fds = [0i32; 2];
-    
-    // Attempt to create the raw pipe
+
+    // SAFETY: `fds` is a valid, correctly-sized `&mut [c_int; 2]` for
+    // `pipe(2)` to write its two returned descriptors into.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return None; 
+        return None;
     }
 
     // RAII Safety: Immediately wrap raw FDs.
     // If the function returns early after this point, FDs are automatically closed.
+    // SAFETY: `fds[0]` is a freshly-created, open, unique descriptor `pipe(2)`
+    // just returned above, wrapped here exactly once.
     let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: same as `read_fd` above, for the pipe's other (write) end.
     let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
+    // SAFETY: every `libc` call below only reads/sets flags on the two FDs
+    // owned above (still valid — neither `OwnedFd` has been dropped yet).
     unsafe {
         for fd in &[read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
             let flags = libc::fcntl(*fd, libc::F_GETFL, 0);

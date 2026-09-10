@@ -88,7 +88,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                     let mut payload = Vec::with_capacity(1048576);
                     let mut reader = read_file.take(268435456);
 
-                    let mut chunk_buffer = super::AlignedBuffer::new(65536, 4096);
+                    // Malformed size/align is unreachable with these fixed
+                    // literals, but skip this one ingestion job rather than
+                    // unwind if it ever weren't (see `AlignedBuffer::new`).
+                    let Some(mut chunk_buffer) = super::AlignedBuffer::new(65536, 4096) else { return; };
                     let chunk = chunk_buffer.as_mut_slice();
 
                     let mut hasher = (!is_uri_list).then(Sha3_256::new);
@@ -146,6 +149,9 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                         hash,
                     });
 
+                    // SAFETY: `malloc_trim(0)` only requests the allocator
+                    // release free pages back to the OS; it doesn't touch
+                    // any live allocation this thread holds.
                     #[cfg(target_os = "linux")]
                     unsafe { libc::malloc_trim(0); }
                 });

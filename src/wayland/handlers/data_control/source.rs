@@ -20,6 +20,9 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
         match ev {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
                 if mime_is_compatible(&mime_type, &meta.mime) {
+                    // SAFETY: `raw` is the valid, open fd the compositor
+                    // just handed us in this `Send` event; `fcntl` only
+                    // reads/sets its status flags.
                     unsafe {
                         let raw = fd.as_raw_fd();
                         let flags = libc::fcntl(raw, libc::F_GETFL, 0);
@@ -123,6 +126,9 @@ fn send_via_sendfile(path: &Path, dest: OwnedFd) {
         // clipboard payloads are far below that, but chunk defensively
         // rather than assume any particular kernel's exact ceiling.
         let chunk = remaining.min(1usize << 30);
+        // SAFETY: `dest_fd`/`src_fd` are valid, open descriptors owned by
+        // `dest_file`/`src_file` (alive for this whole call), and `offset`
+        // is a valid `&mut libc::off_t` for `sendfile(2)` to advance.
         let n = unsafe { libc::sendfile(dest_fd, src_fd, &mut offset, chunk) };
 
         if n < 0 {

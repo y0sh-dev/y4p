@@ -30,6 +30,9 @@ impl DbWorker {
                     Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
                 }
                 // Return freed heap to the OS after each large payload.
+                // SAFETY: `malloc_trim(0)` only requests the allocator
+                // release free pages back to the OS; it doesn't touch any
+                // live allocation this thread holds.
                 #[cfg(target_os = "linux")]
                 unsafe { libc::malloc_trim(0); }
             }

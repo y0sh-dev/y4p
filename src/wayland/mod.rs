@@ -8,21 +8,22 @@ pub mod handlers;
 
 use wayland_client::{Connection, EventQueue};
 pub use self::state::WaylandState;
-use crate::core::constants::*;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Instant, Duration};
 
-/// Establish a connection to the Wayland compositor.
-pub fn create_connection() -> (Connection, EventQueue<WaylandState>) {
-    let conn = Connection::connect_to_env().expect(MSG_WAYLAND_CONN_FAIL);
+/// Establish a connection to the Wayland compositor. `None` when no
+/// compositor is reachable (e.g. `DISPLAY`/`WAYLAND_DISPLAY` unset) — the
+/// caller decides how to report that instead of this sensor layer panicking.
+pub fn create_connection() -> Option<(Connection, EventQueue<WaylandState>)> {
+    let conn = Connection::connect_to_env().ok()?;
     let event_queue = conn.new_event_queue();
-    (conn, event_queue)
+    Some((conn, event_queue))
 }
 
 /// Extract data from the system clipboard with strict timeout and lifecycle management.
 /// Prevents indefinite hangs by using poll-based non-blocking dispatch.
 pub fn paste_from_os(mime: &str) -> Vec<u8> {
-    let (conn, mut event_queue) = create_connection();
+    let Some((conn, mut event_queue)) = create_connection() else { return Vec::new(); };
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
@@ -59,6 +60,8 @@ pub fn paste_from_os(mime: &str) -> Vec<u8> {
         let _ = conn.flush();
 
         // Wait for FD activity with a 200ms sub-timeout
+        // SAFETY: `poll_fds` is a valid, correctly-sized array of `pollfd`
+        // for `poll(2)` to read from and write `revents` back into.
         let poll_res = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, 200) };
 
         if poll_res > 0 {
