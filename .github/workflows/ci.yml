@@ -11,9 +11,6 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # -------------------------------------------------------------
-  # Job 1: 高速静的解析 & コード規約チェック (目標: < 40秒)
-  # -------------------------------------------------------------
   lint:
     name: Lint & Static Analysis
     runs-on: ubuntu-latest
@@ -36,9 +33,6 @@ jobs:
             -W clippy::cast_lossless \
             -W clippy::redundant_clone
 
-  # -------------------------------------------------------------
-  # Job 2: 単体・統合・並行性テスト (目標: < 1.5分)
-  # -------------------------------------------------------------
   test:
     name: Unit & Concurrency Tests
     runs-on: ubuntu-latest
@@ -54,9 +48,6 @@ jobs:
       - name: Run Headless Test Suite
         run: cargo test --verbose -- --nocapture
 
-  # -------------------------------------------------------------
-  # Job 3: コア層の未定義動作検証 (目標: < 45秒)
-  # -------------------------------------------------------------
   miri:
     name: Miri (Core Utils UB Check)
     runs-on: ubuntu-latest
@@ -74,9 +65,6 @@ jobs:
       - name: Run Miri on Pure Rust Utils
         run: cargo miri test --lib core::utils
 
-  # -------------------------------------------------------------
-  # Job 4: メモリ安全性・FFI境界検証 (目標: < 1.5分)
-  # -------------------------------------------------------------
   asan:
     name: AddressSanitizer (Memory Safety)
     runs-on: ubuntu-latest
