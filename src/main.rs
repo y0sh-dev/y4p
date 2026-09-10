@@ -32,6 +32,8 @@ fn main() {
     // Ignore SIGPIPE: a reader disappearing mid-write (e.g. a Wayland client
     // closing the destination fd of an offer.receive()) must surface as an
     // EPIPE on the write, never as process termination.
+    // SAFETY: `signal` is called with a valid signal number and one of the
+    // two `SIG_*` constants, per its documented contract.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
 
     let args: Vec<String> = std::env::args().collect();
@@ -48,6 +50,11 @@ fn main() {
     // needed to wake it up — setting the flag is sufficient. Non-daemon
     // invocations must simply exit themselves and must never touch the
     // daemon's socket.
+    // Startup precondition, not resident event-loop code (the Non-fatal
+    // Isolation Scope covers core/storage/wayland/daemon, not this
+    // entry point): a process that can't install its own signal handler
+    // has nothing safe left to fall back to, so failing fast here is correct.
+    #[allow(clippy::expect_used)]
     ctrlc::set_handler(move || {
         if crate::core::is_exiting() {
             // Second Ctrl+C: force-exit immediately regardless of role.

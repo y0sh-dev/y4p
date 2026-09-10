@@ -8,8 +8,11 @@ use super::formatter;
 use super::utils::{self, RangeSelection, ArgContext};
 use crate::core::constants::*;
 
-type ItemData = (i64, i64, String, i64, Option<String>, bool);
-type IndexItem<'a> = (usize, &'a ItemData);
+// `pub(crate)`: also named directly by `search.rs`, which builds the same
+// (abs_idx, &row) shape from its own `search_metadata` results, to avoid
+// re-spelling the same 6-element tuple type there (clippy::type_complexity).
+pub(crate) type ItemData = (i64, i64, String, i64, Option<String>, bool);
+pub(crate) type IndexItem<'a> = (usize, &'a ItemData);
 
 /// Entry point for the 'list' command.
 pub fn run(args: &[String], db: &ClipboardDb) {

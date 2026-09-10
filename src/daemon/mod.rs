@@ -63,7 +63,10 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
     let max_history = crate::core::get_max_history();
     let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history);
 
-    let (conn, mut event_queue) = wayland::create_connection();
+    let Some((conn, mut event_queue)) = wayland::create_connection() else {
+        eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);
+        return false;
+    };
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
@@ -118,6 +121,8 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
             libc::pollfd { fd: listener.as_fd().as_raw_fd(),  events: libc::POLLIN, revents: 0 },
         ];
 
+        // SAFETY: `poll_fds` is a valid, correctly-sized array of `pollfd`
+        // for `poll(2)` to read from and write `revents` back into.
         if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 
         // IPC Ingress Handling: Status replies inline via `accept_and_dispatch`;

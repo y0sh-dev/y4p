@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Strict Clippy Audit
+        run: |
+          cargo clippy --all-targets -- \
+            -D warnings \
+            -W clippy::undocumented_unsafe_blocks \
+            -W clippy::cast_lossless \
+            -W clippy::redundant_clone
+
+  test:
+    name: Unit & Concurrency Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Headless Test Suite
+        run: cargo test --verbose -- --nocapture
+
+  miri:
+    name: Miri (Core Utils UB Check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Miri on Pure Rust Utils
+        run: cargo miri test --lib core::utils
+
+  asan:
+    name: AddressSanitizer (Memory Safety)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests with ASan
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+        # -Zbuild-std: the sanitizer must also instrument std itself (libc
+        # FFI, allocator) for ASan to see across the crate/std boundary —
+        # `-Zsanitizer=address` alone only instruments this crate's own code.
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- --nocapture
