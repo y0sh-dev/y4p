@@ -1,6 +1,6 @@
 [package]
 name = "y4p"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2024"
 description = "A robust, unified clipboard manager for Wayland with SQLite storage."
 license = "GPL-3.0-or-later"
@@ -34,6 +34,12 @@ codegen-units = 1
 opt-level = "s"
 panic = "abort"
 
+# y4p is a resident daemon, and this profile's `panic = "abort"` means an
+# unwrap()/expect()/panic! anywhere in its call graph — even inside a
+# spawned worker thread — aborts the *whole* process, not just that thread.
+# Denied crate-wide; `src/cli` (the CLI entry point) and `#[cfg(test)]` code
+# carve out their own `#![allow(...)]`/`#[allow(...)]` overrides where a
+# hard failure or test assertion is actually the correct behavior.
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

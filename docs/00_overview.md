@@ -70,25 +70,25 @@ Four layers. Each with one job.
                   /        |          |          \
                  v         v          v           v
               core     storage     wayland      daemon
-                          ^           |            |
-                          |           |            |
-                          |     storage::           |
-                          |   ContentLocation        |
-                          |     (one type)           |
-                          +-----------<--------------+
+                          ^                        |  |
+                          |                        |  |
+                          +----------<-------------+  |
+                                                       v
+                                                    wayland
 
               cli  ------------------>  storage
               cli  ------------------>  core
               daemon  ---------------->  wayland
+              daemon  ---------------->  storage
 ```
 
-The one direction worth noticing is `wayland --> storage::ContentLocation`.
+`wayland` does not depend on `storage` — it doesn't know SQLite exists. `daemon` is the only module that depends on both, and it's the one place that translates between them.
 
-The egress path needs to know whether a record's payload lives inline in SQLite, or out in the file cache. So it depends on that one type — not on the rest of storage's internals.
+Concretely: `daemon::handle_restore_request` asks `storage::ClipboardDb::locate_content` where a record's payload lives — inline in SQLite, or out in the file cache — and gets back a `storage::ContentLocation`. It then re-expresses that answer as a `wayland::state::SourcePayload`, which is the only vocabulary `wayland/handlers/data_control::source` actually understands. `wayland` receives a payload it can hand to the compositor; it never sees `ContentLocation`, and never imports from `storage` to interpret one.
 
-Nothing under `storage/` or `core/` ever imports from `wayland/`, `daemon/`, or `cli/`. Dependencies only flow inward, toward `core`.
+Nothing under `storage/`, `wayland/`, or `core/` ever imports from `daemon/` or `cli/`. Dependencies only flow inward, toward `core`, and the wayland/storage boundary in particular only ever gets crossed by `daemon`, never directly.
 
-That's a deliberate constraint. It's what lets `storage` be tested and reasoned about without ever having to stand up a real Wayland connection.
+That's a deliberate constraint. It's what lets `storage` be tested and reasoned about without ever having to stand up a real Wayland connection — and what lets `wayland` be tested without ever having to stand up a real database.
 
 ---
 
@@ -99,6 +99,6 @@ Pick the row that matches what's actually on your mind. Each one is a self-conta
 | What you want to know | File to read |
 | :--- | :--- |
 | Why the daemon multiplexes Wayland and IPC on a single thread, why ingestion hashes and buffers in one pass, and how `provider_locks` stops the daemon from re-ingesting its own restores | [01 — Wayland Protocol & Streaming I/O](01_wayland_streaming_io.md) |
-| Why text and large binaries live in two different storage engines, how schema migrations stay safe across upgrades, and how Pin protection carves pinned records out of the rotation limit | [02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md) |
-| Why every database write funnels through one worker thread, and why the daemon explicitly returns memory to the OS after a large payload | [03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md) |
-| Why display order (MRU) and identity (stable ID) are deliberately two different numbers, and why the CLI treats an unrecognized flag as an error, never a guess | [04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md) |
+| Why text and large binaries live in two different storage engines, how schema migrations stay safe across upgrades, how history rotation reached near-O(1) cost, and how Pin protection carves pinned records out of the rotation limit | [02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md) |
+| Why every database write funnels through one worker thread, why the daemon explicitly returns memory to the OS after a large payload, and how `open_read_only` moves the single-writer rule from convention to something SQLite itself enforces | [03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md) |
+| Why display order (MRU) and identity (stable ID) are deliberately two different numbers, why a window function was eliminated from search, why `--raw` output is an unbreakable API contract, why negative indices are rejected outright, and why the CLI treats an unrecognized flag as an error, never a guess | [04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md) |

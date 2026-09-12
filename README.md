@@ -8,7 +8,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)
-[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.2.5-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` is a standalone clipboard manager, built natively for Wayland.
 

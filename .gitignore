@@ -1,7 +1,6 @@
 # --- Rust Artifacts ---
 /target/
 /.idea/
-Cargo.lock
 
 # --- Storage / Databases ---
 # Block SQLite databases and transaction logs anywhere in the workspace
