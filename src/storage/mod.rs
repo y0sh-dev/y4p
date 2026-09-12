@@ -96,6 +96,7 @@ impl ClipboardDb {
     ///
     /// Not yet wired into any caller (daemon's `read_db`, the read-only CLI
     /// commands) by design — this task adds the constructor only, per spec.
+    // TODO(v0.3.0): Integrate into CLI read commands and daemon read_db
     #[allow(dead_code)]
     pub fn open_read_only() -> Result<Self, String> {
         let db_path = crate::core::get_db_path();
