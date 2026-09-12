@@ -4,6 +4,7 @@
 // src/storage/db.rs
 
 use rusqlite::{params, Connection, Result};
+use rusqlite::types::ValueRef;
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::core::constants::{SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
@@ -58,9 +59,14 @@ impl SqliteStore {
         } else {
             // "application/xhtml+xml" doesn't contain "text" itself (unlike
             // text/html), so it needs its own check here to get a preview at
-            // all rather than falling through to `None`.
+            // all rather than falling through to `None`. Also decides the
+            // `content` storage class below, so search's `content LIKE ?`
+            // (see search_metadata/validate_keywords) always lines up with
+            // what actually got stored as TEXT vs BLOB.
             let is_markup = mime == "text/html" || mime.contains("xhtml");
-            let preview = if mime.contains("text") || mime.contains("uri-list") || is_markup {
+            let is_text_like = mime.contains("text") || mime.contains("uri-list") || mime.contains("json") || is_markup;
+
+            let preview = if is_text_like {
                 // Rich markup's raw tags aren't a readable preview — strip
                 // them first so the preview column always shows plain,
                 // scannable text instead of leaking `<div>`/`<strong>` etc.
@@ -73,35 +79,60 @@ impl SqliteStore {
                 Some(s.chars().take(PREVIEW_CHARS).collect::<String>().replace('\n', " "))
             } else { None };
 
-            let db_content = if is_image { None } else { Some(data) };
-
-            tx.execute(
-                "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![ts, mime, data.len() as i64, preview, db_content, hash],
-            ).map_err(|e| e.to_string())?;
+            // TEXT storage class for textual content: lets `content LIKE ?`
+            // match directly, without a per-row `CAST(content AS TEXT)` at
+            // query time. Bytes claiming a text MIME but not actually valid
+            // UTF-8 fall through to the ordinary BLOB path rather than being
+            // rejected or corrupted.
+            if is_text_like && let Ok(text) = std::str::from_utf8(data) {
+                tx.execute(
+                    "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![ts, mime, data.len() as i64, preview, text, hash],
+                ).map_err(|e| e.to_string())?;
+            } else {
+                let db_content = if is_image { None } else { Some(data) };
+                tx.execute(
+                    "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![ts, mime, data.len() as i64, preview, db_content, hash],
+                ).map_err(|e| e.to_string())?;
+            }
 
             tx.last_insert_rowid()
         };
 
-        // G-10: rotation only ever counts/evicts unpinned rows — both the
-        // outer candidate filter and the inner "keep newest N" subquery are
-        // scoped to `is_pinned = 0`, so pinned rows are never candidates for
-        // eviction AND never consume the unpinned history quota.
+        // G-10: rotation only ever counts/evicts unpinned rows, so both
+        // queries below filter to `is_pinned = 0` before applying the
+        // OFFSET — pinned rows are never candidates for eviction AND never
+        // consume the unpinned history quota.
+        //
+        // PERF: `LIMIT -1 OFFSET ?1` seeks directly to the (max_history+1)th
+        // unpinned row in `idx_pinned_ts` and scans only what's actually
+        // expiring, instead of the previous `NOT IN (SELECT ... LIMIT ?1)`
+        // form — that forced SQLite to build a Bloom filter from the kept
+        // set and probe it against every unpinned row (cost scales with
+        // total history size, not with how much actually expired).
         let expired_hashes: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT hash FROM clipboard
                  WHERE is_pinned = 0
-                   AND id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)"
+                 ORDER BY timestamp DESC
+                 LIMIT -1 OFFSET ?1"
             ).map_err(|e| e.to_string())?;
             let rows = stmt.query_map(params![max_history as i64], |row| row.get::<_, String>(0))
                 .map_err(|e| e.to_string())?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
+        // Same expiring set as above, deleted by rowid (via `id IN (...)`)
+        // rather than re-testing `NOT IN` against the kept rows.
         tx.execute(
             "DELETE FROM clipboard
-             WHERE is_pinned = 0
-               AND id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)",
+             WHERE id IN (
+                 SELECT id FROM clipboard
+                 WHERE is_pinned = 0
+                 ORDER BY timestamp DESC
+                 LIMIT -1 OFFSET ?1
+             )",
             params![max_history as i64]
         ).map_err(|e| e.to_string())?;
 
@@ -122,19 +153,33 @@ impl SqliteStore {
     /// NULL`, but every text/uri-list record gets a non-null preview (see
     /// `upsert_record`), so that branch was dead and a match past the first
     /// `PREVIEW_CHARS` characters was silently missed. Checking `content`
-    /// unconditionally makes the full body actually searchable.
+    /// unconditionally makes the full body actually searchable. No more
+    /// `CAST(content AS TEXT)` here either — `upsert_record` now binds
+    /// textual content with TEXT storage class directly, so `content` is
+    /// already text-comparable for every row this query's mime filter admits.
+    ///
+    /// PERF: absolute index is a correlated `COUNT(*)` per candidate row
+    /// instead of `ROW_NUMBER() OVER (ORDER BY timestamp DESC)`. The window
+    /// function forced SQLite to materialize and number every row in the
+    /// table before the mime/keyword filter could run at all; this form lets
+    /// the filter (and its `idx_ts`/`idx_pinned_ts` index usage) run first,
+    /// so the `COUNT(*)` only pays for rows that actually matched. Ties
+    /// (identical `timestamp`, effectively never seen at this table's
+    /// millisecond granularity) would collapse to the same index rather than
+    /// the arbitrary-but-distinct one `ROW_NUMBER()` assigned — an accepted
+    /// difference given how the index is only ever a display/lookup key, not
+    /// a uniqueness guarantee.
     pub fn search_metadata(&self, queries: &[String], limit: usize) -> Vec<(usize, MetaRow)> {
         let and_clauses: Vec<String> = (1..=queries.len())
-            .map(|i| format!("(preview LIKE ?{i} OR CAST(content AS TEXT) LIKE ?{i})"))
+            .map(|i| format!("(preview LIKE ?{i} OR content LIKE ?{i})"))
             .collect();
         let limit_idx = queries.len() + 1;
 
         let sql = format!(
-            "SELECT abs_idx, id, timestamp, mime, size, preview, is_pinned FROM (
-                SELECT id, timestamp, mime, size, preview, content, is_pinned,
-                       ROW_NUMBER() OVER (ORDER BY timestamp DESC) - 1 AS abs_idx
-                FROM clipboard
-             ) WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
+            "SELECT (SELECT COUNT(*) FROM clipboard c2 WHERE c2.timestamp > c1.timestamp) AS abs_idx,
+                    id, timestamp, mime, size, preview, is_pinned
+             FROM clipboard c1
+             WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
                AND {}
              ORDER BY timestamp DESC LIMIT ?{}",
             and_clauses.join(" AND "), limit_idx
@@ -164,7 +209,7 @@ impl SqliteStore {
     /// Pre-sorts keywords into (valid, invalid) by a cheap `LIMIT 1`
     /// existence check per word, so `search_metadata`'s AND query only ever
     /// runs against words actually present. Same text/mime filter as the
-    /// real search, minus the ROW_NUMBER/ordering machinery it doesn't need.
+    /// real search, minus the absolute-index/ordering machinery it doesn't need.
     pub fn validate_keywords(&self, keywords: &[String]) -> (Vec<String>, Vec<String>) {
         let mut valid = Vec::new();
         let mut invalid = Vec::new();
@@ -174,7 +219,7 @@ impl SqliteStore {
             let exists = self.conn.query_row(
                 "SELECT 1 FROM clipboard
                  WHERE (mime LIKE '%text%' OR mime LIKE '%UTF8%')
-                   AND (preview LIKE ?1 OR CAST(content AS TEXT) LIKE ?1)
+                   AND (preview LIKE ?1 OR content LIKE ?1)
                  LIMIT 1",
                 params![pattern], |_| Ok(())
             ).is_ok();
@@ -207,7 +252,18 @@ impl SqliteStore {
         self.conn.query_row(
             "SELECT mime, content, hash FROM clipboard WHERE id = ?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            |row| {
+                // BUGFIX: `content` can now be TEXT storage class (v3
+                // textual rows) or BLOB (binary/legacy rows) — `row.get::<_,
+                // Vec<u8>>` only accepts BLOB and errors on TEXT. Reading
+                // via `ValueRef::as_bytes` accepts either storage class
+                // uniformly as raw bytes.
+                let content = match row.get_ref(1)? {
+                    ValueRef::Null => None,
+                    v => Some(v.as_bytes()?.to_vec()),
+                };
+                Ok((row.get(0)?, content, row.get(2)?))
+            }
         ).ok()
     }
 
