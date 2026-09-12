@@ -6,7 +6,7 @@
 use rusqlite::Connection;
 
 /// Bump this and add a `migrate_to_vN` below whenever the schema changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Schema initialization and versioned migrations, gated by `PRAGMA user_version`
 /// so an existing on-disk DB only ever runs the migrations it's missing.
@@ -34,6 +34,9 @@ impl SchemaManager {
         }
         if version < 2 {
             Self::migrate_to_v2(conn)?;
+        }
+        if version < 3 {
+            Self::migrate_to_v3(conn)?;
         }
 
         if version < SCHEMA_VERSION {
@@ -91,6 +94,26 @@ impl SchemaManager {
 
         // Index creation for is_pinned lives in `initialize` (unconditional,
         // outside the version gate) rather than here — see its comment.
+        Ok(())
+    }
+
+    /// `content` for textual MIMEs moves from BLOB to TEXT storage class
+    /// (see `db::SqliteStore::upsert_record`), so search can `content LIKE
+    /// ?` directly instead of paying a `CAST(content AS TEXT)` per row.
+    /// Backfills existing rows in place: `CAST(x AS TEXT)` on an
+    /// already-BLOB value reproduces the identical bytes, just relabeled
+    /// under TEXT storage class — no data is rewritten or lost. Same mime
+    /// predicate `upsert_record` uses to decide TEXT vs BLOB at insert time.
+    fn migrate_to_v3(conn: &mut Connection) -> Result<(), String> {
+        conn.execute(
+            "UPDATE clipboard
+             SET content = CAST(content AS TEXT)
+             WHERE content IS NOT NULL
+               AND (mime LIKE '%text%' OR mime LIKE '%uri-list%' OR mime LIKE '%json%'
+                    OR mime = 'text/html' OR mime LIKE '%xhtml%')",
+            [],
+        )
+        .map_err(|e| format!("v3 migration failed: {}", e))?;
         Ok(())
     }
 }
