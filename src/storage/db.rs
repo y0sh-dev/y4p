@@ -4,6 +4,7 @@
 // src/storage/db.rs
 
 use rusqlite::{params, Connection, Result};
+use rusqlite::types::ValueRef;
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::core::constants::{SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
@@ -251,7 +252,18 @@ impl SqliteStore {
         self.conn.query_row(
             "SELECT mime, content, hash FROM clipboard WHERE id = ?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            |row| {
+                // BUGFIX: `content` can now be TEXT storage class (v3
+                // textual rows) or BLOB (binary/legacy rows) — `row.get::<_,
+                // Vec<u8>>` only accepts BLOB and errors on TEXT. Reading
+                // via `ValueRef::as_bytes` accepts either storage class
+                // uniformly as raw bytes.
+                let content = match row.get_ref(1)? {
+                    ValueRef::Null => None,
+                    v => Some(v.as_bytes()?.to_vec()),
+                };
+                Ok((row.get(0)?, content, row.get(2)?))
+            }
         ).ok()
     }
 
