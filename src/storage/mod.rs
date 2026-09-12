@@ -7,7 +7,7 @@ mod cache;
 mod db;
 mod schema;
 
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OpenFlags, Result};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -86,6 +86,29 @@ impl ClipboardDb {
         Ok(Self { store: SqliteStore::new(conn), cache: FileCache::new(cache_dir) })
     }
 
+    /// Read-only counterpart to `open`, for callers that never write (the
+    /// daemon's `read_db`, future read-only CLI commands): `SQLITE_OPEN_READ_ONLY`
+    /// enforces the Single-Writer design at the engine level rather than by
+    /// convention alone, and `SQLITE_OPEN_NO_MUTEX` skips connection-internal
+    /// locking a connection only ever touched from one thread doesn't need.
+    /// No `SQLITE_OPEN_CREATE` — the writer (`open`) must already have run
+    /// once to create/migrate the database file this connects to.
+    ///
+    /// Not yet wired into any caller (daemon's `read_db`, the read-only CLI
+    /// commands) by design — this task adds the constructor only, per spec.
+    #[allow(dead_code)]
+    pub fn open_read_only() -> Result<Self, String> {
+        let db_path = crate::core::get_db_path();
+        let cache_dir = crate::core::get_cache_dir();
+
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).map_err(|e| format!("sqlite read-only connection failed: {}", e))?;
+
+        Ok(Self { store: SqliteStore::new(conn), cache: FileCache::new(cache_dir) })
+    }
+
     /// Public wrapper for raw data insertion. Returns the persistent row ID
     /// of the record now representing this content (either newly inserted,
     /// or the pre-existing record if this was a duplicate by hash).
@@ -136,10 +159,10 @@ impl ClipboardDb {
     /// `--id`) could therefore restore a completely different entry than
     /// the one shown.
     ///
-    /// Fixed by computing each row's absolute MRU index (`ROW_NUMBER() OVER
-    /// (ORDER BY timestamp DESC) - 1`, matching exactly how `list.rs`
-    /// derives it) over the *whole* table before filtering, so a search
-    /// result's displayed index is always consistent with `list`'s.
+    /// Fixed by computing each row's absolute MRU index (count of rows with
+    /// a strictly later timestamp, matching exactly how `list.rs` derives
+    /// it) so a search result's displayed index is always consistent with
+    /// `list`'s.
     pub fn search_metadata(&self, queries: &[String], limit: usize) -> Vec<(usize, MetaRow)> {
         if queries.is_empty() { return Vec::new(); }
         self.store.search_metadata(queries, limit)
