@@ -6,7 +6,7 @@
 use wayland_client::{Dispatch, Connection, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::{self, ExtDataControlSourceV1};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
