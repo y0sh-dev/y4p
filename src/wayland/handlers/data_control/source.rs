@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
 use super::mime_is_compatible;
 use crate::core::constants::*;
-use crate::core::utils::strip_html_tags;
+use crate::core::utils::{strip_html_tags, mime_base_eq};
 
 // --- ExtDataControlSourceV1 ---
 
@@ -19,18 +19,26 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
     fn event(state: &mut Self, _source: &ExtDataControlSourceV1, ev: ext_data_control_source_v1::Event, meta: &SourceMetadata, _: &Connection, _: &QueueHandle<Self>) {
         match ev {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
-                if mime_is_compatible(&mime_type, &meta.mime) {
-                    // SAFETY: `raw` is the valid, open fd the compositor
-                    // just handed us in this `Send` event; `fcntl` only
-                    // reads/sets its status flags.
-                    unsafe {
-                        let raw = fd.as_raw_fd();
-                        let flags = libc::fcntl(raw, libc::F_GETFL, 0);
-                        if flags >= 0 {
-                            libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-                        }
+                // SAFETY: `raw` is the valid, open fd the compositor just
+                // handed us in this `Send` event; `fcntl` only reads/sets
+                // its status flags.
+                unsafe {
+                    let raw = fd.as_raw_fd();
+                    let flags = libc::fcntl(raw, libc::F_GETFL, 0);
+                    if flags >= 0 {
+                        libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK);
                     }
+                }
 
+                // Multi-layer defense (image egress): images get their own
+                // dispatch — true MIME, text/uri-list, and on-demand
+                // image/png are all satisfiable from one stored payload, none
+                // of which `mime_is_compatible`'s any-image-to-any-image rule
+                // (built for the old, since-removed alt-Offer scheme) models
+                // correctly any more.
+                if meta.mime.starts_with("image/") {
+                    handle_image_send(&meta.mime, &meta.payload, &mime_type, fd);
+                } else if mime_is_compatible(&mime_type, &meta.mime) {
                     match &meta.payload {
                         // Kernel-level egress: hand the destination pipe
                         // straight to sendfile(2) against the cache file.
@@ -168,4 +176,153 @@ fn fallback_copy(mut src: std::fs::File, mut dest: std::fs::File, start_offset: 
         copied += n as u64;
     }
     let _ = dest.flush();
+}
+
+/// Routes a `Send` request for an image record to one of the three MIMEs
+/// `daemon::handle_restore_request` actually offers for it: the true
+/// format, `text/uri-list`, or the `image/png` compatibility layer. Any
+/// other request (a client asking for something never offered) is refused,
+/// same as the pre-existing `mime_is_compatible` fallthrough.
+fn handle_image_send(true_mime: &str, payload: &SourcePayload, requested: &str, fd: OwnedFd) {
+    if mime_base_eq(requested, true_mime) {
+        send_raw(payload, fd);
+    } else if mime_base_eq(requested, MIME_URI_LIST) {
+        send_uri_list(payload, fd);
+    } else if mime_base_eq(requested, "image/png") {
+        send_as_png(payload, fd);
+    } else {
+        drop(std::fs::File::from(fd));
+    }
+}
+
+fn clone_payload(payload: &SourcePayload) -> SourcePayload {
+    match payload {
+        SourcePayload::File(path) => SourcePayload::File(path.clone()),
+        SourcePayload::Owned(data) => SourcePayload::Owned(data.clone()),
+    }
+}
+
+/// Spawns the thread that actually performs `send_raw_blocking` — the entry
+/// point used directly from the `Send` dispatch (not yet on a thread of its
+/// own). `send_as_png`'s no-converter fallback calls the blocking variant
+/// directly instead, since it's already running on its own spawned thread.
+fn send_raw(payload: &SourcePayload, fd: OwnedFd) {
+    let owned = clone_payload(payload);
+    std::thread::spawn(move || send_raw_blocking(&owned, fd));
+}
+
+fn send_raw_blocking(payload: &SourcePayload, fd: OwnedFd) {
+    match payload {
+        SourcePayload::File(path) => send_via_sendfile(path, fd),
+        SourcePayload::Owned(data) => {
+            let mut file = std::fs::File::from(fd);
+            if let Err(e) = file.write_all(data) {
+                eprintln!("{}egress transmission failure: {}", LOG_ERROR, e);
+            }
+            let _ = file.flush();
+        }
+    }
+}
+
+/// `text/uri-list` Offer: hands file-drop-aware consumers (Discord/Telegram/
+/// file managers) a path straight to the cached original instead of inline
+/// bytes. Only meaningful for a cache-backed payload — images are always
+/// cache-backed by construction (see `storage::upsert_record`), so the
+/// `Owned` arm here is a defensive "nothing to point at", not an expected case.
+fn send_uri_list(payload: &SourcePayload, fd: OwnedFd) {
+    let SourcePayload::File(path) = payload else {
+        drop(std::fs::File::from(fd));
+        return;
+    };
+    let uri = format!("file://{}\r\n", path.display());
+    let mut file = std::fs::File::from(fd);
+    std::thread::spawn(move || {
+        if let Err(e) = file.write_all(uri.as_bytes()) {
+            eprintln!("{}egress transmission failure: {}", LOG_ERROR, e);
+        }
+        let _ = file.flush();
+    });
+}
+
+/// `image/png` compatibility Offer: every major Wayland toolkit (GTK/Qt/
+/// Chromium) hardcodes PNG as the one bitmap format it will even ask for, so
+/// a non-PNG stored image has to become one on demand here, or paste fails
+/// outright regardless of what else was Offered. Runs entirely on its own
+/// spawned thread — converter discovery and the conversion itself are both
+/// child-process calls, neither of which may ever touch the daemon's main
+/// poll loop.
+fn send_as_png(payload: &SourcePayload, fd: OwnedFd) {
+    let owned = clone_payload(payload);
+    std::thread::spawn(move || {
+        match find_png_converter().and_then(|c| convert_to_png(c, &owned)) {
+            Some(png) => {
+                let mut file = std::fs::File::from(fd);
+                if let Err(e) = file.write_all(&png) {
+                    eprintln!("{}egress transmission failure: {}", LOG_ERROR, e);
+                }
+                let _ = file.flush();
+            }
+            // No converter installed, or it failed on this particular
+            // input: send the untouched original rather than fail the
+            // paste outright — a lenient app parsing it anyway beats a
+            // guaranteed failure (see the requirement doc's §2's rationale).
+            None => send_raw_blocking(&owned, fd),
+        }
+    });
+}
+
+/// Checks for a system image converter in the priority order the
+/// requirement specifies. A `-version` invocation that spawns at all is
+/// treated as "installed" — the exit code isn't checked, since a bare
+/// version query returning non-zero on some builds wouldn't mean the tool
+/// is actually missing.
+fn find_png_converter() -> Option<&'static str> {
+    ["magick", "convert", "dwebp"].into_iter().find(|&cmd| {
+        std::process::Command::new(cmd)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+/// Runs `converter` against `payload`'s bytes and returns the resulting PNG,
+/// or `None` on any failure (missing input, non-zero exit, empty output) —
+/// every failure mode collapses to the same "couldn't convert" signal so the
+/// caller's raw-bytes fallback is the only place that has to reason about why.
+fn convert_to_png(converter: &str, payload: &SourcePayload) -> Option<Vec<u8>> {
+    match payload {
+        SourcePayload::File(path) => run_converter(converter, path),
+        SourcePayload::Owned(data) => {
+            // No cache-file path to hand the converter directly — images
+            // are always cache-backed in practice (see
+            // storage::upsert_record), so this is a defensive spill-to-disk
+            // fallback, not the expected case. Unique per call (pid +
+            // thread id) since concurrent Send events each run their own
+            // conversion on their own thread.
+            let tmp = std::env::temp_dir().join(format!(
+                "y4p-egress-{}-{:?}.tmp",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            if std::fs::write(&tmp, data).is_err() { return None; }
+            let result = run_converter(converter, &tmp);
+            let _ = std::fs::remove_file(&tmp);
+            result
+        }
+    }
+}
+
+fn run_converter(converter: &str, input: &Path) -> Option<Vec<u8>> {
+    // ImageMagick's `magick`/`convert` take an output *format*, not a path,
+    // to write to stdout (`png:-`); dwebp instead takes a literal `-o -`.
+    let args: Vec<String> = if converter == "dwebp" {
+        vec![input.to_string_lossy().into_owned(), "-o".into(), "-".into()]
+    } else {
+        vec![input.to_string_lossy().into_owned(), "png:-".into()]
+    };
+
+    let output = std::process::Command::new(converter).args(&args).output().ok()?;
+    (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
 }
