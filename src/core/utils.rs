@@ -95,6 +95,119 @@ pub fn mime_base_eq(a: &str, b: &str) -> bool {
     parse_mime(a).0 == parse_mime(b).0
 }
 
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Original Image Fetcher (v0.3.0): extracts the first `<img ... src="...">`
+/// (or `src='...'`) URL from a raw `text/html` clipboard payload.
+///
+/// Byte-slice scanning only — no HTML parser or regex crate, per the
+/// project's no-extra-dependency policy for this feature. `<img` and `src=`
+/// are matched case-insensitively via a lowercased copy; the returned URL is
+/// sliced from the *original* bytes so its casing is preserved. The search
+/// for `src=` is bounded to the first `<img...>` tag's own closing `>`, so a
+/// later, unrelated `src=` elsewhere in the document is never mistaken for
+/// this tag's attribute.
+pub fn extract_image_url_from_html(html: &[u8]) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let img_pos = find_subslice(&lower, b"<img")?;
+    let tag_end = find_subslice(&lower[img_pos..], b">")
+        .map(|rel| img_pos + rel)
+        .unwrap_or(lower.len());
+
+    let src_rel = find_subslice(&lower[img_pos..tag_end], b"src=")?;
+    let mut i = img_pos + src_rel + 4; // past "src="
+    while lower.get(i).is_some_and(u8::is_ascii_whitespace) { i += 1; }
+
+    let quote = *html.get(i)?;
+    if quote != b'"' && quote != b'\'' { return None; }
+    i += 1;
+    let start = i;
+    while html.get(i).is_some_and(|&b| b != quote) { i += 1; }
+
+    (i < html.len()).then(|| String::from_utf8_lossy(&html[start..i]).into_owned())
+}
+
+/// Strict allow-list for the Original Image Fetcher's network fetch: only
+/// `http://`/`https://` URLs are eligible. Rejects `data:image/...` (already
+/// local — no fetch needed) and `file://`/relative paths (a "network fetch"
+/// of a local path is never correct) alike, so a malformed or hostile
+/// extraction can never reach `curl` with something other than a plain web URL.
+pub fn is_valid_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Identifies an image payload's real format from its leading bytes,
+/// independent of whatever MIME label a sender (or a `curl`-fetched HTTP
+/// response's `Content-Type`, which this function never even looks at)
+/// claims. Shared by the ordinary Wayland ingestion path and the Original
+/// Image Fetcher, so both trust the bytes, never the label.
+pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 4 {
+        match &data[0..4] {
+            [0x89, 0x50, 0x4E, 0x47] => return Some("image/png"),
+            [0xFF, 0xD8, 0xFF, _] => return Some("image/jpeg"),
+            [0x47, 0x49, 0x46, 0x38] => return Some("image/gif"),
+            b"RIFF" if data.len() >= 12 && &data[8..12] == b"WEBP" => return Some("image/webp"),
+            _ => {}
+        }
+        // AVIF: ISOBMFF container — bytes 4..8 are literally "ftyp",
+        // followed by a 4-byte major brand naming the specific format.
+        if data.len() >= 12 && &data[4..8] == b"ftyp" && matches!(&data[8..12], b"avif" | b"avis") {
+            return Some("image/avif");
+        }
+    }
+
+    // SVG has no fixed magic bytes (it's XML text), so it's only checked
+    // once every binary signature above has missed.
+    let head = data.trim_ascii_start();
+    (head.starts_with(b"<?xml") || head.starts_with(b"<svg")).then_some("image/svg+xml")
+}
+
+/// Runs `curl` as a child process to fetch `url`'s raw bytes for the
+/// Original Image Fetcher. `-sL` suppresses curl's own progress output and
+/// follows redirects (a source URL captured from `text/html` is very often
+/// a CDN redirect, not the final asset); `--max-time`/`--connect-timeout`
+/// bound how long a stalled server can hold up the fetch; `--max-filesize`
+/// aborts the transfer before a hostile response can allocate unbounded
+/// memory; `--user-agent` avoids the hotlink-protection 403 some CDNs
+/// (Cloudflare, Pixiv, ...) return to obviously non-browser clients.
+///
+/// `Command::output()` buffers curl's entire stdout in memory before this
+/// returns — `--max-filesize` is what keeps that bounded, not this
+/// function's own logic.
+pub fn fetch_image_via_curl(url: &str) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("curl")
+        .arg("-sL")
+        .arg("--max-time")
+        .arg(crate::core::constants::CURL_TIMEOUT_SECS.to_string())
+        .arg("--connect-timeout")
+        .arg("3")
+        .arg("--max-filesize")
+        .arg(crate::core::constants::MAX_IMAGE_FETCH_SIZE.to_string())
+        .arg("--user-agent")
+        .arg(crate::core::constants::FETCH_USER_AGENT)
+        .arg(url)
+        .output()
+        .map_err(|e| format!("curl spawn failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("curl exited with {}", output.status));
+    }
+    if output.stdout.is_empty() {
+        return Err("curl returned an empty response".to_string());
+    }
+    // Belt-and-suspenders: `--max-filesize` should already have aborted the
+    // transfer before this point, but a size ceiling enforced entirely by an
+    // external process is never trusted without also checking it here.
+    if output.stdout.len() > crate::core::constants::MAX_IMAGE_FETCH_SIZE {
+        return Err("fetched payload exceeds MAX_IMAGE_FETCH_SIZE".to_string());
+    }
+
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -218,5 +331,133 @@ mod tests {
         let (base, params) = parse_mime("Text/Plain ; charset=UTF-8 ; foo=bar");
         assert_eq!(base, "text/plain");
         assert_eq!(params, vec!["charset=UTF-8", "foo=bar"]);
+    }
+
+    #[test]
+    fn extract_image_url_double_quoted() {
+        let html = br#"<img src="https://example.com/a.png" alt="cat">"#;
+        assert_eq!(extract_image_url_from_html(html).unwrap(), "https://example.com/a.png");
+    }
+
+    #[test]
+    fn extract_image_url_single_quoted() {
+        let html = br#"<img src='https://example.com/a.png'>"#;
+        assert_eq!(extract_image_url_from_html(html).unwrap(), "https://example.com/a.png");
+    }
+
+    #[test]
+    fn extract_image_url_case_insensitive_tag_and_attr() {
+        let html = br#"<IMG SRC="https://Example.com/A.png">"#;
+        // Extraction is case-insensitive when *finding* `<img`/`src=`, but
+        // the returned URL is sliced from the original bytes, so its own
+        // casing must come through untouched.
+        assert_eq!(extract_image_url_from_html(html).unwrap(), "https://Example.com/A.png");
+    }
+
+    #[test]
+    fn extract_image_url_attribute_order_irrelevant() {
+        let html = br#"<img alt="x" width="10" src="https://example.com/b.jpg" height="10">"#;
+        assert_eq!(extract_image_url_from_html(html).unwrap(), "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn extract_image_url_stops_at_tag_boundary() {
+        // A `src=` belonging to a second, later tag must never be picked up
+        // for the first <img> — the search is bounded by the first tag's
+        // own closing '>'.
+        let html = br#"<img alt="no src here"><a src="https://wrong.example/">text</a>"#;
+        assert_eq!(extract_image_url_from_html(html), None);
+    }
+
+    #[test]
+    fn extract_image_url_no_img_tag() {
+        assert_eq!(extract_image_url_from_html(b"<p>no image here</p>"), None);
+    }
+
+    #[test]
+    fn extract_image_url_missing_src() {
+        assert_eq!(extract_image_url_from_html(br#"<img alt="no source">"#), None);
+    }
+
+    #[test]
+    fn extract_image_url_unterminated_quote() {
+        assert_eq!(extract_image_url_from_html(br#"<img src="https://example.com/a.png>"#), None);
+    }
+
+    #[test]
+    fn extract_image_url_data_uri_passes_through_unfiltered() {
+        // Extraction itself doesn't judge the scheme — that's
+        // `is_valid_http_url`'s job (see the safety-net tests below).
+        let html = br#"<img src="data:image/png;base64,AAAA">"#;
+        assert_eq!(extract_image_url_from_html(html).unwrap(), "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn is_valid_http_url_accepts_http_and_https() {
+        assert!(is_valid_http_url("http://example.com/a.png"));
+        assert!(is_valid_http_url("https://example.com/a.png"));
+    }
+
+    #[test]
+    fn is_valid_http_url_rejects_non_network_schemes() {
+        assert!(!is_valid_http_url("data:image/png;base64,AAAA"));
+        assert!(!is_valid_http_url("file:///etc/passwd"));
+        assert!(!is_valid_http_url("/relative/path.png"));
+        assert!(!is_valid_http_url(""));
+    }
+
+    #[test]
+    fn detect_image_mime_png() {
+        assert_eq!(detect_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]), Some("image/png"));
+    }
+
+    #[test]
+    fn detect_image_mime_jpeg() {
+        assert_eq!(detect_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn detect_image_mime_gif() {
+        assert_eq!(detect_image_mime(b"GIF89a...."), Some("image/gif"));
+    }
+
+    #[test]
+    fn detect_image_mime_webp() {
+        let mut data = b"RIFF".to_vec();
+        data.extend_from_slice(&[0, 0, 0, 0]); // chunk size, irrelevant here
+        data.extend_from_slice(b"WEBP");
+        assert_eq!(detect_image_mime(&data), Some("image/webp"));
+    }
+
+    #[test]
+    fn detect_image_mime_avif() {
+        let mut data = vec![0, 0, 0, 0x20];
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"avif");
+        assert_eq!(detect_image_mime(&data), Some("image/avif"));
+    }
+
+    #[test]
+    fn detect_image_mime_avif_sequence_brand() {
+        let mut data = vec![0, 0, 0, 0x20];
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"avis");
+        assert_eq!(detect_image_mime(&data), Some("image/avif"));
+    }
+
+    #[test]
+    fn detect_image_mime_svg_xml_declaration() {
+        assert_eq!(detect_image_mime(b"<?xml version=\"1.0\"?><svg></svg>"), Some("image/svg+xml"));
+    }
+
+    #[test]
+    fn detect_image_mime_svg_bare() {
+        assert_eq!(detect_image_mime(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"), Some("image/svg+xml"));
+    }
+
+    #[test]
+    fn detect_image_mime_unrecognized_returns_none() {
+        assert_eq!(detect_image_mime(b"not an image at all"), None);
+        assert_eq!(detect_image_mime(b""), None);
     }
 }

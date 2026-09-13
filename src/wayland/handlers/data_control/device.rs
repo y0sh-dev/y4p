@@ -10,10 +10,11 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 use std::io::Read;
 use std::os::fd::AsFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use sha3::{Digest, Sha3_256};
 use crate::wayland::state::{WaylandState, OfferData, ClipboardJob};
 use crate::core::constants::*;
-use super::{make_pipe, is_sensitive};
+use super::{make_pipe, is_sensitive, AlignedBuffer};
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
     fn event(state: &mut Self, _: &ExtDataControlDeviceV1, ev: ext_data_control_device_v1::Event, _: &(), conn: &Connection, _: &QueueHandle<Self>) {
@@ -61,8 +62,28 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 .or_else(|| mimes.first().cloned())
                 .unwrap_or_else(|| DEFAULT_MIME.to_string());
 
-            // Initialize data transfer pipe
             let is_image = mime_to_get.to_ascii_lowercase().starts_with("image/");
+
+            // Original Image Fetcher (v0.3.0): a browser "copy image" nearly
+            // always offers image/* alongside text/html carrying an <img>
+            // tag pointing at the original asset. When both are present (and
+            // the daemon has somewhere to send a resulting job), try to
+            // recover that original — typically a much higher-fidelity
+            // WebP/JPEG than the re-encoded PNG the browser also put on the
+            // clipboard — before falling back to the ordinary receive path.
+            if is_image
+                && FETCH_ORIGINAL_IMAGES
+                && mimes.iter().any(|m| crate::core::utils::mime_base_eq(m, "text/html"))
+                && let Some(tx) = state.job_tx.clone()
+            {
+                let conn = conn.clone();
+                std::thread::spawn(move || {
+                    fetch_original_image(offer, conn, mime_to_get, tx);
+                });
+                return;
+            }
+
+            // Initialize data transfer pipe
             let (read_file, write_fd) = match make_pipe(is_image) {
                 Some(p) => p,
                 None => return,
@@ -70,7 +91,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 
             // Request data transmission from the compositor
             offer.receive(mime_to_get.clone(), write_fd.as_fd());
-            drop(write_fd); 
+            drop(write_fd);
             let _ = conn.flush();
 
             // Offload ingestion and persistence to the worker thread
@@ -83,77 +104,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 let is_uri_list = mime_to_get == MIME_URI_LIST;
 
                 std::thread::spawn(move || {
-                    use sha3::{Sha3_256, Digest};
-
-                    let mut payload = Vec::with_capacity(1048576);
-                    let mut reader = read_file.take(268435456);
-
-                    // Malformed size/align is unreachable with these fixed
-                    // literals, but skip this one ingestion job rather than
-                    // unwind if it ever weren't (see `AlignedBuffer::new`).
-                    let Some(mut chunk_buffer) = super::AlignedBuffer::new(65536, 4096) else { return; };
-                    let chunk = chunk_buffer.as_mut_slice();
-
-                    let mut hasher = (!is_uri_list).then(Sha3_256::new);
-
-                    while let Ok(n) = reader.read(chunk) {
-                        if n == 0 { break; }
-                        let data = &chunk[..n];
-                        if let Some(h) = hasher.as_mut() { h.update(data); }
-                        payload.extend_from_slice(data);
-                    }
-
-                    if payload.is_empty() { return; }
-                    let mut final_mime = mime_to_get;
-
-                    if is_uri_list {
-                        payload = crate::core::utils::normalize_uri_list(&payload);
-                        if payload.is_empty() { return; }
-                    } else {
-                        // Heuristic MIME identification via magic bytes
-                        let detected = if payload.len() >= 4 {
-                            match &payload[0..4] {
-                                [0x89, 0x50, 0x4E, 0x47] => Some("image/png"),
-                                [0xFF, 0xD8, 0xFF, _]    => Some("image/jpeg"),
-                                [0x47, 0x49, 0x46, 0x38] => Some("image/gif"),
-                                b"RIFF" if payload.len() >= 12 && &payload[8..12] == b"WEBP" => Some("image/webp"),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        // SVG has no fixed magic bytes (it's XML text), so it
-                        // only gets checked once the binary signatures above miss.
-                        let detected = detected.or_else(|| {
-                            let head = payload.trim_ascii_start();
-                            (head.starts_with(b"<?xml") || head.starts_with(b"<svg")).then_some("image/svg+xml")
-                        });
-                        if let Some(m) = detected { final_mime = m.to_string(); }
-                    }
-
-                    // SHA3-256 finalize() returns a GenericArray.
-                    let hash = match hasher {
-                        Some(h) => h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-                        // uri-list: fingerprint the normalized bytes actually being persisted.
-                        None => {
-                            let mut h = Sha3_256::new();
-                            h.update(&payload);
-                            h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
-                        }
-                    };
-
-                    // Send the completed payload and its SHA3 fingerprint to the persistent worker.
-                    let _ = job_tx_clone.send(ClipboardJob {
-                        mime: final_mime,
-                        data: payload,
-                        hash,
-                    });
-
-                    // SAFETY: `malloc_trim(0)` only requests the allocator
-                    // release free pages back to the OS; it doesn't touch
-                    // any live allocation this thread holds.
-                    #[cfg(target_os = "linux")]
-                    unsafe { libc::malloc_trim(0); }
+                    ingest_and_send(read_file, mime_to_get, is_uri_list, &job_tx_clone);
                 });
             } else {
                 // Action Mode: Synchronous read for immediate CLI processing
@@ -169,4 +120,134 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
     wayland_client::event_created_child!(WaylandState, ExtDataControlDeviceV1, [
         ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, OfferData { mimes: Arc::new(Mutex::new(Vec::new())) })
     ]);
+}
+
+/// Reads a MIME payload from an already-`offer.receive()`d pipe, hashes it
+/// (re-identifying images by magic bytes along the way — see
+/// `core::utils::detect_image_mime`), and forwards the finished
+/// `ClipboardJob` to the DbWorker.
+///
+/// Factored out of the Selection handler so both the ordinary ingestion
+/// path (which spawns a dedicated thread per selection) and the Original
+/// Image Fetcher's fallback (`fallback_receive_image`, called from a thread
+/// it's already running on) reach identical read/hash/send behavior without
+/// duplicating it — this function itself never spawns anything.
+fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: bool, job_tx: &mpsc::Sender<ClipboardJob>) {
+    let mut payload = Vec::with_capacity(1048576);
+    let mut reader = read_file.take(268435456);
+
+    // Malformed size/align is unreachable with these fixed literals, but
+    // skip this one ingestion job rather than unwind if it ever weren't
+    // (see `AlignedBuffer::new`).
+    let Some(mut chunk_buffer) = AlignedBuffer::new(65536, 4096) else { return; };
+    let chunk = chunk_buffer.as_mut_slice();
+
+    let mut hasher = (!is_uri_list).then(Sha3_256::new);
+
+    while let Ok(n) = reader.read(chunk) {
+        if n == 0 { break; }
+        let data = &chunk[..n];
+        if let Some(h) = hasher.as_mut() { h.update(data); }
+        payload.extend_from_slice(data);
+    }
+
+    if payload.is_empty() { return; }
+    let mut final_mime = mime_to_get;
+
+    if is_uri_list {
+        payload = crate::core::utils::normalize_uri_list(&payload);
+        if payload.is_empty() { return; }
+    } else if let Some(m) = crate::core::utils::detect_image_mime(&payload) {
+        final_mime = m.to_string();
+    }
+
+    // SHA3-256 finalize() returns a GenericArray.
+    let hash = match hasher {
+        Some(h) => h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+        // uri-list: fingerprint the normalized bytes actually being persisted.
+        None => {
+            let mut h = Sha3_256::new();
+            h.update(&payload);
+            h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        }
+    };
+
+    // Send the completed payload and its SHA3 fingerprint to the persistent worker.
+    let _ = job_tx.send(ClipboardJob { mime: final_mime, data: payload, hash });
+
+    // SAFETY: `malloc_trim(0)` only requests the allocator release free
+    // pages back to the OS; it doesn't touch any live allocation this
+    // thread holds.
+    #[cfg(target_os = "linux")]
+    unsafe { libc::malloc_trim(0); }
+}
+
+/// The pre-v0.3.0 image ingestion path, factored out so both the ordinary
+/// case (no `text/html` offered alongside the image) and the Original Image
+/// Fetcher's fallback reach it identically: request `image_mime` from
+/// `offer` over a fresh pipe, then read/hash/send exactly as before.
+fn fallback_receive_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: &mpsc::Sender<ClipboardJob>) {
+    let Some((read_file, write_fd)) = make_pipe(true) else { return; };
+    offer.receive(image_mime.clone(), write_fd.as_fd());
+    drop(write_fd);
+    let _ = conn.flush();
+    ingest_and_send(read_file, image_mime, false, job_tx);
+}
+
+/// Original Image Fetcher (v0.3.0): when a selection offers both an image
+/// and `text/html` — the common shape of a browser's "copy image" — this
+/// tries to recover the *original* asset from its source URL via `curl`,
+/// instead of settling for whatever bitmap (often a lossily downscaled
+/// `image/png`) the browser itself wrote to the clipboard.
+///
+/// Runs entirely on its own thread (spawned by the caller), so neither the
+/// `text/html` pipe read nor `curl`'s network I/O ever blocks the daemon's
+/// main `libc::poll` loop. Sending Wayland requests from this thread —
+/// `offer.receive`/`conn.flush`, used for the `text/html` request below and,
+/// on the fallback path, inside `fallback_receive_image` — is safe:
+/// `wayland-backend`'s connection state is `Send + Sync` by design, and
+/// nothing here waits on a reply; any resulting event still dispatches on
+/// the compositor's usual event-loop thread.
+fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: mpsc::Sender<ClipboardJob>) {
+    let Some((html_read, html_write)) = make_pipe(false) else {
+        fallback_receive_image(offer, conn, image_mime, &job_tx);
+        return;
+    };
+    offer.receive("text/html".to_string(), html_write.as_fd());
+    drop(html_write);
+    let _ = conn.flush();
+
+    let mut html_payload = Vec::new();
+    let mut reader = html_read.take(268435456);
+    let _ = reader.read_to_end(&mut html_payload);
+
+    let fetched = crate::core::utils::extract_image_url_from_html(&html_payload)
+        .filter(|url| crate::core::utils::is_valid_http_url(url))
+        .and_then(|url| crate::core::utils::fetch_image_via_curl(&url).ok())
+        .and_then(|bytes| crate::core::utils::detect_image_mime(&bytes).map(|mime| (bytes, mime)));
+
+    match fetched {
+        // Original bytes recovered — done. `offer.receive(image_mime, ...)`
+        // is never called in this branch, so the browser's own re-encoded
+        // bitmap is never separately received or stored alongside it (no
+        // duplicate save — see the requirement doc's section 2.3.1).
+        Some((data, mime)) => {
+            let mut hasher = Sha3_256::new();
+            hasher.update(&data);
+            let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+            let _ = job_tx.send(ClipboardJob { mime: mime.to_string(), data, hash });
+
+            // SAFETY: `malloc_trim(0)` only requests the allocator release
+            // free pages back to the OS; it doesn't touch any live
+            // allocation this thread holds.
+            #[cfg(target_os = "linux")]
+            unsafe { libc::malloc_trim(0); }
+        }
+        // No <img> URL, a non-http(s) URL (relative path, data:image/...),
+        // a failed/timed-out/non-zero curl run, or a response that isn't
+        // actually an image — every one of these falls back identically,
+        // with nothing surfaced to the user: the clipboard event is still
+        // serviced, just via the ordinary Wayland receive path.
+        None => fallback_receive_image(offer, conn, image_mime, &job_tx),
+    }
 }
