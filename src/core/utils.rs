@@ -165,6 +165,29 @@ pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
     (head.starts_with(b"<?xml") || head.starts_with(b"<svg")).then_some("image/svg+xml")
 }
 
+/// Image Hijacker quality fix: a `curl` download (or, less often, a
+/// compositor transfer) can lose its final bytes to a dropped connection or
+/// a truncating proxy without that failure ever surfacing as a non-zero
+/// exit code or an empty response — the payload just silently ends early.
+/// This detects the three formats with a fixed, well-known trailer and
+/// appends it when missing, so a subtly-truncated download still decodes
+/// instead of failing (or worse, half-rendering) in whatever application
+/// receives it. Every other format (WebP, SVG, AVIF, ...) has no single
+/// fixed byte sequence this function could safely reconstruct, so it passes
+/// through untouched rather than risk corrupting a container it doesn't
+/// actually understand.
+pub fn sanitize_image_payload(mut data: Vec<u8>, mime: &str) -> Vec<u8> {
+    const PNG_IEND: [u8; 12] = [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82];
+
+    match mime {
+        "image/jpeg" if !data.ends_with(&[0xFF, 0xD9]) => data.extend_from_slice(&[0xFF, 0xD9]),
+        "image/png" if !data.ends_with(&PNG_IEND) => data.extend_from_slice(&PNG_IEND),
+        "image/gif" if data.last() != Some(&0x3B) => data.push(0x3B),
+        _ => {}
+    }
+    data
+}
+
 /// Runs `curl` as a child process to fetch `url`'s raw bytes for the
 /// Original Image Fetcher. `-sL` suppresses curl's own progress output and
 /// follows redirects (a source URL captured from `text/html` is very often
@@ -459,5 +482,56 @@ mod tests {
     fn detect_image_mime_unrecognized_returns_none() {
         assert_eq!(detect_image_mime(b"not an image at all"), None);
         assert_eq!(detect_image_mime(b""), None);
+    }
+
+    #[test]
+    fn sanitize_jpeg_appends_missing_eoi() {
+        let truncated = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02];
+        let fixed = sanitize_image_payload(truncated, "image/jpeg");
+        assert!(fixed.ends_with(&[0xFF, 0xD9]));
+    }
+
+    #[test]
+    fn sanitize_jpeg_leaves_intact_payload_unchanged() {
+        let intact = vec![0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xD9];
+        let result = sanitize_image_payload(intact.clone(), "image/jpeg");
+        assert_eq!(result, intact);
+    }
+
+    #[test]
+    fn sanitize_png_appends_missing_iend() {
+        let truncated = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02];
+        let fixed = sanitize_image_payload(truncated, "image/png");
+        let iend: [u8; 12] = [0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82];
+        assert!(fixed.ends_with(&iend));
+    }
+
+    #[test]
+    fn sanitize_png_leaves_intact_payload_unchanged() {
+        let mut intact = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        intact.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
+        let result = sanitize_image_payload(intact.clone(), "image/png");
+        assert_eq!(result, intact);
+    }
+
+    #[test]
+    fn sanitize_gif_appends_missing_trailer() {
+        let truncated = vec![b'G', b'I', b'F', b'8', b'9', b'a', 0x01, 0x02];
+        let fixed = sanitize_image_payload(truncated, "image/gif");
+        assert_eq!(fixed.last(), Some(&0x3B));
+    }
+
+    #[test]
+    fn sanitize_gif_leaves_intact_payload_unchanged() {
+        let intact = vec![b'G', b'I', b'F', b'8', b'9', b'a', 0x3B];
+        let result = sanitize_image_payload(intact.clone(), "image/gif");
+        assert_eq!(result, intact);
+    }
+
+    #[test]
+    fn sanitize_unknown_format_passes_through_untouched() {
+        let webp = vec![b'R', b'I', b'F', b'F', 0, 0, 0, 0, b'W', b'E', b'B', b'P', 0xAB];
+        let result = sanitize_image_payload(webp.clone(), "image/webp");
+        assert_eq!(result, webp);
     }
 }

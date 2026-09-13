@@ -159,6 +159,9 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
         if payload.is_empty() { return; }
     } else if let Some(m) = crate::core::utils::detect_image_mime(&payload) {
         final_mime = m.to_string();
+        // A compositor transfer can be cut short the same way a curl
+        // download can — repair before this payload's hash is ever computed.
+        payload = crate::core::utils::sanitize_image_payload(payload, &final_mime);
     }
 
     // SHA3-256 finalize() returns a GenericArray.
@@ -232,6 +235,10 @@ fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mi
         // bitmap is never separately received or stored alongside it (no
         // duplicate save — see the requirement doc's section 2.3.1).
         Some((data, mime)) => {
+            // Sanitize before hashing: the hash persisted to SQLite, the
+            // cache filename, and the bytes served back on `copy-to` must
+            // all be computed from the exact same (possibly-repaired) data.
+            let data = crate::core::utils::sanitize_image_payload(data, mime);
             let mut hasher = Sha3_256::new();
             hasher.update(&data);
             let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
