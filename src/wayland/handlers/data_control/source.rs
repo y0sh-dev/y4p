@@ -260,6 +260,7 @@ fn dup_owned_fd(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
 
     /// A minimal, valid 1x1 lossy WebP (VP8) — small enough to embed
     /// directly, real enough for an actual system decoder to accept.
