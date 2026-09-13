@@ -107,13 +107,6 @@ pub const HTML_MIME_ALTS: &[&str] = &[
     "TEXT",
 ];
 
-pub const IMAGE_MIME_ALTS: &[&str] = &[
-    "image/png",
-    "image/webp",
-    "image/jpeg",
-    "image/gif",
-];
-
 // --- UI Layout & Formatting Settings ---
 pub const WIDTH_ID: usize      = 6;
 pub const WIDTH_WHEN: usize    = 8;

@@ -218,18 +218,18 @@ fn handle_restore_request(
         let source = manager.create_data_source(qh, meta);
 
         // Broadcaster Strategy: advertise compatible MIMEs alongside the
-        // stored one so the paste target can pick whichever it understands.
+        // stored one so the paste target can pick whichever it understands
+        // — except for images, where y4p has no transcoding engine, so
+        // `mime` (the one format the stored bytes actually are) is the only
+        // offer that can ever be honored correctly. Offering e.g. image/png
+        // for a stored WebP used to mean a paste target could request
+        // "image/png" and receive raw WebP bytes back — read by the
+        // receiver as a corrupt PNG, not a missing feature.
         source.offer(mime.clone());
 
         if mime.starts_with("image/") {
-            if mime == "image/png" {
-                for alt in IMAGE_MIME_ALTS {
-                    if *alt != mime { source.offer(alt.to_string()); }
-                }
-            } else {
-                // Non-PNG images: PNG is the broadest-compatibility fallback.
-                source.offer("image/png".to_string());
-            }
+            // No further offers — the single, true-MIME offer above is
+            // already complete and correct for images.
         } else if mime == "text/html" || mime == "application/xhtml+xml" {
             for alt in HTML_MIME_ALTS {
                 if *alt != mime { source.offer(alt.to_string()); }
