@@ -31,10 +31,10 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
                 }
 
                 // Multi-layer defense (image egress): images get their own
-                // dispatch — true MIME, text/uri-list, and on-demand
-                // image/png are all satisfiable from one stored payload, none
-                // of which `mime_is_compatible`'s any-image-to-any-image rule
-                // (built for the old, since-removed alt-Offer scheme) models
+                // dispatch — true MIME and on-demand image/png are both
+                // satisfiable from one stored payload, neither of which
+                // `mime_is_compatible`'s any-image-to-any-image rule (built
+                // for the old, since-removed alt-Offer scheme) models
                 // correctly any more.
                 if meta.mime.starts_with("image/") {
                     handle_image_send(&meta.mime, &meta.payload, &mime_type, fd);
@@ -178,16 +178,14 @@ fn fallback_copy(mut src: std::fs::File, mut dest: std::fs::File, start_offset: 
     let _ = dest.flush();
 }
 
-/// Routes a `Send` request for an image record to one of the three MIMEs
-/// `daemon::handle_restore_request` actually offers for it: the true
-/// format, `text/uri-list`, or the `image/png` compatibility layer. Any
-/// other request (a client asking for something never offered) is refused,
-/// same as the pre-existing `mime_is_compatible` fallthrough.
+/// Routes a `Send` request for an image record to one of the two MIMEs
+/// `daemon::handle_restore_request` actually offers for it: the true format,
+/// or the `image/png` compatibility layer. Any other request (a client
+/// asking for something never offered) is refused, same as the pre-existing
+/// `mime_is_compatible` fallthrough.
 fn handle_image_send(true_mime: &str, payload: &SourcePayload, requested: &str, fd: OwnedFd) {
     if mime_base_eq(requested, true_mime) {
         send_raw(payload, fd);
-    } else if mime_base_eq(requested, MIME_URI_LIST) {
-        send_uri_list(payload, fd);
     } else if mime_base_eq(requested, "image/png") {
         send_as_png(payload, fd);
     } else {
@@ -222,26 +220,6 @@ fn send_raw_blocking(payload: &SourcePayload, fd: OwnedFd) {
             let _ = file.flush();
         }
     }
-}
-
-/// `text/uri-list` Offer: hands file-drop-aware consumers (Discord/Telegram/
-/// file managers) a path straight to the cached original instead of inline
-/// bytes. Only meaningful for a cache-backed payload — images are always
-/// cache-backed by construction (see `storage::upsert_record`), so the
-/// `Owned` arm here is a defensive "nothing to point at", not an expected case.
-fn send_uri_list(payload: &SourcePayload, fd: OwnedFd) {
-    let SourcePayload::File(path) = payload else {
-        drop(std::fs::File::from(fd));
-        return;
-    };
-    let uri = format!("file://{}\r\n", path.display());
-    let mut file = std::fs::File::from(fd);
-    std::thread::spawn(move || {
-        if let Err(e) = file.write_all(uri.as_bytes()) {
-            eprintln!("{}egress transmission failure: {}", LOG_ERROR, e);
-        }
-        let _ = file.flush();
-    });
 }
 
 /// `image/png` compatibility Offer: every major Wayland toolkit (GTK/Qt/
