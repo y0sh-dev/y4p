@@ -231,6 +231,204 @@ pub fn fetch_image_via_curl(url: &str) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
+/// True when `mime`'s base type (see `parse_mime`) matches one of the
+/// plain-text alternatives y4p treats as Ingress-sanitizable prose —
+/// `TEXT_MIME_ALTS` (`text/plain`, the raw X11/Wayland text atoms, ...).
+/// Used to gate `sanitize_text_payload` so binary/rich payloads (images,
+/// `text/html`, `application/json`, ...) are never run through URL/query
+/// rewriting meant for plain prose.
+pub fn is_text_mime(mime: &str) -> bool {
+    crate::core::constants::TEXT_MIME_ALTS.iter().any(|&alt| mime_base_eq(mime, alt))
+}
+
+/// Case-insensitive `s.get(..prefix.len())` prefix check that never panics
+/// on a short string or a multi-byte char boundary (`str::get` returns
+/// `None` for either instead of slicing).
+fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// True if `key` is one of y4p's known tracking-parameter names, given the
+/// domain-specific context already resolved by the caller. `utm_*`/`ref_*`
+/// are prefix rules (can't live in a fixed-string slice), so they're
+/// checked here directly rather than added to `UNIVERSAL_TRACKING_KEYS`.
+/// Amazon's bare `ref` is domain-gated (unlike `ref_*`, which is universal)
+/// because plenty of non-tracking sites use a bare `ref` query key too.
+fn is_tracking_key(key: &str, is_x_twitter: bool, is_amazon: bool) -> bool {
+    if starts_with_ignore_case(key, "utm_") || starts_with_ignore_case(key, "ref_") {
+        return true;
+    }
+    if crate::core::constants::UNIVERSAL_TRACKING_KEYS.iter().any(|&k| key.eq_ignore_ascii_case(k)) {
+        return true;
+    }
+    if is_x_twitter && (key.eq_ignore_ascii_case("s") || key.eq_ignore_ascii_case("t")) {
+        return true;
+    }
+    if is_amazon && key.eq_ignore_ascii_case("ref") {
+        return true;
+    }
+    false
+}
+
+/// True if `host` is exactly `domain`, or a subdomain of it (`sub.domain`
+/// — never a look-alike like `notdomain.com`).
+fn host_matches(host: &str, domain: &str) -> bool {
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
+    let Some(suffix_start) = host.len().checked_sub(domain.len() + 1) else { return false; };
+    host.as_bytes()[suffix_start] == b'.'
+        && host.get(suffix_start + 1..).is_some_and(|suf| suf.eq_ignore_ascii_case(domain))
+}
+
+/// Extracts the host (Authority, minus any `user:pass@`/port) from a URL's
+/// pre-query portion. Byte-slice scanning only: every split point comes
+/// from `find`/`split` on an ASCII delimiter, which — by UTF-8's
+/// self-synchronizing design — always lands on a char boundary, so none of
+/// this can panic even on a URL with non-ASCII path/host segments.
+fn extract_host(before_query: &str) -> &str {
+    let after_scheme = before_query.find("://").map_or(before_query, |i| &before_query[i + 3..]);
+    let end = after_scheme.find(['/', '#']).unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    let host_and_port = authority.rsplit('@').next().unwrap_or(authority);
+    host_and_port.split(':').next().unwrap_or(host_and_port)
+}
+
+/// Rebuilds `url` with every tracking query parameter (see module docs on
+/// `UNIVERSAL_TRACKING_KEYS` and the domain-specific/YouTube-`t` exception
+/// rules) removed, preserving parameter order, an untouched fragment, and
+/// dropping the `?` entirely when nothing legitimate survives. Fast-path:
+/// a URL with no `?` at all has no query to touch and is returned as-is.
+pub fn clean_url_tracking_params(url: &str) -> String {
+    let Some(q_pos) = url.find('?') else { return url.to_string(); };
+
+    let before_query = &url[..q_pos];
+    let after_query = &url[q_pos + 1..];
+    let (query, fragment) = match after_query.find('#') {
+        Some(h) => (&after_query[..h], &after_query[h..]),
+        None => (after_query, ""),
+    };
+
+    let host = extract_host(before_query);
+    let is_x_twitter = host_matches(host, "x.com") || host_matches(host, "twitter.com");
+    let is_amazon = host.split('.').any(|label| label.eq_ignore_ascii_case("amazon"));
+    let is_youtube = host_matches(host, "youtube.com") || host_matches(host, "youtu.be");
+
+    let mut kept = String::with_capacity(query.len());
+    for pair in query.split('&') {
+        if pair.is_empty() { continue; }
+        let key = pair.split('=').next().unwrap_or("");
+
+        // YouTube's `t` is a playback-start-second, never a tracking token —
+        // protected even though x.com/twitter.com's `t` (a share token) is
+        // stripped, since the two never share a host.
+        let protected = is_youtube && key.eq_ignore_ascii_case("t");
+        if protected || !is_tracking_key(key, is_x_twitter, is_amazon) {
+            if !kept.is_empty() { kept.push('&'); }
+            kept.push_str(pair);
+        }
+    }
+
+    let mut result = String::with_capacity(before_query.len() + 1 + kept.len() + fragment.len());
+    result.push_str(before_query);
+    if !kept.is_empty() {
+        result.push('?');
+        result.push_str(&kept);
+    }
+    result.push_str(fragment);
+    result
+}
+
+/// Locates the nearer of the next `"http://"`/`"https://"` occurrence in
+/// `s`, if any — the entry point `sanitize_text_payload` treats as the
+/// start of an embedded URL.
+fn find_url_start(s: &str) -> Option<usize> {
+    match (s.find("https://"), s.find("http://")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// True if `prefix` (`token` up to but not including the trailing `close`
+/// byte) contains an unmatched opening bracket for it — i.e. the trailing
+/// bracket belongs to the URL itself (e.g. a Wikipedia
+/// `(disambiguation)`-style path segment) rather than to surrounding prose.
+fn has_matching_open(prefix: &str, close: u8) -> bool {
+    let open = match close {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        _ => return false,
+    };
+    let mut depth: i32 = 0;
+    for &b in prefix.as_bytes() {
+        if b == open { depth += 1; } else if b == close { depth -= 1; }
+    }
+    depth > 0
+}
+
+/// Returns the byte length of `token` with trailing sentence punctuation
+/// (`.`, `,`, `;`, `:`, `!`, `?`, quotes) and any *unbalanced* closing
+/// bracket trimmed off, so a URL embedded in prose (`"...?si=1. cool!"`)
+/// doesn't swallow the sentence's own closing punctuation. Every trimmed
+/// byte is ASCII, so slicing at the resulting boundary can never split a
+/// multi-byte character.
+fn trim_trailing_punctuation(token: &str) -> usize {
+    let bytes = token.as_bytes();
+    let mut end = bytes.len();
+
+    while end > 0 {
+        let c = bytes[end - 1];
+        let trim = matches!(c, b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'"')
+            || (matches!(c, b')' | b']' | b'}') && !has_matching_open(&token[..end - 1], c));
+        if !trim { break; }
+        end -= 1;
+    }
+    end
+}
+
+/// Ingress-stage sanitizer for plain-text clipboard payloads: strips
+/// privacy-invasive tracking query parameters from every URL embedded in
+/// `data`, leaving everything else — prose, code, non-URL text — byte-for-
+/// byte untouched.
+///
+/// Two-stage fast path so ordinary text (the overwhelming majority of
+/// clipboard traffic) never pays for the UTF-8 decode + tokenize/rebuild
+/// below: (1) no `"://"` anywhere means no URL at all; (2) a URL with no
+/// `?` anywhere has no query string to strip. Both bail out with nothing
+/// but the mandatory `Vec<u8>` copy the return type requires. Invalid
+/// UTF-8 (rare for a `text/*` payload, but not impossible) also bails out
+/// unsanitized rather than risk corrupting it via lossy decoding.
+pub fn sanitize_text_payload(data: &[u8]) -> Vec<u8> {
+    if find_subslice(data, b"://").is_none() || !data.contains(&b'?') {
+        return data.to_vec();
+    }
+
+    let Ok(text) = std::str::from_utf8(data) else { return data.to_vec(); };
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(scheme_pos) = find_url_start(rest) {
+        out.push_str(&rest[..scheme_pos]);
+        let candidate = &rest[scheme_pos..];
+
+        let token_end = candidate.find(char::is_whitespace).unwrap_or(candidate.len());
+        let token = &candidate[..token_end];
+        let trim_end = trim_trailing_punctuation(token);
+
+        out.push_str(&clean_url_tracking_params(&token[..trim_end]));
+        out.push_str(&token[trim_end..]);
+
+        rest = &candidate[token_end..];
+    }
+    out.push_str(rest);
+
+    out.into_bytes()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -533,5 +731,196 @@ mod tests {
         let webp = vec![b'R', b'I', b'F', b'F', 0, 0, 0, 0, b'W', b'E', b'B', b'P', 0xAB];
         let result = sanitize_image_payload(webp.clone(), "image/webp");
         assert_eq!(result, webp);
+    }
+
+    // --- is_text_mime ---
+
+    #[test]
+    fn is_text_mime_accepts_plain_text_alternatives() {
+        assert!(is_text_mime("text/plain"));
+        assert!(is_text_mime("text/plain;charset=utf-8"));
+        assert!(is_text_mime("TEXT/Plain; charset=UTF-8"));
+        assert!(is_text_mime("UTF8_STRING"));
+        assert!(is_text_mime("STRING"));
+        assert!(is_text_mime("TEXT"));
+    }
+
+    #[test]
+    fn is_text_mime_rejects_non_text_alternatives() {
+        assert!(!is_text_mime("text/html"));
+        assert!(!is_text_mime("image/png"));
+        assert!(!is_text_mime("application/json"));
+        assert!(!is_text_mime(crate::core::constants::MIME_URI_LIST));
+    }
+
+    // --- clean_url_tracking_params ---
+
+    #[test]
+    fn clean_url_no_query_returns_unchanged() {
+        assert_eq!(clean_url_tracking_params("https://example.com/page"), "https://example.com/page");
+    }
+
+    #[test]
+    fn clean_url_strips_utm_case_insensitive() {
+        let url = "https://example.com/page?UTM_Source=news&UTM_Medium=email&foo=bar";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/page?foo=bar");
+    }
+
+    #[test]
+    fn clean_url_strips_all_universal_keys() {
+        let url = "https://example.com/?fbclid=1&gclid=2&gbraid=3&wbraid=4&msclkid=5&igshid=6&mc_cid=7&mc_eid=8&si=9";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/");
+    }
+
+    #[test]
+    fn clean_url_strips_ref_prefix_universally() {
+        let url = "https://example.com/?ref_src=twsrc&ref_url=abc&keep=1";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/?keep=1");
+    }
+
+    #[test]
+    fn clean_url_drops_question_mark_when_nothing_survives() {
+        assert_eq!(clean_url_tracking_params("https://example.com/page?utm_source=x"), "https://example.com/page");
+    }
+
+    #[test]
+    fn clean_url_preserves_fragment() {
+        let url = "https://example.com/page?utm_campaign=abc&foo=bar#section";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/page?foo=bar#section");
+    }
+
+    #[test]
+    fn clean_url_preserves_fragment_when_query_fully_removed() {
+        let url = "https://example.com/page?utm_source=x#top";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/page#top");
+    }
+
+    #[test]
+    fn clean_url_preserves_order_of_kept_params() {
+        let url = "https://example.com/?a=1&utm_source=x&b=2&fbclid=y&c=3";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/?a=1&b=2&c=3");
+    }
+
+    #[test]
+    fn clean_url_x_and_twitter_strip_s_and_t() {
+        let x = "https://x.com/user/status/123?s=20&t=abcXYZ";
+        assert_eq!(clean_url_tracking_params(x), "https://x.com/user/status/123");
+        let tw = "https://twitter.com/user/status/123?s=20&t=abcXYZ&lang=en";
+        assert_eq!(clean_url_tracking_params(tw), "https://twitter.com/user/status/123?lang=en");
+    }
+
+    #[test]
+    fn clean_url_s_and_t_not_stripped_off_x_twitter_domain() {
+        let url = "https://example.com/page?s=20&t=abcXYZ";
+        assert_eq!(clean_url_tracking_params(url), "https://example.com/page?s=20&t=abcXYZ");
+    }
+
+    #[test]
+    fn clean_url_amazon_strips_bare_ref() {
+        let url = "https://www.amazon.co.jp/dp/XXXX?ref=sr_1_1&ref_=sr_1_1&qid=123";
+        assert_eq!(clean_url_tracking_params(url), "https://www.amazon.co.jp/dp/XXXX?qid=123");
+    }
+
+    #[test]
+    fn clean_url_amazon_subdomain_matches() {
+        let url = "https://smile.amazon.com/dp/XXXX?ref=abc&qid=1";
+        assert_eq!(clean_url_tracking_params(url), "https://smile.amazon.com/dp/XXXX?qid=1");
+    }
+
+    #[test]
+    fn clean_url_bare_ref_not_stripped_off_amazon_domain() {
+        let url = "https://github.com/rust-lang/rust?ref=readme";
+        assert_eq!(clean_url_tracking_params(url), "https://github.com/rust-lang/rust?ref=readme");
+    }
+
+    #[test]
+    fn clean_url_youtube_t_param_protected() {
+        let watch = "https://www.youtube.com/watch?v=abc123&t=42s";
+        assert_eq!(clean_url_tracking_params(watch), "https://www.youtube.com/watch?v=abc123&t=42s");
+        let short = "https://youtu.be/abc123?si=XYZ&t=10";
+        assert_eq!(clean_url_tracking_params(short), "https://youtu.be/abc123?t=10");
+    }
+
+    #[test]
+    fn clean_url_t_param_stripped_when_not_youtube() {
+        // Sanity check that the YouTube exception is domain-gated, not a
+        // blanket "never touch `t`" rule.
+        let url = "https://x.com/user/status/123?t=abc";
+        assert_eq!(clean_url_tracking_params(url), "https://x.com/user/status/123");
+    }
+
+    #[test]
+    fn clean_url_host_lookalike_not_matched() {
+        // "notyoutube.com" must not be treated as a youtube.com subdomain.
+        let url = "https://notyoutube.com/watch?t=42s&utm_source=x";
+        assert_eq!(clean_url_tracking_params(url), "https://notyoutube.com/watch?t=42s");
+    }
+
+    // --- sanitize_text_payload ---
+
+    #[test]
+    fn sanitize_text_payload_plain_prose_untouched() {
+        let input = b"Just a normal sentence with no links at all.";
+        assert_eq!(sanitize_text_payload(input), input);
+    }
+
+    #[test]
+    fn sanitize_text_payload_code_snippet_untouched() {
+        let input = b"fn main() { let x: Option<i32> = None; }";
+        assert_eq!(sanitize_text_payload(input), input);
+    }
+
+    #[test]
+    fn sanitize_text_payload_url_without_query_untouched() {
+        let input = b"See https://example.com/docs for details.";
+        assert_eq!(sanitize_text_payload(input), input);
+    }
+
+    #[test]
+    fn sanitize_text_payload_single_url_strips_tracking() {
+        let input = b"https://example.com/page?utm_source=x&foo=bar";
+        let expected = b"https://example.com/page?foo=bar";
+        assert_eq!(sanitize_text_payload(input), expected);
+    }
+
+    #[test]
+    fn sanitize_text_payload_embedded_url_preserves_sentence_punctuation() {
+        let input = b"Check: https://example.com/?si=123. cool!";
+        let expected = b"Check: https://example.com/. cool!";
+        assert_eq!(sanitize_text_payload(input), expected);
+    }
+
+    #[test]
+    fn sanitize_text_payload_multiple_urls() {
+        let input = b"first https://a.example/?utm_source=x second https://b.example/?ref_src=y done";
+        let expected = b"first https://a.example/ second https://b.example/ done";
+        assert_eq!(sanitize_text_payload(input), expected);
+    }
+
+    #[test]
+    fn sanitize_text_payload_trailing_paren_in_prose_not_swallowed() {
+        let input = b"link (https://example.com/?utm_source=x) end";
+        let expected = b"link (https://example.com/) end";
+        assert_eq!(sanitize_text_payload(input), expected);
+    }
+
+    #[test]
+    fn sanitize_text_payload_balanced_paren_in_url_kept() {
+        let input = b"https://en.wikipedia.org/wiki/Rust_(programming_language)?utm_source=x";
+        let expected = b"https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        assert_eq!(sanitize_text_payload(input), expected);
+    }
+
+    #[test]
+    fn sanitize_text_payload_invalid_utf8_bypassed_unsanitized() {
+        let mut input = b"https://example.com/?".to_vec();
+        input.extend_from_slice(&[0xFF, 0xFE]);
+        let result = sanitize_text_payload(&input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_text_payload_empty_input() {
+        assert_eq!(sanitize_text_payload(b""), b"");
     }
 }
