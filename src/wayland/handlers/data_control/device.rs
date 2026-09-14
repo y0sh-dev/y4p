@@ -142,13 +142,9 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
     let Some(mut chunk_buffer) = AlignedBuffer::new(65536, 4096) else { return; };
     let chunk = chunk_buffer.as_mut_slice();
 
-    let mut hasher = (!is_uri_list).then(Sha3_256::new);
-
     while let Ok(n) = reader.read(chunk) {
         if n == 0 { break; }
-        let data = &chunk[..n];
-        if let Some(h) = hasher.as_mut() { h.update(data); }
-        payload.extend_from_slice(data);
+        payload.extend_from_slice(&chunk[..n]);
     }
 
     if payload.is_empty() { return; }
@@ -162,18 +158,16 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
         // A compositor transfer can be cut short the same way a curl
         // download can — repair before this payload's hash is ever computed.
         payload = crate::core::utils::sanitize_image_payload(payload, &final_mime);
+    } else if crate::core::utils::is_text_mime(&final_mime) {
+        payload = crate::core::utils::sanitize_text_payload(&payload);
+        if payload.is_empty() { return; }
     }
 
-    // SHA3-256 finalize() returns a GenericArray.
-    let hash = match hasher {
-        Some(h) => h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>(),
-        // uri-list: fingerprint the normalized bytes actually being persisted.
-        None => {
-            let mut h = Sha3_256::new();
-            h.update(&payload);
-            h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
-        }
-    };
+    // SHA3-256 fingerprint of the final normalized/sanitized payload actually being persisted.
+    let mut hasher = Sha3_256::new();
+    hasher.update(&payload);
+    let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
 
     // Send the completed payload and its SHA3 fingerprint to the persistent worker.
     let _ = job_tx.send(ClipboardJob { mime: final_mime, data: payload, hash });
