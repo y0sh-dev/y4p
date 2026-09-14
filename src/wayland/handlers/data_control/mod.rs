@@ -122,10 +122,10 @@ fn mime_is_compatible(requested: &str, target: &str) -> bool {
 /// lowercased haystack can never contain that hint's own uppercase letters
 /// verbatim, so this specific hint could never actually match anything,
 /// silently defeating the KDE password-manager filter it exists for.
-fn is_sensitive(mimes: &[String]) -> bool {
+pub(crate) fn is_sensitive<S: AsRef<str>>(mimes: &[S]) -> bool {
     SENSITIVE_MIME_HINTS.iter().any(|&hint| {
         let hint_lower = hint.to_ascii_lowercase();
-        mimes.iter().any(|m| m.to_ascii_lowercase().contains(&hint_lower))
+        mimes.iter().any(|m| m.as_ref().to_ascii_lowercase().contains(&hint_lower))
     })
 }
 
@@ -184,5 +184,39 @@ impl Dispatch<ExtDataControlOfferV1, OfferData> for WaylandState {
             && !mimes.contains(&mime_type) {
             mimes.push(mime_type);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_sensitive_detects_all_configured_hints() {
+        assert!(is_sensitive(&["x-kde-passwordManagerHint"]));
+        assert!(is_sensitive(&["X-KDE-PASSWORDMANAGERHINT"]));
+        assert!(is_sensitive(&["application/x-keepassxc-selection"]));
+        assert!(is_sensitive(&["application/x-vnd.1password"]));
+        assert!(is_sensitive(&["application/x-bitwarden"]));
+        assert!(is_sensitive(&["x-gnome-cliptrace"]));
+        assert!(is_sensitive(&["org.nspasteboard.ConcealedType"]));
+        assert!(is_sensitive(&["custom/secret-payload"]));
+        assert!(is_sensitive(&["text/plain", "application/x-keepassxc-selection"]));
+    }
+
+    #[test]
+    fn is_sensitive_clean_mimes_pass() {
+        assert!(!is_sensitive(&["text/plain"]));
+        assert!(!is_sensitive(&["text/plain;charset=utf-8"]));
+        assert!(!is_sensitive(&["text/html"]));
+        assert!(!is_sensitive(&["image/png"]));
+        assert!(!is_sensitive(&["text/uri-list"]));
+    }
+
+    #[test]
+    fn is_sensitive_empty_list_returns_false() {
+        let empty: &[&str] = &[];
+        assert!(!is_sensitive(empty));
     }
 }

@@ -40,7 +40,12 @@ pub const SENSITIVE_MIME_HINTS: &[&str] = &[
     "x-kde-passwordManagerHint", 
     "password", 
     "secret",
-    "x-gnome-cliptrace"
+    "x-gnome-cliptrace",
+    // v0.3.0 Step 3: modern desktop password managers and concealed markers
+    "keepass",
+    "1password",
+    "bitwarden",
+    "concealed",
 ];
 
 // --- Clipboard & Preview Settings ---
@@ -86,9 +91,12 @@ pub const MIME_PRIORITY_ORDER: &[&str] = &[
     "STRING",
     "TEXT",
     // Rich text / structured markup — fallback only.
+    //
+    // v0.3.0 Step 3: "text/rtf" deliberately has no entry here. RTF contains
+    // binary control codes unsafe to persist as plain text. It is skipped
+    // at ingestion to prevent SQLite preview corruption.
     "text/html",
     "application/xhtml+xml",
-    "text/rtf",
     "text/markdown",
     "application/json",
     "application/xml",

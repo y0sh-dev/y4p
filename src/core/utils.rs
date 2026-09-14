@@ -241,6 +241,19 @@ pub fn is_text_mime(mime: &str) -> bool {
     crate::core::constants::TEXT_MIME_ALTS.iter().any(|&alt| mime_base_eq(mime, alt))
 }
 
+/// True when `mime`'s base type (see `parse_mime`) is HTML or XHTML markup
+/// (`text/html` or `application/xhtml+xml`) eligible for forced plain-text fallback.
+pub fn is_html_mime(mime: &str) -> bool {
+    let base = parse_mime(mime).0;
+    base == "text/html" || base == "application/xhtml+xml"
+}
+
+/// True when `mime`'s base type (see `parse_mime`) is RTF (`text/rtf` or `application/rtf`).
+pub fn is_rtf_mime(mime: &str) -> bool {
+    let base = parse_mime(mime).0;
+    base == "text/rtf" || base == "application/rtf"
+}
+
 /// Case-insensitive `s.get(..prefix.len())` prefix check that never panics
 /// on a short string or a multi-byte char boundary (`str::get` returns
 /// `None` for either instead of slicing).
@@ -751,6 +764,44 @@ mod tests {
         assert!(!is_text_mime("image/png"));
         assert!(!is_text_mime("application/json"));
         assert!(!is_text_mime(crate::core::constants::MIME_URI_LIST));
+    }
+
+    // --- is_html_mime ---
+
+    #[test]
+    fn is_html_mime_accepts_html_and_xhtml() {
+        assert!(is_html_mime("text/html"));
+        assert!(is_html_mime("text/html; charset=utf-8"));
+        assert!(is_html_mime("TEXT/HTML;charset=UTF-8"));
+        assert!(is_html_mime("application/xhtml+xml"));
+        assert!(is_html_mime("APPLICATION/XHTML+XML; charset=utf-8"));
+    }
+
+    #[test]
+    fn is_html_mime_rejects_non_html() {
+        assert!(!is_html_mime("text/plain"));
+        assert!(!is_html_mime("text/rtf"));
+        assert!(!is_html_mime("image/png"));
+        assert!(!is_html_mime("application/json"));
+        assert!(!is_html_mime("application/xml"));
+    }
+
+    // --- is_rtf_mime ---
+
+    #[test]
+    fn is_rtf_mime_accepts_rtf_variants() {
+        assert!(is_rtf_mime("text/rtf"));
+        assert!(is_rtf_mime("Text/RTF"));
+        assert!(is_rtf_mime("TEXT/RTF; charset=utf-8"));
+        assert!(is_rtf_mime("application/rtf"));
+        assert!(is_rtf_mime("APPLICATION/RTF"));
+    }
+
+    #[test]
+    fn is_rtf_mime_rejects_non_rtf() {
+        assert!(!is_rtf_mime("text/plain"));
+        assert!(!is_rtf_mime("text/html"));
+        assert!(!is_rtf_mime("image/png"));
     }
 
     // --- clean_url_tracking_params ---
