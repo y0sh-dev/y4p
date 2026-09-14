@@ -131,6 +131,24 @@ pub const TIME_UNIT_SEC:  &str = "s ago";
 pub const TIME_UNIT_MIN:  &str = "m ago";
 pub const TIME_UNIT_HOUR: &str = "h ago";
 
+// --- Content Sanitization: URL Tracking Parameter Removal ---
+// Exact (non-prefix) query keys stripped from any URL, on any domain,
+// before a text/* clipboard payload is persisted — see
+// core::utils::clean_url_tracking_params. Prefix-shaped universal rules
+// (`utm_*`, `ref_*`) are matched separately since a fixed-string slice
+// can't express a prefix.
+pub const UNIVERSAL_TRACKING_KEYS: &[&str] = &[
+    "si",
+    "fbclid",
+    "gclid",
+    "gbraid",
+    "wbraid",
+    "msclkid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+];
+
 // --- Wayland Protocol Configuration ---
 pub const INTERFACE_MANAGER: &str = "ext_data_control_manager_v1";
 pub const INTERFACE_SEAT:    &str = "wl_seat";
