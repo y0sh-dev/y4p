@@ -58,9 +58,11 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 .find_map(|&p| mimes.iter().find(|m| crate::core::utils::mime_base_eq(m, p)))
                 .cloned()
                 .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("image/")).cloned())
-                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("text/")).cloned())
-                .or_else(|| mimes.first().cloned())
-                .unwrap_or_else(|| DEFAULT_MIME.to_string());
+                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("text/") && !crate::core::utils::is_rtf_mime(m)).cloned())
+                .or_else(|| mimes.iter().find(|m| !crate::core::utils::is_rtf_mime(m)).cloned());
+
+            let Some(mime_to_get) = mime_to_get else { return; };
+            if crate::core::utils::is_rtf_mime(&mime_to_get) { return; }
 
             let is_image = mime_to_get.to_ascii_lowercase().starts_with("image/");
 
@@ -158,6 +160,16 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
         // A compositor transfer can be cut short the same way a curl
         // download can — repair before this payload's hash is ever computed.
         payload = crate::core::utils::sanitize_image_payload(payload, &final_mime);
+    } else if crate::core::utils::is_html_mime(&final_mime) {
+        // v0.3.0 Step 3: reaching here means no plain-text alternative was
+        // offered alongside the markup (MIME_PRIORITY_ORDER always prefers
+        // one when present) — force a sanitized plain-text fallback rather
+        // than persist raw HTML/XHTML control tags.
+        payload = crate::core::utils::strip_html_tags(&payload);
+        if payload.is_empty() { return; }
+        final_mime = DEFAULT_MIME.to_string();
+        payload = crate::core::utils::sanitize_text_payload(&payload);
+        if payload.is_empty() { return; }
     } else if crate::core::utils::is_text_mime(&final_mime) {
         payload = crate::core::utils::sanitize_text_payload(&payload);
         if payload.is_empty() { return; }
