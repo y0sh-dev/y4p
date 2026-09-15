@@ -43,6 +43,11 @@ pub struct ClipboardJob {
     pub mime: String,
     pub data: Vec<u8>,
     pub hash: String,
+    // v0.3.0 Step 4: the focused window's App ID at ingestion time, from
+    // `wayland::active_app::detect_active_app()` — advisory filtering
+    // context for Step 5, kept in memory only (per design doc's "案A") and
+    // never written to `storage/`.
+    pub source_app: Option<String>,
 }
 
 pub struct WaylandState {

@@ -181,8 +181,14 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
     let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
 
+    // v0.3.0 Step 4: best-effort App ID of the focused (= copying) window,
+    // via compositor IPC. Safe to call from this already-spawned ingestion
+    // thread — never the main Wayland dispatch loop — even in the worst
+    // case of a slow/hung compositor.
+    let source_app = crate::wayland::active_app::detect_active_app();
+
     // Send the completed payload and its SHA3 fingerprint to the persistent worker.
-    let _ = job_tx.send(ClipboardJob { mime: final_mime, data: payload, hash });
+    let _ = job_tx.send(ClipboardJob { mime: final_mime, data: payload, hash, source_app });
 
     // SAFETY: `malloc_trim(0)` only requests the allocator release free
     // pages back to the OS; it doesn't touch any live allocation this
@@ -248,7 +254,11 @@ fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mi
             let mut hasher = Sha3_256::new();
             hasher.update(&data);
             let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-            let _ = job_tx.send(ClipboardJob { mime: mime.to_string(), data, hash });
+            // v0.3.0 Step 4: this branch also runs entirely on its own
+            // spawned thread (see this function's own doc comment), so the
+            // same compositor-IPC lookup is just as safe to call here.
+            let source_app = crate::wayland::active_app::detect_active_app();
+            let _ = job_tx.send(ClipboardJob { mime: mime.to_string(), data, hash, source_app });
 
             // SAFETY: `malloc_trim(0)` only requests the allocator release
             // free pages back to the OS; it doesn't touch any live
