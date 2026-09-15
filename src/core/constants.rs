@@ -41,7 +41,7 @@ pub const SENSITIVE_MIME_HINTS: &[&str] = &[
     "password", 
     "secret",
     "x-gnome-cliptrace",
-    // v0.3.0 Step 3: modern desktop password managers and concealed markers
+    // Password managers and concealed markers
     "keepass",
     "1password",
     "bitwarden",
@@ -92,9 +92,8 @@ pub const MIME_PRIORITY_ORDER: &[&str] = &[
     "TEXT",
     // Rich text / structured markup — fallback only.
     //
-    // v0.3.0 Step 3: "text/rtf" deliberately has no entry here. RTF contains
-    // binary control codes unsafe to persist as plain text. It is skipped
-    // at ingestion to prevent SQLite preview corruption.
+    // "text/rtf" deliberately has no entry here. RTF contains control words
+    // unsafe to persist as plain text and is dropped or handled separately.
     "text/html",
     "application/xhtml+xml",
     "text/markdown",
@@ -161,16 +160,11 @@ pub const UNIVERSAL_TRACKING_KEYS: &[&str] = &[
 pub const INTERFACE_MANAGER: &str = "ext_data_control_manager_v1";
 pub const INTERFACE_SEAT:    &str = "wl_seat";
 
-// --- Original Image Fetcher (v0.3.0) ---
-// Whether to attempt fetching an image's original source bytes over the
-// network (see device.rs), instead of settling for whatever re-encoded
-// bitmap the browser wrote to the clipboard, is now a runtime setting —
-// v0.3.0 Step 5 flipped this from a compile-time `const` to
-// `Config::should_hijack_image()` (`[image] hijack_original` in
-// `y4p.toml`, opt-in/`false` by default since it performs a `curl` network
-// fetch), exactly as this comment used to say it eventually would.
+// --- Original Image Fetcher ---
+// Network parameters for fetching original remote image sources when
+// enabled via `[image] hijack_original` in `y4p.toml`.
 
-// `curl`'s `--max-time`: bounds how long a stalled/slow-loris server can
+// `curl`'s `--max-time`: bounds how long a stalled/slow server can
 // hold up the fetch. The fetch itself always runs off the daemon's main
 // poll loop (see device.rs), but a runaway child process is still a leak of
 // threads and file descriptors worth capping.

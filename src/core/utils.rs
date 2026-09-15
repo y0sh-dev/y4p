@@ -99,8 +99,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Original Image Fetcher (v0.3.0): extracts the first `<img ... src="...">`
-/// (or `src='...'`) URL from a raw `text/html` clipboard payload.
+/// Extracts the first `<img ... src="...">` (or `src='...'`) URL from a
+/// raw `text/html` clipboard payload.
 ///
 /// Byte-slice scanning only — no HTML parser or regex crate, per the
 /// project's no-extra-dependency policy for this feature. `<img` and `src=`
