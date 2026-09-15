@@ -3,19 +3,12 @@
 
 // src/core/config.rs
 
-//! v0.3.0 Step 5 — the "grand integration": a single `y4p.toml` that lets a
-//! user dial the behaviour Steps 1-4 hard-coded (Image Hijacker, URL
-//! tracking sanitisation, the MIME gatekeeper, and per-app filtering built
-//! on Step 4's App ID detection) without recompiling.
+//! User configuration loader and lightweight TOML parser.
 //!
-//! Per the agreed technical approach (决定事項 1: 案B), this deliberately
-//! does not pull in `serde`/`toml`: it parses the small, fixed subset of
-//! TOML this schema actually needs using nothing but `std`. The parser is
-//! intentionally forgiving rather than strict — a config file is user-
-//! editable, ambient state the daemon reads on every startup, so a stray
-//! typo or an unrecognised key must never crash it or block it from
-//! serving the clipboard; the only failure mode this parser has is
-//! "silently keep the built-in default for that one value".
+//! Parses `y4p.toml` using standard library primitives alone, deliberately
+//! avoiding external parser crates. The parser is intentionally forgiving:
+//! unrecognised sections or malformed values are ignored, safely falling back
+//! to built-in defaults without aborting daemon startup.
 
 use std::path::PathBuf;
 
@@ -34,10 +27,8 @@ impl Default for GeneralConfig {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImageConfig {
-    /// Opt-in: the Original Image Fetcher (Step 1) performs a `curl`
-    /// network fetch, so it defaults to `false` — a config file's absence,
-    /// or an absent/malformed key within one, must never silently start
-    /// making outbound network requests.
+    /// When enabled, fetches the original remote image referenced by HTML offers.
+    /// Defaults to `false` to avoid ambient network requests without opt-in.
     pub hijack_original: bool,
 }
 

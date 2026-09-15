@@ -1,0 +1,58 @@
+# y4p Configuration Reference
+#
+# y4p loads configuration on startup from:
+#   $XDG_CONFIG_HOME/y4p/y4p.toml
+#   (falls back to ~/.config/y4p/y4p.toml if XDG_CONFIG_HOME is unset)
+#
+# If the configuration file is missing or contains syntax errors, y4p
+# falls back safely to built-in defaults without crashing or refusing to start.
+# All sections and keys are optional. Unrecognised keys are silently ignored.
+
+[general]
+# Maximum number of unpinned history entries to retain in SQLite storage.
+# When the threshold is exceeded, the oldest unpinned entries are pruned.
+# Pinned records are permanently exempt from rotation.
+# Can be overridden by the Y4P_MAX_HISTORY environment variable.
+# Default: 100
+max_history = 100
+
+[image]
+# Image Hijacker (Original Image Fetcher).
+# When enabled and a clipboard offer consists of HTML containing an <img> tag
+# with an HTTP/HTTPS URL, y4p invokes `curl` to fetch the raw image payload.
+# Disabled by default to prevent ambient outbound network calls without opt-in.
+# Default: false
+hijack_original = false
+
+[sanitize]
+# URL Tracking Sanitisation.
+# Automatically strips marketing, click-tracking, and analytics parameters
+# (e.g., utm_*, fbclid, gclid, mc_eid) from URLs found in plain text offers.
+# Platform-specific media parameters (such as YouTube 't' timestamp) are preserved.
+# Balanced parentheses in URLs (e.g. Wikipedia links) are protected.
+# Default: true
+strip_tracking = true
+
+[mime]
+# Drop Rich Text Format (text/rtf, application/rtf) offers at ingress when
+# a corresponding plain text offer is already present, preventing bloat.
+# Default: true
+drop_rtf = true
+
+# Downgrade standalone text/html offers to plain text if the copying client
+# did not provide a text/plain offer, stripping markup tags cleanly.
+# Default: true
+downgrade_html = true
+
+[app]
+# Application exclusion list.
+# Offers originating from active windows matching these App IDs (Wayland app_id
+# or XWayland window class retrieved via compositor IPC) are rejected at ingress.
+# Default: []
+ignore = []
+
+# Sanitisation bypass list.
+# Windows matching these App IDs bypass URL parameter sanitisation, ensuring
+# query strings remain untouched (e.g. for API consoles or debugging tools).
+# Default: []
+bypass_sanitize = []

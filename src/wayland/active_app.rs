@@ -3,14 +3,12 @@
 
 // src/wayland/active_app.rs
 
-//! v0.3.0 Step 4 — "App ID hack": `ext-data-control-v1` deliberately hides
-//! which application owns a clipboard selection (the protocol has no such
-//! field), so this reaches around it by talking directly to whichever
-//! compositor control IPC this session actually has — Hyprland's own
-//! control socket, or the `i3-ipc` protocol Sway (and i3, for XWayland
-//! provenance) both implement — to ask what the currently focused window
-//! is. The result is advisory context only: kept in memory on
-//! `ClipboardJob` (see `state.rs`), never persisted to `storage/`.
+//! Out-of-band active application detection via compositor IPC.
+//!
+//! Because `ext-data-control-v1` intentionally abstracts away client identity,
+//! this module queries compositor control sockets (Hyprland IPC or Sway/i3-ipc)
+//! to determine the currently focused window's App ID. The result is advisory
+//! and kept only in memory during ingestion, never persisted to storage.
 //!
 //! Every code path here is a best-effort lookup, never a hard requirement:
 //! an unsupported compositor, a socket that doesn't exist, a slow/hung
