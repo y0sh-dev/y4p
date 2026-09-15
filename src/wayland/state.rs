@@ -43,10 +43,8 @@ pub struct ClipboardJob {
     pub mime: String,
     pub data: Vec<u8>,
     pub hash: String,
-    // v0.3.0 Step 4: the focused window's App ID at ingestion time, from
-    // `wayland::active_app::detect_active_app()` — advisory filtering
-    // context for Step 5, kept in memory only (per design doc's "案A") and
-    // never written to `storage/`.
+    // Advisory focused window App ID at ingestion time.
+    // Kept in memory only; never persisted to storage.
     pub source_app: Option<String>,
 }
 
@@ -67,9 +65,8 @@ pub struct WaylandState {
     // Private mode: same single-thread-owned field as the rest of this
     // struct, toggled by IPC Pause/Resume.
     pub paused: bool,
-    // v0.3.0 Step 5: loaded once at startup (`Config::load()`, injected by
-    // `daemon::start_daemon`/`wayland::paste_from_os`) and shared read-only
-    // with every ingestion thread via `Arc::clone` — see device.rs.
+    // Active configuration, loaded at startup and shared read-only
+    // with ingestion threads via `Arc`.
     pub config: Arc<crate::core::config::Config>,
 }
 
