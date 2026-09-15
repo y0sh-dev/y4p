@@ -90,6 +90,22 @@ y4p help
 
 ---
 
+## Configuration
+
+`y4p` works out of the box with sensible defaults and zero mandatory configuration.
+
+To customise behaviour — such as URL tracking parameter sanitisation, history limits, MIME filtering, or per-application exclusion rules — place a `y4p.toml` file at `$XDG_CONFIG_HOME/y4p/y4p.toml` (defaulting to `~/.config/y4p/y4p.toml`).
+
+A documented reference template is provided in [`y4p.toml.example`](y4p.toml.example):
+
+```bash
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/y4p"
+cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
+```
+
+
+---
+
 ## Architecture & Design
 
 This README is a quick-start guide, kept intentionally short.
