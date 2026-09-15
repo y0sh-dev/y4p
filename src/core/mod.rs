@@ -5,25 +5,37 @@
 
 pub mod constants;
 pub mod utils;
+pub mod config;
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::core::constants::{DB_DIR_NAME, DB_FILE_NAME, SOCKET_FILE_NAME, DEFAULT_MAX_HISTORY, ENV_MAX_HISTORY};
+use crate::core::constants::{DB_DIR_NAME, DB_FILE_NAME, SOCKET_FILE_NAME, ENV_MAX_HISTORY};
 
 pub static SIG_EXIT: AtomicBool = AtomicBool::new(false);
 
-/// Resolve the effective history retention cap: `Y4P_MAX_HISTORY` when it
-/// parses as a positive integer, `DEFAULT_MAX_HISTORY` otherwise (unset,
-/// non-numeric, zero, or negative) — never panics, always usable.
+/// Resolve the effective history retention cap. Priority order: the
+/// `Y4P_MAX_HISTORY` environment variable when it parses as a positive
+/// integer, then `y4p.toml`'s `[general] max_history` (v0.3.0 Step 5), then
+/// `DEFAULT_MAX_HISTORY` — never panics, always usable.
+///
+/// This function's signature (no arguments) is depended on by call sites
+/// across `cli/` and, critically, `storage::ClipboardDb::insert_with_hash`
+/// itself, which must stay untouched (see the Step 5 brief's "0 lines
+/// changed" rule for `src/storage/`) — so the config file is loaded and
+/// parsed fresh on every call here rather than threaded through as a
+/// parameter. That's a deliberately-accepted cost: this is called at most
+/// once per CLI invocation or clipboard save, never in a hot loop, and a
+/// small TOML file read is negligible next to the SQLite I/O either of
+/// those already does.
 pub fn get_max_history() -> usize {
     std::env::var(ENV_MAX_HISTORY)
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
         .map(|n| n as usize)
-        .unwrap_or(DEFAULT_MAX_HISTORY)
+        .unwrap_or_else(|| config::Config::load().general.max_history)
 }
 
 /// Securely resolve and initialize the database path following XDG Data Home specs.
