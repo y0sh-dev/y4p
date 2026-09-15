@@ -23,3 +23,7 @@ Session.vim
 # --- OS Junk ---
 .DS_Store
 Thumbs.db
+
+# --- Agent Instructions / Local Metadata ---
+GEMINI.md
+
