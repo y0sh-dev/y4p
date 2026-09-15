@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use sha3::{Digest, Sha3_256};
 use crate::wayland::state::{WaylandState, OfferData, ClipboardJob};
 use crate::core::constants::*;
+use crate::core::config::Config;
 use super::{make_pipe, is_sensitive, AlignedBuffer};
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
@@ -54,15 +55,22 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             // takes the string as the sender actually offered it — the
             // compositor request below needs that exact original form, not
             // the normalized one.
+            // v0.3.0 Step 5: `[mime] drop_rtf` (default true) governs
+            // whether RTF is excluded from selection here at all. When a
+            // user opts out, RTF becomes eligible again in both fallback
+            // searches below, so an RTF-only offer resolves to it instead
+            // of being dropped.
+            let drop_rtf = state.config.should_drop_rtf();
+
             let mime_to_get = MIME_PRIORITY_ORDER.iter()
                 .find_map(|&p| mimes.iter().find(|m| crate::core::utils::mime_base_eq(m, p)))
                 .cloned()
                 .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("image/")).cloned())
-                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("text/") && !crate::core::utils::is_rtf_mime(m)).cloned())
-                .or_else(|| mimes.iter().find(|m| !crate::core::utils::is_rtf_mime(m)).cloned());
+                .or_else(|| mimes.iter().find(|m| m.to_ascii_lowercase().starts_with("text/") && (!drop_rtf || !crate::core::utils::is_rtf_mime(m))).cloned())
+                .or_else(|| mimes.iter().find(|m| !drop_rtf || !crate::core::utils::is_rtf_mime(m)).cloned());
 
             let Some(mime_to_get) = mime_to_get else { return; };
-            if crate::core::utils::is_rtf_mime(&mime_to_get) { return; }
+            if drop_rtf && crate::core::utils::is_rtf_mime(&mime_to_get) { return; }
 
             let is_image = mime_to_get.to_ascii_lowercase().starts_with("image/");
 
@@ -73,14 +81,21 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             // recover that original — typically a much higher-fidelity
             // WebP/JPEG than the re-encoded PNG the browser also put on the
             // clipboard — before falling back to the ordinary receive path.
+            //
+            // v0.3.0 Step 5: `should_hijack_image()` (`[image]
+            // hijack_original`, opt-in/`false` by default) replaces the old
+            // compile-time `FETCH_ORIGINAL_IMAGES` constant — this performs
+            // an outbound `curl` fetch, so it must stay off unless the user
+            // explicitly turns it on in `y4p.toml`.
             if is_image
-                && FETCH_ORIGINAL_IMAGES
+                && state.config.should_hijack_image()
                 && mimes.iter().any(|m| crate::core::utils::mime_base_eq(m, "text/html"))
                 && let Some(tx) = state.job_tx.clone()
             {
                 let conn = conn.clone();
+                let config = state.config.clone();
                 std::thread::spawn(move || {
-                    fetch_original_image(offer, conn, mime_to_get, tx);
+                    fetch_original_image(offer, conn, mime_to_get, tx, config);
                 });
                 return;
             }
@@ -104,9 +119,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 // persisted), so it can't share the other MIMEs' single-pass
                 // hash-while-read below.
                 let is_uri_list = mime_to_get == MIME_URI_LIST;
+                let config = state.config.clone();
 
                 std::thread::spawn(move || {
-                    ingest_and_send(read_file, mime_to_get, is_uri_list, &job_tx_clone);
+                    ingest_and_send(read_file, mime_to_get, is_uri_list, &job_tx_clone, &config);
                 });
             } else {
                 // Action Mode: Synchronous read for immediate CLI processing
@@ -134,7 +150,16 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 /// Image Fetcher's fallback (`fallback_receive_image`, called from a thread
 /// it's already running on) reach identical read/hash/send behavior without
 /// duplicating it — this function itself never spawns anything.
-fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: bool, job_tx: &mpsc::Sender<ClipboardJob>) {
+fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: bool, job_tx: &mpsc::Sender<ClipboardJob>, config: &Config) {
+    // v0.3.0 Step 5: resolve the source app once, up front — an ignored
+    // app's clipboard event is discarded here before any pipe I/O, hashing,
+    // or sanitisation work is spent on it. Safe to call from this
+    // already-spawned ingestion thread (never the main Wayland dispatch
+    // loop) even in the worst case of a slow/hung compositor — see
+    // `wayland::active_app`.
+    let source_app = crate::wayland::active_app::detect_active_app();
+    if config.is_app_ignored(source_app.as_deref()) { return; }
+
     let mut payload = Vec::with_capacity(1048576);
     let mut reader = read_file.take(268435456);
 
@@ -160,32 +185,35 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
         // A compositor transfer can be cut short the same way a curl
         // download can — repair before this payload's hash is ever computed.
         payload = crate::core::utils::sanitize_image_payload(payload, &final_mime);
-    } else if crate::core::utils::is_html_mime(&final_mime) {
+    } else if crate::core::utils::is_html_mime(&final_mime) && config.should_downgrade_html() {
         // v0.3.0 Step 3: reaching here means no plain-text alternative was
         // offered alongside the markup (MIME_PRIORITY_ORDER always prefers
-        // one when present) — force a sanitized plain-text fallback rather
-        // than persist raw HTML/XHTML control tags.
+        // one when present) — force a sanitised plain-text fallback rather
+        // than persist raw HTML/XHTML control tags. v0.3.0 Step 5 makes this
+        // itself opt-out-able (`[mime] downgrade_html = false` leaves the
+        // markup untouched, falling through with no branch matched at all).
         payload = crate::core::utils::strip_html_tags(&payload);
         if payload.is_empty() { return; }
         final_mime = DEFAULT_MIME.to_string();
-        payload = crate::core::utils::sanitize_text_payload(&payload);
-        if payload.is_empty() { return; }
+        if !config.should_bypass_sanitize(source_app.as_deref()) {
+            payload = crate::core::utils::sanitize_text_payload(&payload);
+            if payload.is_empty() { return; }
+        }
     } else if crate::core::utils::is_text_mime(&final_mime) {
-        payload = crate::core::utils::sanitize_text_payload(&payload);
-        if payload.is_empty() { return; }
+        // v0.3.0 Step 5: `should_bypass_sanitize` is true when tracking
+        // removal is disabled globally, or the source app is explicitly
+        // listed under `[app] bypass_sanitize` (e.g. an app whose own URLs
+        // are wrongly mistaken for tracking links).
+        if !config.should_bypass_sanitize(source_app.as_deref()) {
+            payload = crate::core::utils::sanitize_text_payload(&payload);
+            if payload.is_empty() { return; }
+        }
     }
 
-    // SHA3-256 fingerprint of the final normalized/sanitized payload actually being persisted.
+    // SHA3-256 fingerprint of the final normalised/sanitised payload actually being persisted.
     let mut hasher = Sha3_256::new();
     hasher.update(&payload);
     let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
-
-    // v0.3.0 Step 4: best-effort App ID of the focused (= copying) window,
-    // via compositor IPC. Safe to call from this already-spawned ingestion
-    // thread — never the main Wayland dispatch loop — even in the worst
-    // case of a slow/hung compositor.
-    let source_app = crate::wayland::active_app::detect_active_app();
 
     // Send the completed payload and its SHA3 fingerprint to the persistent worker.
     let _ = job_tx.send(ClipboardJob { mime: final_mime, data: payload, hash, source_app });
@@ -201,12 +229,12 @@ fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, is_uri_list: b
 /// case (no `text/html` offered alongside the image) and the Original Image
 /// Fetcher's fallback reach it identically: request `image_mime` from
 /// `offer` over a fresh pipe, then read/hash/send exactly as before.
-fn fallback_receive_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: &mpsc::Sender<ClipboardJob>) {
+fn fallback_receive_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: &mpsc::Sender<ClipboardJob>, config: &Config) {
     let Some((read_file, write_fd)) = make_pipe(true) else { return; };
     offer.receive(image_mime.clone(), write_fd.as_fd());
     drop(write_fd);
     let _ = conn.flush();
-    ingest_and_send(read_file, image_mime, false, job_tx);
+    ingest_and_send(read_file, image_mime, false, job_tx, config);
 }
 
 /// Original Image Fetcher (v0.3.0): when a selection offers both an image
@@ -223,9 +251,17 @@ fn fallback_receive_image(offer: ExtDataControlOfferV1, conn: Connection, image_
 /// `wayland-backend`'s connection state is `Send + Sync` by design, and
 /// nothing here waits on a reply; any resulting event still dispatches on
 /// the compositor's usual event-loop thread.
-fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: mpsc::Sender<ClipboardJob>) {
+fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mime: String, job_tx: mpsc::Sender<ClipboardJob>, config: Arc<Config>) {
+    // v0.3.0 Step 5: same early ignored-app discard as `ingest_and_send`,
+    // done here too since this path never goes through that function for
+    // its own (successfully hijacked) `ClipboardJob` — checked before the
+    // `text/html` pipe is even requested, so an ignored app costs nothing
+    // beyond this one App ID lookup.
+    let source_app = crate::wayland::active_app::detect_active_app();
+    if config.is_app_ignored(source_app.as_deref()) { return; }
+
     let Some((html_read, html_write)) = make_pipe(false) else {
-        fallback_receive_image(offer, conn, image_mime, &job_tx);
+        fallback_receive_image(offer, conn, image_mime, &job_tx, &config);
         return;
     };
     offer.receive("text/html".to_string(), html_write.as_fd());
@@ -254,10 +290,6 @@ fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mi
             let mut hasher = Sha3_256::new();
             hasher.update(&data);
             let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-            // v0.3.0 Step 4: this branch also runs entirely on its own
-            // spawned thread (see this function's own doc comment), so the
-            // same compositor-IPC lookup is just as safe to call here.
-            let source_app = crate::wayland::active_app::detect_active_app();
             let _ = job_tx.send(ClipboardJob { mime: mime.to_string(), data, hash, source_app });
 
             // SAFETY: `malloc_trim(0)` only requests the allocator release
@@ -271,6 +303,6 @@ fn fetch_original_image(offer: ExtDataControlOfferV1, conn: Connection, image_mi
         // actually an image — every one of these falls back identically,
         // with nothing surfaced to the user: the clipboard event is still
         // serviced, just via the ordinary Wayland receive path.
-        None => fallback_receive_image(offer, conn, image_mime, &job_tx),
+        None => fallback_receive_image(offer, conn, image_mime, &job_tx, &config),
     }
 }

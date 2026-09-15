@@ -67,6 +67,10 @@ pub struct WaylandState {
     // Private mode: same single-thread-owned field as the rest of this
     // struct, toggled by IPC Pause/Resume.
     pub paused: bool,
+    // v0.3.0 Step 5: loaded once at startup (`Config::load()`, injected by
+    // `daemon::start_daemon`/`wayland::paste_from_os`) and shared read-only
+    // with every ingestion thread via `Arc::clone` — see device.rs.
+    pub config: Arc<crate::core::config::Config>,
 }
 
 impl WaylandState {
@@ -74,7 +78,7 @@ impl WaylandState {
     // layer must not depend on `storage`) — the daemon keeps its read-side
     // `ClipboardDb` handle in its own scope and passes it explicitly to
     // whatever needs it (see `daemon::handle_restore_request`).
-    pub fn new_daemon(job_tx: mpsc::Sender<ClipboardJob>, verbose: bool) -> Self {
+    pub fn new_daemon(job_tx: mpsc::Sender<ClipboardJob>, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
         Self {
             manager: None,
             manager_id: None,
@@ -90,10 +94,11 @@ impl WaylandState {
             selection_received: false,
             current_source: None,
             paused: false,
+            config,
         }
     }
 
-    pub fn new_action(target_mime: String, verbose: bool) -> Self {
+    pub fn new_action(target_mime: String, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
         Self {
             manager: None,
             manager_id: None,
@@ -109,6 +114,7 @@ impl WaylandState {
             selection_received: false,
             current_source: None,
             paused: false,
+            config,
         }
     }
 }

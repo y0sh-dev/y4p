@@ -28,8 +28,13 @@ pub fn paste_from_os(mime: &str) -> Vec<u8> {
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
-    // Initialize in action mode (DB-less)
-    let mut state = WaylandState::new_action(mime.to_string(), false);
+    // Initialize in action mode (DB-less). Loading the config here too
+    // (rather than defaulting) keeps a one-shot `paste-from` consistent
+    // with the daemon's own ingestion pipeline for the gates that also
+    // apply to this shared Selection-handling code path (RTF drop, Image
+    // Hijacker opt-in) — see device.rs.
+    let config = std::sync::Arc::new(crate::core::config::Config::load());
+    let mut state = WaylandState::new_action(mime.to_string(), false, config);
 
     // 1. Synchronize to bind initial protocols (Manager & Seat)
     let _ = event_queue.roundtrip(&mut state);
