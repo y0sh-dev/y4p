@@ -63,10 +63,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
     let max_history = crate::core::get_max_history();
     let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history);
 
-    // v0.3.0 Step 5: loaded once here, at startup, and shared read-only for
-    // the whole daemon's lifetime — a config-file edit takes effect on the
-    // next daemon restart, not live (unlike `max_history`, which
-    // `get_max_history()` re-reads per save; see its own doc comment).
+    // Active configuration loaded once at startup and shared read-only across handlers.
     let config = Arc::new(crate::core::config::Config::load());
 
     let Some((conn, mut event_queue)) = wayland::create_connection() else {

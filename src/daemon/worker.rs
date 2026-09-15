@@ -27,10 +27,7 @@ impl DbWorker {
                         metrics.record_ingress();
                         if verbose {
                             let mut line = log_save(&job.mime, job.data.len());
-                            // v0.3.0 Step 4: `source_app` is advisory,
-                            // in-memory-only context (never persisted to
-                            // `storage/`), so it only ever surfaces here in
-                            // the verbose ingestion log.
+                            // Advisory source application (in-memory only) logged in verbose mode.
                             if let Some(app) = &job.source_app {
                                 line.push_str(" from [");
                                 line.push_str(app);
