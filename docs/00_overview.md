@@ -4,7 +4,7 @@ This is the entry point for `y4p`'s internal documentation.
 
 The [README](../README.md) tells you *what* the tool does, and how to run it. Everything under `docs/` tells you *why* it's built the way it is.
 
-Each file below is a self-contained theme. Read the one your question actually falls under — you don't need to read all four in order.
+Each file below is a self-contained theme. Read the one your question actually falls under — you don't need to read all five in order.
 
 ---
 
@@ -102,3 +102,5 @@ Pick the row that matches what's actually on your mind. Each one is a self-conta
 | Why text and large binaries live in two different storage engines, how schema migrations stay safe across upgrades, how history rotation reached near-O(1) cost, and how Pin protection carves pinned records out of the rotation limit | [02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md) |
 | Why every database write funnels through one worker thread, why the daemon explicitly returns memory to the OS after a large payload, and how `open_read_only` moves the single-writer rule from convention to something SQLite itself enforces | [03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md) |
 | Why display order (MRU) and identity (stable ID) are deliberately two different numbers, why a window function was eliminated from search, why `--raw` output is an unbreakable API contract, why negative indices are rejected outright, and why the CLI treats an unrecognized flag as an error, never a guess | [04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md) |
+| How clipboard ingress filters sensitive hints, how the Image Hijacker and dynamic egress transcoding preserve source fidelity, how URL tracking removal protects privacy without breaking sentence punctuation or balanced Wikipedia links, and how out-of-band compositor IPC enforces per-app rules | [05 — Filter Pipeline & Application Rules](05_filter_pipeline_and_app_rules.md) |
+
