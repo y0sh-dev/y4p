@@ -25,7 +25,19 @@ impl DbWorker {
                 match db.insert_with_hash(&job.mime, &job.data, &job.hash, max_history) {
                     Ok(_) => {
                         metrics.record_ingress();
-                        if verbose { println!("{}", log_save(&job.mime, job.data.len())); }
+                        if verbose {
+                            let mut line = log_save(&job.mime, job.data.len());
+                            // v0.3.0 Step 4: `source_app` is advisory,
+                            // in-memory-only context (never persisted to
+                            // `storage/`), so it only ever surfaces here in
+                            // the verbose ingestion log.
+                            if let Some(app) = &job.source_app {
+                                line.push_str(" from [");
+                                line.push_str(app);
+                                line.push(']');
+                            }
+                            println!("{}", line);
+                        }
                     }
                     Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
                 }
