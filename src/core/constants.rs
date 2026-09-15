@@ -162,11 +162,13 @@ pub const INTERFACE_MANAGER: &str = "ext_data_control_manager_v1";
 pub const INTERFACE_SEAT:    &str = "wl_seat";
 
 // --- Original Image Fetcher (v0.3.0) ---
-// Internal feature flag: attempt to fetch an image's original source bytes
-// over the network (see device.rs) instead of settling for whatever
-// re-encoded bitmap the browser wrote to the clipboard. A `const` for now,
-// not a config value — flip to a settings-file lookup once y4p has one.
-pub const FETCH_ORIGINAL_IMAGES: bool = true;
+// Whether to attempt fetching an image's original source bytes over the
+// network (see device.rs), instead of settling for whatever re-encoded
+// bitmap the browser wrote to the clipboard, is now a runtime setting —
+// v0.3.0 Step 5 flipped this from a compile-time `const` to
+// `Config::should_hijack_image()` (`[image] hijack_original` in
+// `y4p.toml`, opt-in/`false` by default since it performs a `curl` network
+// fetch), exactly as this comment used to say it eventually would.
 
 // `curl`'s `--max-time`: bounds how long a stalled/slow-loris server can
 // hold up the fetch. The fetch itself always runs off the daemon's main
