@@ -1,10 +1,10 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/handlers/seat.rs
+// crates/wayland/src/handlers/seat.rs
 
 use wayland_client::{protocol::wl_seat, Connection, Dispatch, QueueHandle};
-use crate::wayland::state::WaylandState;
+use crate::state::WaylandState;
 use crate::core::constants::*;
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
