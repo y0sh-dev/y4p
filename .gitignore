@@ -1,5 +1,7 @@
 # --- Rust Artifacts ---
-/target/
+# Unanchored on purpose: besides the workspace `target/`, some crate tests
+# create scratch directories under `<crate>/target/` (via CARGO_MANIFEST_DIR).
+target/
 /.idea/
 
 # --- Storage / Databases ---
