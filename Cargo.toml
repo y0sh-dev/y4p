@@ -2,13 +2,13 @@
 # The root package (`y4p`, the binary) is an implicit member. Domain crates
 # are added under `crates/` one milestone at a time (see
 # ROADMAP_MODULARIZATION.md); dependencies flow strictly inward towards `core`.
-members = ["crates/core", "crates/storage", "crates/image"]
+members = ["crates/core", "crates/storage", "crates/image", "crates/wayland"]
 resolver = "3"
 
 [workspace.package]
 # Single source of truth: every member inherits these, so a release bump
 # touches exactly one line.
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -19,6 +19,9 @@ libc = "0.2.186"
 # Payload fingerprints: the Wayland ingest path and the storage layer must
 # agree on the digest, so both pull the same pinned version.
 sha3 = "0.12.0"
+# Wayland client bindings: used by the protocol crate and by the daemon's event
+# loop, which names `wayland_client` types directly.
+wayland-client = "0.31.14"
 
 [package]
 name = "y4p"
@@ -34,19 +37,19 @@ y4p-core = { path = "crates/core" }
 # SQLite store, schema migrations and the filesystem blob cache. `rusqlite`
 # is encapsulated there; the binary never touches it directly.
 y4p-storage = { path = "crates/storage" }
-# Local image pipeline: format sniffing, scratch-directory sandbox, sandboxed
-# ImageMagick transcoding, throttle and circuit breaker.
-y4p-image = { path = "crates/image" }
+# Wayland protocol handlers and streaming clipboard I/O. `wayland-protocols`
+# is encapsulated there; the local image pipeline (`y4p-image`) is reached only
+# through it.
+y4p-wayland = { path = "crates/wayland" }
 
 # --- Wayland Core ---
-wayland-client = "0.31.14"
-wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+# The daemon event loop names `wayland_client` types (`Connection`,
+# `QueueHandle`) directly, so the binary keeps this one.
+wayland-client.workspace = true
 
 # --- Utilities ---
 # For robust pipe communication and avoiding runtime deadlocks.
 libc.workspace = true
-# For payload deduplication via unique content fingerprints.
-sha3.workspace = true
 # For calculating terminal layout bounds accurately (supports full/half-width).
 unicode-width = "0.2.2"
 # For handling terminal signals (e.g., SIGINT/Ctrl+C).
