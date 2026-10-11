@@ -56,7 +56,7 @@ Visual progress checklist across the modularization development cycle:
   - Physically extract `src/core/` into `crates/core/` (`y4p-core`).
   - Wire path dependency (`y4p-core = { path = "crates/core" }`) while preserving binary entrypoint in `src/main.rs`.
 
-- [ ] **v0.6.2: Decoupling of `crates/storage`**
+- [x] **v0.6.2: Decoupling of `crates/storage`**
   - Extract SQLite facade and filesystem blob cache into `crates/storage/` (`y4p-storage`).
   - Purify DB / Cache boundaries and schema migration isolation.
 

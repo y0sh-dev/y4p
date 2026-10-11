@@ -20,10 +20,10 @@
 
 // The domain core lives in the `y4p-core` workspace crate. Aliasing it to
 // `core` keeps every `crate::core::...` path in the sibling modules resolving
-// unchanged (and `src/storage/` byte-for-byte untouched).
+// unchanged. `y4p-storage` is aliased to `storage` for the same reason.
 use y4p_core as core;
+use y4p_storage as storage;
 
-mod storage;
 mod wayland;
 mod daemon;
 mod image;

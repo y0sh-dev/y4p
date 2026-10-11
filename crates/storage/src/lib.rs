@@ -1,7 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/storage/mod.rs
+// crates/storage/src/lib.rs
+
+// Aliased to `core` so the `crate::core::...` paths in the modules below
+// resolve exactly as they did inside the monolith (import resolution only).
+use y4p_core as core;
 
 mod cache;
 mod db;
