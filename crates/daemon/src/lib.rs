@@ -3,10 +3,12 @@
 
 // crates/daemon/src/lib.rs
 
-// Aliased to `core` / `storage` / `wayland` so the `crate::core::...`,
-// `crate::storage::...` and `crate::wayland::...` paths in the modules below
-// resolve exactly as they did inside the monolith (import resolution only).
+// Aliased to `core` / `storage` / `wayland` / `image` so the `crate::core::...`,
+// `crate::storage::...`, `crate::wayland::...` and `crate::image::...` paths in
+// the modules below resolve exactly as they did inside the monolith (import
+// resolution only).
 use y4p_core as core;
+use y4p_image as image;
 use y4p_storage as storage;
 use y4p_wayland as wayland;
 

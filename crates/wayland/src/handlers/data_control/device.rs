@@ -11,7 +11,6 @@ use wayland_protocols::ext::data_control::v1::client::{
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::sync::{mpsc, Arc, Mutex};
-use sha3::{Digest, Sha3_256};
 use crate::state::{WaylandState, OfferData, ClipboardJob};
 use crate::core::constants::*;
 use super::{make_pipe, is_sensitive};
@@ -117,47 +116,19 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
         .or_else(|| mimes.iter().find(|m| !drop_rtf || !crate::core::utils::is_rtf_mime(m)).cloned())
 }
 
-/// Reads a MIME payload from an already-`offer.receive()`d pipe, turns it
-/// into a finished `ClipboardJob` (see `build_job`) and forwards it to the
-/// DbWorker.
+/// Reads a MIME payload from an already-`offer.receive()`d pipe, normalises
+/// it (see `normalise_payload`) and forwards the raw `(mime, data)` pair to
+/// the daemon's worker.
 ///
 /// Factored out of the Selection handler so it can be called from the
-/// dedicated per-selection thread the handler spawns. That thread is also
-/// why image transcoding may block here (it spawns `magick`): neither the
-/// daemon's poll loop nor the Wayland event queue is ever held up by it.
+/// dedicated per-selection thread the handler spawns. This layer only drains
+/// the pipe and normalises: image transcoding and fingerprinting are the
+/// worker's concern, so this thread never spawns `magick` or hashes anything.
 fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, job_tx: &mpsc::Sender<ClipboardJob>) {
     let Some(payload) = read_bounded_payload(read_file, MAX_PAYLOAD_BYTES) else { return; };
-    let Some(job) = build_job(mime_to_get, payload) else { return; };
+    let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
 
-    // Send the completed payload and its SHA3 fingerprint to the persistent worker.
-    let _ = job_tx.send(job);
-}
-
-/// Turns a raw payload into the job that will actually be persisted, in a
-/// fixed order: normalise, then route through the image pipeline, then hash.
-///
-/// The order matters. Raster images are privacy-stripped and re-encoded by
-/// `image::route::route_for_ingest`, which may change both the MIME and every
-/// byte; the fingerprint must describe what `DbWorker` and the cache file
-/// really store, so it is computed last, over the final bytes. (Hashing
-/// earlier would key the row by bytes that are never saved, and the same
-/// image copied twice would still dedupe only by accident.) Routing falls
-/// back to the untouched original on any failure, so the hash then covers
-/// the original instead — consistent either way.
-///
-/// Returns `None` only where `normalise_payload` does.
-fn build_job(mime_to_get: String, payload: Vec<u8>) -> Option<ClipboardJob> {
-    let (normalised_mime, normalised) = normalise_payload(mime_to_get, payload)?;
-    let (mime, data) = crate::image::route::route_for_ingest(normalised_mime, normalised);
-    let hash = fingerprint(&data);
-    Some(ClipboardJob { mime, data, hash })
-}
-
-/// Lowercase-hex SHA3-256 fingerprint of `data`.
-fn fingerprint(data: &[u8]) -> String {
-    let mut hasher = Sha3_256::new();
-    hasher.update(data);
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    let _ = job_tx.send(ClipboardJob { mime, data });
 }
 
 /// Reads at most `limit` bytes from an already-`offer.receive()`d pipe.
@@ -383,87 +354,5 @@ mod tests {
         let raw = b"# just text, not uri-list or an image".to_vec();
         let result = normalise_payload("text/markdown".to_string(), raw.clone());
         assert_eq!(result, Some(("text/markdown".to_string(), raw)));
-    }
-
-    // --- build_job (normalise -> image routing -> hash) ---
-
-    fn magick_available() -> bool {
-        if crate::image::magick::is_available() {
-            true
-        } else {
-            eprintln!("skipping: `magick` is not available on this system");
-            false
-        }
-    }
-
-    fn generated(args: &[&str]) -> Vec<u8> {
-        let mut out = Vec::new();
-        crate::image::magick::run(args, std::io::empty(), &mut out).unwrap();
-        out
-    }
-
-    #[test]
-    fn build_job_plain_text_is_unchanged_and_hashed_as_is() {
-        let raw = b"hello clipboard".to_vec();
-        let job = build_job("text/plain".to_string(), raw.clone()).unwrap();
-        assert_eq!(job.mime, "text/plain");
-        assert_eq!(job.data, raw);
-        assert_eq!(job.hash, fingerprint(&raw));
-    }
-
-    #[test]
-    fn build_job_svg_bypasses_the_image_pipeline_unchanged() {
-        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"5\" height=\"5\"/>".to_vec();
-        let job = build_job("image/svg+xml".to_string(), svg.clone()).unwrap();
-        assert_eq!(job.mime, "image/svg+xml");
-        assert_eq!(job.data, svg);
-        assert_eq!(job.hash, fingerprint(&svg));
-    }
-
-    #[test]
-    fn build_job_uri_list_is_normalised_then_hashed_without_image_routing() {
-        let job = build_job(MIME_URI_LIST.to_string(), b"file:///a.png".to_vec()).unwrap();
-        assert_eq!(job.mime, MIME_URI_LIST);
-        assert_eq!(job.data, b"/a.png".to_vec());
-        assert_eq!(job.hash, fingerprint(b"/a.png"));
-    }
-
-    #[test]
-    fn build_job_png_becomes_webp_and_the_hash_covers_the_converted_bytes() {
-        if !magick_available() { return; }
-        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
-        let job = build_job("image/png".to_string(), png.clone()).unwrap();
-        assert_eq!(job.mime, "image/webp");
-        assert_eq!(&job.data[8..12], b"WEBP");
-        assert_eq!(job.hash, fingerprint(&job.data), "fingerprint must describe the stored bytes");
-        assert_ne!(job.hash, fingerprint(&png), "fingerprint must not be that of the discarded original");
-    }
-
-    #[test]
-    fn build_job_same_image_copied_twice_yields_the_same_fingerprint() {
-        if !magick_available() { return; }
-        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
-        let first = build_job("image/png".to_string(), png.clone()).unwrap();
-        let second = build_job("image/png".to_string(), png).unwrap();
-        assert_eq!(first.hash, second.hash, "deduplication relies on a deterministic conversion");
-    }
-
-    #[test]
-    fn build_job_corrupt_png_falls_back_to_the_original_bytes_mime_and_hash() {
-        if !magick_available() { return; }
-        let mut corrupt = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        corrupt.extend_from_slice(&[0xA5; 2048]);
-        let job = build_job("image/png".to_string(), corrupt.clone()).unwrap();
-        assert_eq!(job.mime, "image/png");
-        assert_eq!(job.data, corrupt);
-        assert_eq!(job.hash, fingerprint(&corrupt));
-    }
-
-    #[test]
-    fn build_job_mislabelled_image_is_reidentified_before_routing() {
-        if !magick_available() { return; }
-        let png = generated(&["-size", "16x16", "xc:red", "png:-"]);
-        let job = build_job("application/octet-stream".to_string(), png).unwrap();
-        assert_eq!(job.mime, "image/webp");
     }
 }

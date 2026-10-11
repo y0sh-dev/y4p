@@ -74,9 +74,10 @@ Visual progress checklist across the modularization development cycle:
 - [x] **v0.6.6: Decoupling of `crates/daemon`**
   - Extract the daemon event loop into `crates/daemon/` (`y4p-daemon`), depending on `y4p-wayland`, `y4p-storage` and `y4p-core`; `src/main.rs` becomes the thin composition root.
 
-- [ ] **v0.6.7: Test Externalisation & Zero-Copy Preparation Stage 2 (Stream I/O Contract)**
-  - Relocate inline unit tests to dedicated `tests/` integration directories (`src/` purification).
-  - Refine inter-crate streaming I/O and zero-allocation contracts.
+- [x] **v0.6.7: Ingestion Pipeline Purification & Stream I/O Contract**
+  - `y4p-wayland` no longer depends on `y4p-image` or `sha3`: `ClipboardJob` is `{ mime, data }` and the ingestion thread streams normalised raw payloads straight to the worker.
+  - Image routing and SHA3-256 fingerprinting moved into the `y4p-daemon` worker (`process_job`), together with the 7 ingestion tests.
+  - *Not performed in this milestone:* relocating inline unit tests to dedicated `tests/` directories (originally planned here; placement pending confirmation with the human supervisor).
 
 - [ ] **v0.6.8: Pre-Distillation Hardening & Feature Polish**
   - System-wide regression hardening / reserved slot for future capability insertion.

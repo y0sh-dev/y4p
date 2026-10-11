@@ -7,8 +7,6 @@ license.workspace = true
 
 [dependencies]
 y4p-core = { path = "../core" }
-# Ingested images are routed through the local pipeline before they are stored.
-y4p-image = { path = "../image" }
 
 # --- Wayland Core ---
 wayland-client.workspace = true
@@ -17,8 +15,6 @@ wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 # --- Utilities ---
 # Pipes, poll(2), fcntl(2) and sendfile(2) for the non-blocking payload streams.
 libc.workspace = true
-# Payload fingerprints; must agree with the storage layer's digest.
-sha3.workspace = true
 
 # Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
 # unsafe-documentation and clone lints) is defined once in the workspace root

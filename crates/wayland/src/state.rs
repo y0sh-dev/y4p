@@ -39,10 +39,12 @@ pub struct SourceMetadata {
     pub payload: SourcePayload,
 }
 
+/// A normalised raw payload handed from the ingestion thread to the daemon's
+/// worker. Deliberately carries no fingerprint: image transcoding rewrites the
+/// bytes, so the digest is only meaningful once the worker has the final ones.
 pub struct ClipboardJob {
     pub mime: String,
     pub data: Vec<u8>,
-    pub hash: String,
 }
 
 pub struct WaylandState {

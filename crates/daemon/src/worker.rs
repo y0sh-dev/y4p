@@ -7,11 +7,17 @@ use crate::core::constants::*;
 use crate::metrics::DaemonMetrics;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
+use sha3::{Digest, Sha3_256};
 use std::sync::{mpsc, Arc};
 
 /// Owns the single writer connection and its background thread. All
 /// persistence goes through this one channel, so SQLite only ever sees one
 /// writer.
+///
+/// Image transcoding and fingerprinting happen on this thread too (see
+/// `process_job`): the Wayland layer hands over normalised raw payloads and
+/// never blocks on `magick`. Jobs are therefore also persisted strictly in
+/// arrival order.
 pub struct DbWorker {
     tx: mpsc::Sender<ClipboardJob>,
 }
@@ -22,11 +28,12 @@ impl DbWorker {
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                match db.insert_with_hash(&job.mime, &job.data, &job.hash, max_history) {
+                let (mime, data, hash) = process_job(job.mime, job.data);
+                match db.insert_with_hash(&mime, &data, &hash, max_history) {
                     Ok(_) => {
                         metrics.record_ingress();
                         if verbose {
-                            println!("{}", log_save(&job.mime, job.data.len()));
+                            println!("{}", log_save(&mime, data.len()));
                         }
                     }
                     Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
@@ -41,5 +48,126 @@ impl DbWorker {
     /// can be queued without touching the worker thread directly.
     pub fn sender(&self) -> mpsc::Sender<ClipboardJob> {
         self.tx.clone()
+    }
+}
+
+/// Turns a normalised raw payload into what will actually be persisted, in a
+/// fixed order: route through the image pipeline, then hash.
+///
+/// The order matters. Raster images are privacy-stripped and re-encoded by
+/// `image::route::route_for_ingest`, which may change both the MIME and every
+/// byte; the fingerprint must describe what the database and the cache file
+/// really store, so it is computed last, over the final bytes. (Hashing
+/// earlier would key the row by bytes that are never saved, and the same
+/// image copied twice would still dedupe only by accident.) Routing falls
+/// back to the untouched original on any failure, so the hash then covers
+/// the original instead — consistent either way.
+///
+/// Returns `(mime, data, hash)`.
+fn process_job(mime: String, data: Vec<u8>) -> (String, Vec<u8>, String) {
+    let (mime, data) = crate::image::route::route_for_ingest(mime, data);
+    let hash = fingerprint(&data);
+    (mime, data, hash)
+}
+
+/// Lowercase-hex SHA3-256 fingerprint of `data`.
+fn fingerprint(data: &[u8]) -> String {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // --- process_job (image routing -> hash) ---
+    //
+    // Payloads reach `process_job` already normalised by the Wayland layer
+    // (URI lists decoded, mislabelled images re-identified by magic bytes);
+    // the image router additionally sniffs the bytes itself, so a mislabelled
+    // image is still recognised here.
+
+    fn magick_available() -> bool {
+        if crate::image::magick::is_available() {
+            true
+        } else {
+            eprintln!("skipping: `magick` is not available on this system");
+            false
+        }
+    }
+
+    fn generated(args: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::image::magick::run(args, std::io::empty(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn process_job_plain_text_is_unchanged_and_hashed_as_is() {
+        let raw = b"hello clipboard".to_vec();
+        let (mime, data, hash) = process_job("text/plain".to_string(), raw.clone());
+        assert_eq!(mime, "text/plain");
+        assert_eq!(data, raw);
+        assert_eq!(hash, fingerprint(&raw));
+    }
+
+    #[test]
+    fn process_job_svg_bypasses_the_image_pipeline_unchanged() {
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"5\" height=\"5\"/>".to_vec();
+        let (mime, data, hash) = process_job("image/svg+xml".to_string(), svg.clone());
+        assert_eq!(mime, "image/svg+xml");
+        assert_eq!(data, svg);
+        assert_eq!(hash, fingerprint(&svg));
+    }
+
+    #[test]
+    fn process_job_uri_list_bypasses_image_routing_and_is_hashed() {
+        // Already normalised upstream: one path per line. A path that merely
+        // *names* a PNG is still text and must never reach the transcoder.
+        let (mime, data, hash) = process_job(MIME_URI_LIST.to_string(), b"/a.png".to_vec());
+        assert_eq!(mime, MIME_URI_LIST);
+        assert_eq!(data, b"/a.png".to_vec());
+        assert_eq!(hash, fingerprint(b"/a.png"));
+    }
+
+    #[test]
+    fn process_job_png_becomes_webp_and_the_hash_covers_the_converted_bytes() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let (mime, data, hash) = process_job("image/png".to_string(), png.clone());
+        assert_eq!(mime, "image/webp");
+        assert_eq!(&data[8..12], b"WEBP");
+        assert_eq!(hash, fingerprint(&data), "fingerprint must describe the stored bytes");
+        assert_ne!(hash, fingerprint(&png), "fingerprint must not be that of the discarded original");
+    }
+
+    #[test]
+    fn process_job_same_image_copied_twice_yields_the_same_fingerprint() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let (_, _, first) = process_job("image/png".to_string(), png.clone());
+        let (_, _, second) = process_job("image/png".to_string(), png);
+        assert_eq!(first, second, "deduplication relies on a deterministic conversion");
+    }
+
+    #[test]
+    fn process_job_corrupt_png_falls_back_to_the_original_bytes_mime_and_hash() {
+        if !magick_available() { return; }
+        let mut corrupt = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        corrupt.extend_from_slice(&[0xA5; 2048]);
+        let (mime, data, hash) = process_job("image/png".to_string(), corrupt.clone());
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, corrupt);
+        assert_eq!(hash, fingerprint(&corrupt));
+    }
+
+    #[test]
+    fn process_job_mislabelled_image_is_reidentified_before_routing() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "16x16", "xc:red", "png:-"]);
+        let (mime, _, _) = process_job("application/octet-stream".to_string(), png);
+        assert_eq!(mime, "image/webp");
     }
 }
