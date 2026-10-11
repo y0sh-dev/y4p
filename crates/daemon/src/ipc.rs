@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/daemon/ipc.rs
+// crates/daemon/src/ipc.rs
 
 use crate::core::constants::*;
 use std::io::{BufRead, Write};

@@ -1,14 +1,20 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/daemon/mod.rs
+// crates/daemon/src/lib.rs
+
+// Aliased to `core` / `storage` / `wayland` so the `crate::core::...`,
+// `crate::storage::...` and `crate::wayland::...` paths in the modules below
+// resolve exactly as they did inside the monolith (import resolution only).
+use y4p_core as core;
+use y4p_storage as storage;
+use y4p_wayland as wayland;
 
 mod ipc;
 mod metrics;
 mod worker;
 
 use crate::storage::{ClipboardDb, ContentLocation};
-use crate::wayland;
 use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
 use crate::core::constants::*;
 use crate::core::utils::is_html_mime;
