@@ -67,18 +67,20 @@ Visual progress checklist across the modularization development cycle:
 - [x] **v0.6.4: Decoupling of `crates/wayland`**
   - Extract Wayland protocol handlers and streaming I/O into `crates/wayland/` (`y4p-wayland`), depending on `y4p-image`.
 
-- [ ] **v0.6.5: Decoupling of `crates/daemon`, `crates/cli` & Test Externalisation**
-  - Extract daemon event loop (`crates/daemon`) and CLI argument parser (`crates/cli`).
+- [x] **v0.6.5: Decoupling of `crates/cli`**
+  - Extract the command-line frontend (argument parsing, dispatch, formatting) into `crates/cli/` (`y4p-cli`), depending on `y4p-core` and `y4p-storage`.
+  - Ordering (agreed, "Plan A"): CLI and daemon are extracted in separate milestones for incremental safety. `cli` has no dependency on `daemon`/`wayland` (it hands back `CliAction` to the composition root), so it goes first.
+
+- [ ] **v0.6.6: Decoupling of `crates/daemon`**
+  - Extract the daemon event loop into `crates/daemon/` (`y4p-daemon`), depending on `y4p-wayland`, `y4p-storage` and `y4p-core`; `src/main.rs` becomes the thin composition root.
+
+- [ ] **v0.6.7: Test Externalisation & Zero-Copy Preparation Stage 2 (Stream I/O Contract)**
   - Relocate inline unit tests to dedicated `tests/` integration directories (`src/` purification).
-
-- [ ] **v0.6.6: Zero-Copy Preparation Stage 2 (Stream I/O Contract)**
   - Refine inter-crate streaming I/O and zero-allocation contracts.
-
-- [ ] **v0.6.7: Zero-Copy Preparation Stage 2 (Buffer Lifecycle Unification)**
-  - Align buffer lifetimes and descriptor passing mechanisms across crate boundaries.
 
 - [ ] **v0.6.8: Pre-Distillation Hardening & Feature Polish**
   - System-wide regression hardening / reserved slot for future capability insertion.
+  - Zero-Copy Preparation Stage 2 (Buffer Lifecycle Unification), carried over from the former v0.6.7: align buffer lifetimes and descriptor passing mechanisms across crate boundaries. *(Placement pending confirmation with the human supervisor.)*
 
 - [ ] **v0.6.9: Documentation Distillation & Workspace Architecture Freeze**
   - Distil workspace layout, crate dependencies, and architecture invariants into `docs/`.
