@@ -1,11 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/show.rs
+// crates/cli/src/show.rs
 
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use std::io::{self, Write};
 
 /// Inspect entry metadata and payload using index or persistent database ID.
@@ -25,7 +25,7 @@ pub fn run(args: &[String], db: &ClipboardDb) {
         }
     };
 
-    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+    let real_id = match crate::utils::resolve_target_id(input_str, ctx.use_id, db) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{}{}", LOG_ERROR, e);

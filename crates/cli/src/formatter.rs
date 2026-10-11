@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/formatter.rs
+// crates/cli/src/formatter.rs
 
 use unicode_width::UnicodeWidthChar;
 use crate::core::constants::*;

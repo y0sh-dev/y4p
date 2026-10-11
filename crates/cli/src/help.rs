@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/help.rs
+// crates/cli/src/help.rs
 
 /// Display the application version and primary system description.
 ///

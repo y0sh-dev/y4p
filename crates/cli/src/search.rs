@@ -1,11 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/search.rs
+// crates/cli/src/search.rs
 
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use std::collections::HashSet;
 use super::list::{self, IndexItem};
 

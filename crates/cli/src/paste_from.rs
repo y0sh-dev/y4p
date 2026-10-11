@@ -1,10 +1,10 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/paste_from.rs
+// crates/cli/src/paste_from.rs
 
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 
 /// Validate `paste-from` arguments and resolve the target MIME type.
 /// Returns `None` on validation failure. The actual Wayland fetch and

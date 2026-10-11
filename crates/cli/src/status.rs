@@ -1,9 +1,9 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/status.rs
+// crates/cli/src/status.rs
 
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use crate::core::constants::*;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
