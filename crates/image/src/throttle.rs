@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/throttle.rs
+// crates/image/src/throttle.rs
 
 //! Process throttle for the external image converter.
 //!

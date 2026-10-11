@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/sandbox.rs
+// crates/image/src/sandbox.rs
 
 //! Execution environment for the external image converter: where it may
 //! spill to disk, and what it may inherit.
@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::constants::{SCRATCH_DIR_NAME, SCRATCH_FALLBACK_ROOT};
-use crate::image::pipeline::ChildEnv;
+use crate::pipeline::ChildEnv;
 
 /// Owner-only: read, write, search.
 const PRIVATE_MODE: u32 = 0o700;
@@ -201,7 +201,7 @@ fn child_env_with(path: Option<OsString>, scratch: Option<&Path>) -> ChildEnv {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::image::pipeline::run_filter_in_env;
+    use crate::pipeline::run_filter_in_env;
     use std::collections::BTreeSet;
     use std::io::{Read, empty};
 
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn real_magick_spills_into_the_private_scratch_directory() {
-        use crate::image::magick;
+        use crate::magick;
         use std::time::{Duration, Instant};
         if !magick::is_available() {
             eprintln!("skipping: `magick` is not available on this system");

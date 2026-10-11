@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/breaker.rs
+// crates/image/src/breaker.rs
 
 //! Circuit breaker for the external image converter.
 //!

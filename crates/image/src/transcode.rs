@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/transcode.rs
+// crates/image/src/transcode.rs
 
 //! Privacy-stripping, resource-bounded image transcoding on top of the
 //! streaming `magick` runner.
@@ -21,8 +21,8 @@ use crate::core::constants::{
     IMAGE_QUALITY_MIN, IMAGE_TRANSCODE_TIMEOUT_SECS,
 };
 use crate::core::utils::{detect_image_mime, mime_base};
-use crate::image::magick;
-use crate::image::pipeline::{PipelineError, Transfer};
+use crate::magick;
+use crate::pipeline::{PipelineError, Transfer};
 
 /// Raster formats accepted as *input*. The decoder is pinned explicitly
 /// (`png:-`) instead of letting ImageMagick sniff the stream: auto-detection
@@ -230,7 +230,7 @@ impl Transcode {
 
 /// Streams `input` through `magick` according to `job` into `output`,
 /// stripping all metadata. Nothing is buffered whole: see
-/// [`crate::image::pipeline::run_filter`] for the chunked, deadlock-free
+/// [`crate::pipeline::run_filter`] for the chunked, deadlock-free
 /// relay, and for the rule that `output` must be discarded on `Err`.
 ///
 /// A payload that does not decode as `job.input` (corrupt, truncated,

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/pipeline.rs
+// crates/image/src/pipeline.rs
 
 use std::ffi::OsString;
 use std::fmt;
