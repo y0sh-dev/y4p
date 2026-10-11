@@ -1,0 +1,20 @@
+[package]
+name = "y4p-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line frontend for y4p: argument parsing, sub-command dispatch and output formatting."
+license.workspace = true
+
+[dependencies]
+y4p-core = { path = "../core" }
+y4p-storage = { path = "../storage" }
+# For calculating terminal layout bounds accurately (supports full/half-width).
+unicode-width = "0.2.2"
+
+# Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
+# unsafe-documentation and clone lints) is defined once in the workspace root
+# and inherited here; see `[workspace.lints.clippy]` in the root manifest.
+# `src/lib.rs` carves out the CLI-specific exit-on-error `allow`, as the
+# monolithic `cli` module did.
+[lints]
+workspace = true

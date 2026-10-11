@@ -1,11 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/store.rs
+// crates/cli/src/store.rs
 
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use std::io::{self, Read, Write};
 
 /// Ingest data from stdin, persist to database, and synchronize to system clipboard.

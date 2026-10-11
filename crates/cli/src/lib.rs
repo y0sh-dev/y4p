@@ -1,13 +1,19 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/mod.rs
+// crates/cli/src/lib.rs
 
 // `cli` is the CLI entry point: exiting with a clear error/exit code on an
 // unrecoverable input is the correct behavior here, unlike the resident
 // daemon/storage/wayland layers this crate otherwise denies unwrap/expect/
 // panic in (see [lints.clippy] in Cargo.toml).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+// Aliased to `core` / `storage` so the `crate::core::...` and
+// `crate::storage::...` paths in the modules below resolve exactly as they did
+// inside the monolith (import resolution only).
+use y4p_core as core;
+use y4p_storage as storage;
 
 mod daemon;
 mod list;

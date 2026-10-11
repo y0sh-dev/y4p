@@ -1,11 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/cleaning.rs
+// crates/cli/src/cleaning.rs
 
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 
 /// Remove a history record by its MRU index or persistent database ID.
 pub fn delete_run(args: &[String], db: &mut ClipboardDb) {
@@ -24,7 +24,7 @@ pub fn delete_run(args: &[String], db: &mut ClipboardDb) {
         }
     };
 
-    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+    let real_id = match crate::utils::resolve_target_id(input_str, ctx.use_id, db) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{}{}", LOG_ERROR, e);

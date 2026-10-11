@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/list.rs
+// crates/cli/src/list.rs
 
 use crate::storage::ClipboardDb;
 use super::formatter;

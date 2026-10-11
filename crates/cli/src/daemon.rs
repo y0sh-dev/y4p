@@ -1,10 +1,10 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/daemon.rs
+// crates/cli/src/daemon.rs
 
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 
 /// Validate `daemon` command arguments and print the pre-start banner.
 /// Returns the resolved `verbose` flag on success, `None` on any validation

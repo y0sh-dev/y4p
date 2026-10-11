@@ -20,16 +20,16 @@
 
 // The domain core lives in the `y4p-core` workspace crate. Aliasing it to
 // `core` keeps every `crate::core::...` path in the sibling modules resolving
-// unchanged. `y4p-storage` and `y4p-wayland` are aliased for the same reason.
+// unchanged. Domain crates are aliased for the same reason.
 use y4p_core as core;
 use y4p_storage as storage;
-
 use y4p_wayland as wayland;
+use y4p_cli as cli;
+
 mod daemon;
-mod cli;
 
 use std::io::Write;
-use crate::cli::CliAction;
+use cli::CliAction;
 use crate::core::constants::*;
 
 fn main() {

@@ -1,11 +1,11 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/copy_to.rs
+// crates/cli/src/copy_to.rs
 
 use crate::storage::ClipboardDb;
 use crate::core::constants::*;
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use std::os::unix::net::UnixStream;
 use std::io::Write;
 
@@ -23,7 +23,7 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
         None => { eprintln!("{}missing ID.", LOG_ERROR); return; }
     };
 
-    let real_id = match crate::cli::utils::resolve_target_id(input_str, ctx.use_id, db) {
+    let real_id = match crate::utils::resolve_target_id(input_str, ctx.use_id, db) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{}{}", LOG_ERROR, e);

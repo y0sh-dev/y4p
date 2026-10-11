@@ -1,9 +1,9 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/cli/resume.rs
+// crates/cli/src/resume.rs
 
-use crate::cli::utils::ArgContext;
+use crate::utils::ArgContext;
 use crate::core::constants::*;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
