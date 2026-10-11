@@ -2,13 +2,13 @@
 # The root package (`y4p`, the binary) is an implicit member. Domain crates
 # are added under `crates/` one milestone at a time (see
 # ROADMAP_MODULARIZATION.md); dependencies flow strictly inward towards `core`.
-members = ["crates/core", "crates/storage", "crates/image", "crates/wayland", "crates/cli"]
+members = ["crates/core", "crates/storage", "crates/image", "crates/wayland", "crates/cli", "crates/daemon"]
 resolver = "3"
 
 [workspace.package]
 # Single source of truth: every member inherits these, so a release bump
 # touches exactly one line.
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -44,11 +44,9 @@ y4p-wayland = { path = "crates/wayland" }
 # Command-line frontend: argument parsing, dispatch and output formatting.
 # `unicode-width` is encapsulated there.
 y4p-cli = { path = "crates/cli" }
-
-# --- Wayland Core ---
-# The daemon event loop names `wayland_client` types (`Connection`,
-# `QueueHandle`) directly, so the binary keeps this one.
-wayland-client.workspace = true
+# Resident daemon: IPC socket lifecycle, event loop and background DB worker.
+# `wayland-client` is encapsulated there and in `y4p-wayland`.
+y4p-daemon = { path = "crates/daemon" }
 
 # --- Utilities ---
 # For robust pipe communication and avoiding runtime deadlocks.

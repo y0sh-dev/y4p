@@ -26,7 +26,7 @@ use y4p_storage as storage;
 use y4p_wayland as wayland;
 use y4p_cli as cli;
 
-mod daemon;
+use y4p_daemon as daemon;
 
 use std::io::Write;
 use cli::CliAction;

@@ -71,7 +71,7 @@ Visual progress checklist across the modularization development cycle:
   - Extract the command-line frontend (argument parsing, dispatch, formatting) into `crates/cli/` (`y4p-cli`), depending on `y4p-core` and `y4p-storage`.
   - Ordering (agreed, "Plan A"): CLI and daemon are extracted in separate milestones for incremental safety. `cli` has no dependency on `daemon`/`wayland` (it hands back `CliAction` to the composition root), so it goes first.
 
-- [ ] **v0.6.6: Decoupling of `crates/daemon`**
+- [x] **v0.6.6: Decoupling of `crates/daemon`**
   - Extract the daemon event loop into `crates/daemon/` (`y4p-daemon`), depending on `y4p-wayland`, `y4p-storage` and `y4p-core`; `src/main.rs` becomes the thin composition root.
 
 - [ ] **v0.6.7: Test Externalisation & Zero-Copy Preparation Stage 2 (Stream I/O Contract)**

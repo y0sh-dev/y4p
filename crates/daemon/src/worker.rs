@@ -1,10 +1,10 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/daemon/worker.rs
+// crates/daemon/src/worker.rs
 
 use crate::core::constants::*;
-use crate::daemon::metrics::DaemonMetrics;
+use crate::metrics::DaemonMetrics;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
 use std::sync::{mpsc, Arc};

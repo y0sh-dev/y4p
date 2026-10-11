@@ -397,20 +397,20 @@ dependencies = [
 
 [[package]]
 name = "y4p"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "ctrlc",
  "libc",
- "wayland-client",
  "y4p-cli",
  "y4p-core",
+ "y4p-daemon",
  "y4p-storage",
  "y4p-wayland",
 ]
 
 [[package]]
 name = "y4p-cli"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "unicode-width",
  "y4p-core",
@@ -419,15 +419,26 @@ dependencies = [
 
 [[package]]
 name = "y4p-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "libc",
  "percent-encoding",
 ]
 
 [[package]]
+name = "y4p-daemon"
+version = "0.6.6"
+dependencies = [
+ "libc",
+ "wayland-client",
+ "y4p-core",
+ "y4p-storage",
+ "y4p-wayland",
+]
+
+[[package]]
 name = "y4p-image"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "libc",
  "y4p-core",
@@ -435,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "y4p-storage"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "rusqlite",
  "sha3",
@@ -444,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "y4p-wayland"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "libc",
  "sha3",
