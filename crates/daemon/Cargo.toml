@@ -1,0 +1,21 @@
+[package]
+name = "y4p-daemon"
+version.workspace = true
+edition.workspace = true
+description = "Resident daemon for y4p: IPC socket lifecycle, Wayland event loop and background storage worker."
+license.workspace = true
+
+[dependencies]
+y4p-core = { path = "../core" }
+y4p-storage = { path = "../storage" }
+y4p-wayland = { path = "../wayland" }
+# The event loop names `wayland_client` types (`Connection`, `QueueHandle`).
+wayland-client.workspace = true
+# poll(2) over the compositor and IPC listener descriptors.
+libc.workspace = true
+
+# Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
+# unsafe-documentation and clone lints) is defined once in the workspace root
+# and inherited here; see `[workspace.lints.clippy]` in the root manifest.
+[lints]
+workspace = true
