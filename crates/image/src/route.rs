@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/route.rs
+// crates/image/src/route.rs
 
 //! MIME-aware dispatch for ingestion: decides whether a clipboard payload
 //! should be transcoded (privacy-stripped and compressed) and, if so, runs
@@ -28,11 +28,11 @@ use crate::core::constants::{
     log_image_scratch_unavailable, log_image_throttled,
 };
 use crate::core::utils::detect_image_mime;
-use crate::image::breaker::{CircuitBreaker, PermitOutcome};
-use crate::image::magick;
-use crate::image::pipeline::{PipelineError, Transfer};
-use crate::image::throttle::ProcessThrottle;
-use crate::image::transcode::{self, InputFormat, OutputFormat, Quality, Transcode};
+use crate::breaker::{CircuitBreaker, PermitOutcome};
+use crate::magick;
+use crate::pipeline::{PipelineError, Transfer};
+use crate::throttle::ProcessThrottle;
+use crate::transcode::{self, InputFormat, OutputFormat, Quality, Transcode};
 
 /// Bytes inspected when classifying a payload. Binary image signatures fit
 /// in 12; the rest is slack for leading whitespace before an SVG prolog.
@@ -226,7 +226,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::Instant;
-    use crate::image::breaker::BreakerState;
+    use crate::breaker::BreakerState;
 
     fn magick_or_skip() -> bool {
         if magick::is_available() {
@@ -649,7 +649,7 @@ mod tests {
         corrupt.extend_from_slice(&[0xA5; 2048]);
         for _ in 0..5 {
             let routed = route_with("image/png".to_owned(), corrupt.clone(), &breaker, &roomy_throttle(), |job, input, out| {
-                crate::image::transcode::transcode(job, input, out)
+                crate::transcode::transcode(job, input, out)
             });
             assert_eq!(routed, ("image/png".to_owned(), corrupt.clone()));
         }
@@ -886,7 +886,7 @@ mod tests {
     fn a_poisoned_throttle_still_admits_and_still_falls_back() {
         let breaker = fresh_breaker();
         let throttle = ProcessThrottle::new(1, Duration::ZERO);
-        crate::image::throttle::poison_for_test(&throttle);
+        crate::throttle::poison_for_test(&throttle);
 
         let (routed, called) = route_through(&breaker, &throttle, "image/png", png_header(), would_succeed());
         assert!(called.is_some(), "a poisoned lock must not disable conversion");

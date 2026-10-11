@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/mod.rs
+// crates/image/src/lib.rs
 
 //! Local Image Pipeline: runs external converters (ImageMagick's `magick`)
 //! as filters over `Read`/`Write` streams.
@@ -14,6 +14,10 @@
 // exercised by the unit tests only until later v0.5.x milestones adopt them,
 // so `dead_code` is allowed module-wide rather than sprinkled per item.
 #![allow(dead_code)]
+
+// Aliased to `core` so the `crate::core::...` paths in the modules below
+// resolve exactly as they did inside the monolith (import resolution only).
+use y4p_core as core;
 
 pub mod breaker;
 pub mod magick;

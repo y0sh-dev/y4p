@@ -1,0 +1,17 @@
+[package]
+name = "y4p-image"
+version.workspace = true
+edition.workspace = true
+description = "Local image pipeline for y4p: format sniffing, sandboxed ImageMagick transcoding and resource controls."
+license.workspace = true
+
+[dependencies]
+y4p-core = { path = "../core" }
+# Process groups, signals and pipe primitives for the external converter.
+libc.workspace = true
+
+# Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
+# unsafe-documentation and clone lints) is defined once in the workspace root
+# and inherited here; see `[workspace.lints.clippy]` in the root manifest.
+[lints]
+workspace = true

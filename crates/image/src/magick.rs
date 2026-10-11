@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/image/magick.rs
+// crates/image/src/magick.rs
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -9,8 +9,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::core::constants::MAGICK_PROGRAM;
-use crate::image::pipeline::{self, PipelineError, Transfer};
-use crate::image::sandbox::{self, ScratchDir};
+use crate::pipeline::{self, PipelineError, Transfer};
+use crate::sandbox::{self, ScratchDir};
 
 /// True when `program -version` can be spawned and exits successfully.
 ///
