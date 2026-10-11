@@ -64,7 +64,7 @@ Visual progress checklist across the modularization development cycle:
   - Extract image sniffing, `ScratchDir` sandbox, and transcode engine into `crates/image/` (`y4p-image`).
   - Ordering (agreed): `wayland` ingestion calls into the image pipeline (`route_for_ingest`), so `image` must become a crate first for the `wayland` boundary to compile in the next step.
 
-- [ ] **v0.6.4: Decoupling of `crates/wayland`**
+- [x] **v0.6.4: Decoupling of `crates/wayland`**
   - Extract Wayland protocol handlers and streaming I/O into `crates/wayland/` (`y4p-wayland`), depending on `y4p-image`.
 
 - [ ] **v0.6.5: Decoupling of `crates/daemon`, `crates/cli` & Test Externalisation**
