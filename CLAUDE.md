@@ -38,7 +38,7 @@ This document complements the global protocol (`~/.claude/CLAUDE.md`) and define
   - No `unwrap()`, `expect()`, or `panic!()` in production code.
   - Zero warnings under `cargo clippy --all-targets -- -D warnings`.
 - **Storage Subsystem Invariance**:
-  - The logic, schema, queries, and interface of `src/storage/` must remain completely untouched (0 lines changed).
+  - The logic, schema, queries, and interface of `crates/storage/` must remain completely untouched (0 lines changed).
 
 ---
 
