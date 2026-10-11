@@ -2,13 +2,13 @@
 # The root package (`y4p`, the binary) is an implicit member. Domain crates
 # are added under `crates/` one milestone at a time (see
 # ROADMAP_MODULARIZATION.md); dependencies flow strictly inward towards `core`.
-members = ["crates/core"]
+members = ["crates/core", "crates/storage"]
 resolver = "3"
 
 [workspace.package]
 # Single source of truth: every member inherits these, so a release bump
 # touches exactly one line.
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -16,6 +16,9 @@ license = "GPL-3.0-or-later"
 # Shared by more than one member, pinned once. Crates used by a single member
 # are declared in that member's own manifest instead.
 libc = "0.2.186"
+# Payload fingerprints: the Wayland ingest path and the storage layer must
+# agree on the digest, so both pull the same pinned version.
+sha3 = "0.12.0"
 
 [package]
 name = "y4p"
@@ -28,21 +31,19 @@ license.workspace = true
 # --- Workspace Members ---
 # Shared domain types, constants, configuration and XDG path resolution.
 y4p-core = { path = "crates/core" }
+# SQLite store, schema migrations and the filesystem blob cache. `rusqlite`
+# is encapsulated there; the binary never touches it directly.
+y4p-storage = { path = "crates/storage" }
 
 # --- Wayland Core ---
 wayland-client = "0.31.14"
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 
-# --- Storage ---
-# 'bundled' ensures standalone compilation and cross-environment robustness
-# without relying on system-installed SQLite packages.
-rusqlite = { version = "0.40.0", default-features = false, features = ["bundled", "modern_sqlite"] }
-
 # --- Utilities ---
 # For robust pipe communication and avoiding runtime deadlocks.
 libc.workspace = true
 # For payload deduplication via unique content fingerprints.
-sha3 = "0.12.0"
+sha3.workspace = true
 # For calculating terminal layout bounds accurately (supports full/half-width).
 unicode-width = "0.2.2"
 # For handling terminal signals (e.g., SIGINT/Ctrl+C).

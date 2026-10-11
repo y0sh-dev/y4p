@@ -1,0 +1,20 @@
+[package]
+name = "y4p-storage"
+version.workspace = true
+edition.workspace = true
+description = "SQLite store, schema migrations and filesystem blob cache for y4p."
+license.workspace = true
+
+[dependencies]
+y4p-core = { path = "../core" }
+# 'bundled' ensures standalone compilation and cross-environment robustness
+# without relying on system-installed SQLite packages.
+rusqlite = { version = "0.40.0", default-features = false, features = ["bundled", "modern_sqlite"] }
+# Payload deduplication via unique content fingerprints.
+sha3.workspace = true
+
+# Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
+# unsafe-documentation and clone lints) is defined once in the workspace root
+# and inherited here; see `[workspace.lints.clippy]` in the root manifest.
+[lints]
+workspace = true
