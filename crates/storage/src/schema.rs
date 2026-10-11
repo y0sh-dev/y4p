@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/storage/schema.rs
+// crates/storage/src/schema.rs
 
 use rusqlite::Connection;
 
@@ -111,7 +111,7 @@ impl SchemaManager {
                  SET content = CAST(content AS TEXT)
                  WHERE content IS NOT NULL
                    AND {}",
-                crate::storage::db::TEXT_MIME_SQL_PREDICATE
+                crate::db::TEXT_MIME_SQL_PREDICATE
             ),
             [],
         )

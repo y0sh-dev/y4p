@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/storage/cache.rs
+// crates/storage/src/cache.rs
 
 use std::fs;
 use std::path::PathBuf;

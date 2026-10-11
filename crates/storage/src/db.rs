@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/storage/db.rs
+// crates/storage/src/db.rs
 
 use rusqlite::{params, Connection, Result};
 use rusqlite::types::ValueRef;
@@ -351,7 +351,7 @@ mod tests {
     /// genuine production schema rather than a hand-rolled stand-in.
     fn test_store() -> SqliteStore {
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::SchemaManager::initialize(&mut conn, 1000).unwrap();
+        crate::schema::SchemaManager::initialize(&mut conn, 1000).unwrap();
         SqliteStore::new(conn)
     }
 
