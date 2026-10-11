@@ -76,3 +76,98 @@ fn fingerprint(data: &[u8]) -> String {
     hasher.update(data);
     hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    // --- process_job (image routing -> hash) ---
+    //
+    // Payloads reach `process_job` already normalised by the Wayland layer
+    // (URI lists decoded, mislabelled images re-identified by magic bytes);
+    // the image router additionally sniffs the bytes itself, so a mislabelled
+    // image is still recognised here.
+
+    fn magick_available() -> bool {
+        if crate::image::magick::is_available() {
+            true
+        } else {
+            eprintln!("skipping: `magick` is not available on this system");
+            false
+        }
+    }
+
+    fn generated(args: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::image::magick::run(args, std::io::empty(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn process_job_plain_text_is_unchanged_and_hashed_as_is() {
+        let raw = b"hello clipboard".to_vec();
+        let (mime, data, hash) = process_job("text/plain".to_string(), raw.clone());
+        assert_eq!(mime, "text/plain");
+        assert_eq!(data, raw);
+        assert_eq!(hash, fingerprint(&raw));
+    }
+
+    #[test]
+    fn process_job_svg_bypasses_the_image_pipeline_unchanged() {
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"5\" height=\"5\"/>".to_vec();
+        let (mime, data, hash) = process_job("image/svg+xml".to_string(), svg.clone());
+        assert_eq!(mime, "image/svg+xml");
+        assert_eq!(data, svg);
+        assert_eq!(hash, fingerprint(&svg));
+    }
+
+    #[test]
+    fn process_job_uri_list_bypasses_image_routing_and_is_hashed() {
+        // Already normalised upstream: one path per line. A path that merely
+        // *names* a PNG is still text and must never reach the transcoder.
+        let (mime, data, hash) = process_job(MIME_URI_LIST.to_string(), b"/a.png".to_vec());
+        assert_eq!(mime, MIME_URI_LIST);
+        assert_eq!(data, b"/a.png".to_vec());
+        assert_eq!(hash, fingerprint(b"/a.png"));
+    }
+
+    #[test]
+    fn process_job_png_becomes_webp_and_the_hash_covers_the_converted_bytes() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let (mime, data, hash) = process_job("image/png".to_string(), png.clone());
+        assert_eq!(mime, "image/webp");
+        assert_eq!(&data[8..12], b"WEBP");
+        assert_eq!(hash, fingerprint(&data), "fingerprint must describe the stored bytes");
+        assert_ne!(hash, fingerprint(&png), "fingerprint must not be that of the discarded original");
+    }
+
+    #[test]
+    fn process_job_same_image_copied_twice_yields_the_same_fingerprint() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let (_, _, first) = process_job("image/png".to_string(), png.clone());
+        let (_, _, second) = process_job("image/png".to_string(), png);
+        assert_eq!(first, second, "deduplication relies on a deterministic conversion");
+    }
+
+    #[test]
+    fn process_job_corrupt_png_falls_back_to_the_original_bytes_mime_and_hash() {
+        if !magick_available() { return; }
+        let mut corrupt = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        corrupt.extend_from_slice(&[0xA5; 2048]);
+        let (mime, data, hash) = process_job("image/png".to_string(), corrupt.clone());
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, corrupt);
+        assert_eq!(hash, fingerprint(&corrupt));
+    }
+
+    #[test]
+    fn process_job_mislabelled_image_is_reidentified_before_routing() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "16x16", "xc:red", "png:-"]);
+        let (mime, _, _) = process_job("application/octet-stream".to_string(), png);
+        assert_eq!(mime, "image/webp");
+    }
+}
