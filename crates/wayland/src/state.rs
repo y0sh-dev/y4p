@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/state.rs
+// crates/wayland/src/state.rs
 
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_protocols::ext::data_control::v1::client::{

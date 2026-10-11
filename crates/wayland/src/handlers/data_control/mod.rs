@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/handlers/data_control/mod.rs
+// crates/wayland/src/handlers/data_control/mod.rs
 
 pub mod device;
 pub mod source;
@@ -12,7 +12,7 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
 };
 use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
-use crate::wayland::state::{WaylandState, OfferData};
+use crate::state::{WaylandState, OfferData};
 use crate::core::constants::*;
 
 /// Evaluates if the requested MIME type is compatible with the target type.

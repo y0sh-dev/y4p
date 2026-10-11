@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/handlers/data_control/device.rs
+// crates/wayland/src/handlers/data_control/device.rs
 
 use wayland_client::{Dispatch, Connection, QueueHandle, Proxy};
 use wayland_protocols::ext::data_control::v1::client::{
@@ -12,7 +12,7 @@ use std::io::Read;
 use std::os::fd::AsFd;
 use std::sync::{mpsc, Arc, Mutex};
 use sha3::{Digest, Sha3_256};
-use crate::wayland::state::{WaylandState, OfferData, ClipboardJob};
+use crate::state::{WaylandState, OfferData, ClipboardJob};
 use crate::core::constants::*;
 use super::{make_pipe, is_sensitive};
 

@@ -1,14 +1,14 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/handlers/data_control/source.rs
+// crates/wayland/src/handlers/data_control/source.rs
 
 use wayland_client::{Dispatch, Connection, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1::{self, ExtDataControlSourceV1};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
-use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
+use crate::state::{WaylandState, SourceMetadata, SourcePayload};
 use super::mime_is_compatible;
 use crate::core::constants::*;
 use crate::core::utils::{is_html_mime, strip_html_tags};

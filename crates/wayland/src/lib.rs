@@ -1,7 +1,13 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/mod.rs
+// crates/wayland/src/lib.rs
+
+// Aliased to `core` / `image` so the `crate::core::...` and `crate::image::...`
+// paths in the modules below resolve exactly as they did inside the monolith
+// (import resolution only).
+use y4p_core as core;
+use y4p_image as image;
 
 pub mod state;
 pub mod handlers;

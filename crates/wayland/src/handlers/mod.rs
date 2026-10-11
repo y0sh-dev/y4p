@@ -1,7 +1,7 @@
 // Copyright (C) 2026 yosana
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/wayland/handlers/mod.rs
+// crates/wayland/src/handlers/mod.rs
 
 pub mod data_control;
 pub mod seat;
@@ -9,7 +9,7 @@ pub mod seat;
 use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
 use wayland_client::protocol::wl_seat::WlSeat;
-use crate::wayland::state::WaylandState;
+use crate::state::WaylandState;
 use crate::core::constants::*;
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
