@@ -9,10 +9,14 @@ license.workspace = true
 y4p-core = { path = "../core" }
 y4p-storage = { path = "../storage" }
 y4p-wayland = { path = "../wayland" }
+# The worker routes ingested images through the local pipeline before storing them.
+y4p-image = { path = "../image" }
 # The event loop names `wayland_client` types (`Connection`, `QueueHandle`).
 wayland-client.workspace = true
 # poll(2) over the compositor and IPC listener descriptors.
 libc.workspace = true
+# Payload fingerprints; must agree with the storage layer's digest.
+sha3.workspace = true
 
 # Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
 # unsafe-documentation and clone lints) is defined once in the workspace root
