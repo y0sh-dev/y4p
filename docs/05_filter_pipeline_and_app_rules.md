@@ -68,7 +68,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 | Action Mode (`y4p paste-from <mime>`) | `Some` | The offer matching by `mime_base_eq` (case, whitespace and parameters ignored). `drop_rtf` is **not** consulted: an explicit request is honoured, RTF included |
 | Daemon ingestion | `None` | First hit in `MIME_PRIORITY_ORDER`, else any `image/*`, else any `text/*`, else anything. `drop_rtf` is applied at **every** step, so RTF is never selected when enabled, even as the last-resort catch-all |
 
-`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L163`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
+`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L156`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
 
 ### 1.3 Why the order matters
 
@@ -76,7 +76,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 2. **Plain text outranks rich markup.** Electron and Chromium applications routinely announce `text/html` next to `text/plain` but synthesise HTML only on request; a non-rich selection returns an empty transfer for `text/html`. Trying plain text first makes that failure structurally impossible, while `text/html` stays reachable when no plain-text alternative exists.
 3. **Hash after every transformation.** Normalisation and image routing may change bytes; the fingerprint is computed last so the persisted hash always matches the persisted bytes.
 
-> **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are the only payloads rewritten**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); GIF, WebP, SVG, AVIF and non-image types pass through untouched.
+> **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are the only payloads rewritten**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); GIF, SVG, AVIF and non-image types pass through untouched; PNG, BMP, JPEG and WebP leave as `image/png`.
 
 ---
 

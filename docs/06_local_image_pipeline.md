@@ -33,8 +33,8 @@ To address these, `y4p` routes raster images through an isolated pipeline before
                          +------------------------+-------------------------+
                          |                                                  |
                   bypass (original)                                  convert via magick
-        text, HTML, uri-list, SVG, AVIF,                  PNG, BMP  -> lossless WebP
-        GIF, WebP, empty, unknown                         JPEG      -> lossy WebP (q90)
+        text, HTML, uri-list, SVG, AVIF,                  PNG, BMP, JPEG, static WebP
+        GIF, animated WebP, empty, unknown                  -> lossless PNG (zlib level 1)
         breaker open, throttle saturated,
         magick missing, no scratch dir,
         conversion failed
@@ -59,12 +59,15 @@ To address these, `y4p` routes raster images through an isolated pipeline before
 
 | Input | Output | Reason |
 | :--- | :--- | :--- |
-| PNG, BMP | lossless WebP (ImageMagick quality 100) | Bit-exact pixels, metadata removed, normally much smaller (BMP is uncompressed) |
-| JPEG | lossy WebP, `IMAGE_INGEST_JPEG_QUALITY = 90` | JPEG is where phone and camera EXIF/GPS lives, so it must be re-encoded to be stripped; lossless WebP would inflate it several times over |
-| GIF, WebP | untouched | The transcoder keeps only the first frame, which would silently destroy an animation the user copied |
+| PNG, BMP, JPEG, static WebP | lossless PNG (`png:compression-level=1`) | Bit-exact pixels (a JPEG or WebP source keeps its decoded pixels, with no further generation loss), metadata removed, EXIF orientation baked in. PNG is the raster MIME every Wayland paste target requests |
+| GIF, animated WebP | untouched | The transcoder keeps only the first frame, which would silently destroy an animation the user copied (animated WebP is detected via the `VP8X` `ANIM` flag) |
 | SVG, AVIF, anything else | untouched | Vector and scriptable formats never reach a raster decoder; AVIF is not a supported input |
 
-Lossless WebP is always encoded at quality 100: in lossless mode ImageMagick maps any lower quality onto libwebp's near-lossless pre-processing, which *does* alter pixels (measured: 59 of 16 384 pixels differ at quality 75, 118 at 50). Only 100 is exact.
+> **Invariant — the stored raster MIME is `image/png`.** Egress offers exactly the stored MIME ([03](03_concurrency_and_memory.md), [05](05_filter_pipeline_and_app_rules.md) section on compatibility), and `image/png` never matches `image/webp`. A stored WebP was reported as not pasteable on Hyprland into applications that request `image/png` (Discord, Slack, Firefox, Chrome, GIMP, LibreOffice); not re-verified against a live compositor here. Ingestion consequently never produces WebP; the WebP encoders (`OutputFormat::WebpLossless`, `WebpLossy`) remain in `transcode.rs` as tested but unused capability.
+
+**Why zlib level 1.** PNG is lossless at every zlib level; the level trades encode time against file size only. Measured with ImageMagick 7.1 on a 1920x1080 image: photo-like content 137 ms at level 1 against 257 ms at level 9; flat screenshot 65 ms against 81 ms; pixels identical in both (`compare -metric AE` = 0). The cost is size on flat content (the screenshot grew from 22 KB to 93 KB), and a JPEG or WebP source grows several times when stored losslessly. The clipboard path is latency-bound, so speed wins. No `-quality` flag is passed for PNG: it would override the level.
+
+**Animation preservation.** GIF and animated WebP (`VP8X` container with the `ANIM` flag set) bypass transcoding entirely so their multi-frame sequences are not flattened into a single frame.
 
 ---
 
@@ -95,7 +98,7 @@ When the leading bytes identify an image, that identification is final: an SVG a
 
 ## 4. Argument Construction
 
-Every argument handed to `magick` is derived from closed enums and compile-time constants, never from clipboard-controlled text, so no option, `coder:` prefix or filename can be smuggled in. The vector is built in the one safe order ([`crates/image/src/transcode.rs:L203`](../crates/image/src/transcode.rs)):
+Every argument handed to `magick` is derived from closed enums and compile-time constants, never from clipboard-controlled text, so no option, `coder:` prefix or filename can be smuggled in. The vector is built in the one safe order ([`crates/image/src/transcode.rs:L212`](../crates/image/src/transcode.rs)):
 
 | # | Tokens | Why this position |
 | :--- | :--- | :--- |
@@ -103,9 +106,9 @@ Every argument handed to `magick` is derived from closed enums and compile-time 
 | 2 | pinned decoder `fmt:-[0]` | See section 3 |
 | 3 | `-auto-orient` | Orientation lives in EXIF; stripping first would turn a rotated photo sideways. The rotation is baked into the pixels, then the tag is dropped |
 | 4 | `-strip` | Removes every profile and comment: EXIF incl. GPS, XMP, IPTC, ICC, text chunks. **Not a switch: every transcode strips** |
-| 5 | encoder settings, output `webp:-` | `webp:lossless=true` with quality 100, or `webp:lossless=false` with the clamped quality |
+| 5 | encoder settings, output `png:-` | ingestion always uses `-define png:compression-level=1` (a borrowed `'static` token: no allocation). The WebP variants (`webp:lossless=true` with quality 100, or `webp:lossless=false` with the clamped quality) are not selected by ingestion |
 
-`Quality` clamps to 1..=100 on construction, so no input can make `magick` reject the option.
+`Quality` (WebP only) clamps to 1..=100 on construction, so no input can make `magick` reject the option. In lossless WebP mode ImageMagick maps any quality below 100 onto libwebp's near-lossless pre-processing, which *does* alter pixels (measured: 59 of 16 384 pixels differ at quality 75), so the lossless variant is pinned to 100.
 
 ---
 
@@ -174,7 +177,7 @@ The child starts as the leader of its own process group (`process_group(0)`). On
 `IMAGE_LIMIT_TIME_SECS` is a string (it is handed to `magick` as an argument), so the assertion parses it in a `const fn` and fails the build on anything but a whole number of seconds below the outer budget:
 
 ```rust
-// crates/image/src/transcode.rs:L161
+// crates/image/src/transcode.rs:L164
 const _: () = assert!(
     parse_secs(IMAGE_LIMIT_TIME_SECS) >= 1 && parse_secs(IMAGE_LIMIT_TIME_SECS) < IMAGE_TRANSCODE_TIMEOUT_SECS,
     "IMAGE_LIMIT_TIME_SECS must be a whole number of seconds below IMAGE_TRANSCODE_TIMEOUT_SECS",
@@ -187,7 +190,7 @@ const _: () = assert!(
 
 `run_filter_in_env` relays through three cooperating threads: one feeds the child's stdin in 64 KiB chunks, one drains stderr to EOF while keeping only the first 8 KiB (a chatty child can never block on a full stderr pipe), and the calling thread relays stdout into the output buffer. Each pipe always has a live peer, whatever order the child reads and writes in. A `BrokenPipe` on the feed is not an error (the child stopped reading); the exit status is the authoritative verdict. On any `Err` the output buffer may be partial and is discarded.
 
-The output `Vec` is reserved up front from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB), since every ingest conversion is compressing; outgrowing the hint is harmless.
+The output `Vec` is reserved up front from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB), as a fair estimate for PNG and BMP sources; a JPEG or WebP source grows several times as lossless PNG, and outgrowing the hint is harmless (the buffer then grows as usual).
 
 ---
 
@@ -237,7 +240,7 @@ A missing `magick` is reported once per process (`MSG_IMAGE_TOOL_MISSING`) and i
 
 | Situation | Result stored | Process spawned? |
 | :--- | :--- | :--- |
-| Text, HTML, uri-list, SVG, AVIF, GIF, WebP | original | no |
+| Text, HTML, uri-list, SVG, AVIF, GIF | original | no |
 | Empty payload | original | no |
 | Breaker open | original | no |
 | Throttle wait expired | original | no |
@@ -245,7 +248,7 @@ A missing `magick` is reported once per process (`MSG_IMAGE_TOOL_MISSING`) and i
 | Corrupt or over-limit image | original | yes, then discarded |
 | Conversion exceeds 15 s | original | yes, group killed |
 | Converted output invalid | original | yes, then discarded |
-| Success | converted WebP; hash covers the converted bytes | yes |
+| Success | converted PNG; hash covers the converted bytes | yes |
 
 In every row the fingerprint is computed over what is stored, so deduplication stays consistent whether or not conversion happened. A deterministic conversion also means the same image copied twice yields the same fingerprint.
 

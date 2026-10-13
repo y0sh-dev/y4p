@@ -103,18 +103,11 @@ pub const IMAGE_BREAKER_COOLDOWN_SECS: u64 = 30;
 pub const IMAGE_CONCURRENCY_LIMIT: usize = 2;
 pub const IMAGE_THROTTLE_WAIT_MS: u64 = 1000;
 // Upper bound on the output buffer reserved up front for one conversion.
-// Every ingest conversion is compressing (PNG/BMP -> lossless WebP, JPEG ->
-// lossy WebP), so the input size is a sound estimate of the output size; the
-// cap only stops a huge input from reserving address space for an output that
-// will almost certainly be smaller. Outgrowing the hint is harmless (the
-// buffer grows as usual).
+// Every ingest conversion re-encodes to lossless PNG. The input size is a fair
+// estimate of the output for PNG and BMP sources; a JPEG or WebP source grows
+// several times, which is harmless (the buffer then grows as usual). The cap
+// only stops a huge input from reserving address space up front.
 pub const IMAGE_OUTPUT_HINT_CAP_BYTES: usize = 16 * 1024 * 1024;
-
-// Lossy WebP quality used when ingestion re-encodes a JPEG to strip its
-// metadata. JPEG is already lossy, so a lossless WebP would only inflate it;
-// 90 keeps the extra generation loss visually negligible while still
-// shrinking the payload.
-pub const IMAGE_INGEST_JPEG_QUALITY: u8 = 90;
 
 // --- Security & Privacy Configuration ---
 // Clipboard security: MIME types to exclude from persistent storage
