@@ -90,5 +90,8 @@ Visual progress checklist across the modularization development cycle:
   - Relocate `docs/AI_POLICY.md` to `.github/AI_POLICY.md` and `docs/README_ja.md` to the project root as `README_ja.md`.
   - Prepare for `v0.7.0` release branch.
 
-- [ ] **v0.7.0: Official Major Release: The Great Modularization**
+- [x] **v0.7.0: Official Major Release: The Great Modularization**
+  - Conclude the six-crate modular architecture migration (`crates/core`, `storage`, `image`, `wayland`, `cli`, `daemon`).
+  - Solidify the Local Image Pipeline with fast lossless PNG ingestion and animation preservation (GIF and animated WebP).
+  - Distil architecture, contracts, and invariants into the unified `docs/` suite (`00` through `06`).
   - Tag and publish official `v0.7.0` release.
