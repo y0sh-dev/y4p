@@ -108,7 +108,7 @@ y4p list 0-100 --raw --id | fzf | sed -E 's/^\[ *([0-9]+)\].*/\1/' | xargs -r y4
 
 > **Invariant — `--raw` is a published interface.** Any change to its field order, delimiters, padding or marker tokens is a breaking change for every script that parses it, in the same sense as changing a public function signature, except that no compiler will flag it. Such a change has to be reasoned about at that level, never as a cosmetic diff to a `println!`.
 
-`y4p show <target> --raw` is the binary counterpart: it writes the stored payload bytes to stdout with nothing added, so `y4p show 12 --id --raw > recovered_asset.webp` round-trips content.
+`y4p show <target> --raw` is the binary counterpart: it writes the stored payload bytes to stdout with nothing added, so `y4p show 12 --id --raw > recovered_asset.png` round-trips content.
 
 ---
 

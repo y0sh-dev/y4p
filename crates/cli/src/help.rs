@@ -86,7 +86,7 @@ pub fn print_help() {
     println!("    $ y4p list 0-100 --raw --id | fzf | awk '{{print $1}}' | xargs -r y4p copy-to --id");
     
     println!("\n    # 2. Extracting binary content from history:");
-    println!("    $ y4p show 12 --id --raw > recovered_asset.webp");
+    println!("    $ y4p show 12 --id --raw > recovered_asset.png");
     
     println!("\n    # 3. Manual ingestion with custom MIME:");
     println!("    $ cat data.json | y4p store application/json");

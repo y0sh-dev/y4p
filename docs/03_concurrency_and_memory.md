@@ -60,7 +60,7 @@ Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`w
    ClipboardJob { mime, data }
         |
         v
-   y4p_image::route::route_for_ingest(mime, data)   PNG/BMP -> lossless WebP, JPEG -> lossy WebP,
+   y4p_image::route::route_for_ingest(mime, data)   PNG/BMP/JPEG/WebP -> lossless PNG,
         |                                           everything else unchanged; original on any failure
         v
    fingerprint(&data)                               lowercase-hex SHA3-256 over the FINAL bytes
