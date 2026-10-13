@@ -133,12 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn process_job_png_becomes_webp_and_the_hash_covers_the_converted_bytes() {
+    fn process_job_png_is_rewritten_as_png_and_the_hash_covers_the_converted_bytes() {
         if !magick_available() { return; }
         let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
         let (mime, data, hash) = process_job("image/png".to_string(), png.clone());
-        assert_eq!(mime, "image/webp");
-        assert_eq!(&data[8..12], b"WEBP");
+        assert_eq!(mime, "image/png");
+        assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
+        assert_ne!(data, png, "the stored bytes are the stripped re-encode, not the original");
         assert_eq!(hash, fingerprint(&data), "fingerprint must describe the stored bytes");
         assert_ne!(hash, fingerprint(&png), "fingerprint must not be that of the discarded original");
     }
@@ -167,7 +168,44 @@ mod tests {
     fn process_job_mislabelled_image_is_reidentified_before_routing() {
         if !magick_available() { return; }
         let png = generated(&["-size", "16x16", "xc:red", "png:-"]);
-        let (mime, _, _) = process_job("application/octet-stream".to_string(), png);
+        let (mime, data, _) = process_job("application/octet-stream".to_string(), png.clone());
+        assert_eq!(mime, "image/png", "an unlabelled image must leave as a PNG");
+        assert_ne!(data, png, "...and only the converter's output carries that label");
+    }
+
+    #[test]
+    fn process_job_every_raster_input_but_gif_is_stored_as_png_and_never_as_webp() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "16x16", "plasma:fractal", "-depth", "8", "png:-"]);
+        let jpeg = generated(&["-size", "16x16", "plasma:fractal", "jpg:-"]);
+        let webp = generated(&["-size", "16x16", "plasma:fractal", "webp:-"]);
+        for (label, mime, payload) in [("png", "image/png", png), ("jpeg", "image/jpeg", jpeg), ("webp", "image/webp", webp)] {
+            let (out_mime, data, hash) = process_job(mime.to_string(), payload);
+            assert_eq!(out_mime, "image/png", "{label}");
+            assert_eq!(&data[..4], b"\x89PNG", "{label}");
+            assert_eq!(hash, fingerprint(&data), "{label}");
+        }
+    }
+
+    #[test]
+    fn process_job_gif_keeps_its_bytes_and_mime_so_animation_survives() {
+        let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
+        let (mime, data, hash) = process_job("image/gif".to_string(), gif.clone());
+        assert_eq!(mime, "image/gif");
+        assert_eq!(data, gif);
+        assert_eq!(hash, fingerprint(&gif));
+    }
+
+    #[test]
+    fn process_job_animated_webp_keeps_its_bytes_and_mime_so_animation_survives() {
+        let mut webp = vec![0u8; 24];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[20] = 0x02; // Animation flag
+        let (mime, data, hash) = process_job("image/webp".to_string(), webp.clone());
         assert_eq!(mime, "image/webp");
+        assert_eq!(data, webp);
+        assert_eq!(hash, fingerprint(&webp));
     }
 }
