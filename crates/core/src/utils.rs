@@ -121,6 +121,19 @@ pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
     (head.starts_with(b"<?xml") || head.starts_with(b"<svg")).then_some("image/svg+xml")
 }
 
+/// Returns whether a byte stream represents an animated WebP image.
+///
+/// Under the WebP container specification, animated images use the extended
+/// format (`VP8X`) with the `Animation` flag (bit 1, mask 0x02) set at offset 20.
+/// Simple lossy (`VP8 `) and lossless (`VP8L`) containers cannot be animated.
+pub fn is_animated_webp(data: &[u8]) -> bool {
+    data.len() >= 21
+        && &data[0..4] == b"RIFF"
+        && &data[8..12] == b"WEBP"
+        && &data[12..16] == b"VP8X"
+        && (data[20] & 0x02) != 0
+}
+
 /// True when `mime`'s base type (see `mime_base`) is HTML or XHTML markup
 /// (`text/html` or `application/xhtml+xml`) eligible for forced plain-text fallback.
 pub fn is_html_mime(mime: &str) -> bool {
@@ -443,5 +456,52 @@ mod tests {
         assert!(!is_rtf_mime("text/plain"));
         assert!(!is_rtf_mime("text/html"));
         assert!(!is_rtf_mime("image/png"));
+    }
+
+    // --- is_animated_webp ---
+
+    #[test]
+    fn is_animated_webp_detects_vp8x_with_animation_flag() {
+        let mut header = vec![0u8; 24];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[8..12].copy_from_slice(b"WEBP");
+        header[12..16].copy_from_slice(b"VP8X");
+        header[20] = 0x02; // Animation flag
+        assert!(is_animated_webp(&header));
+
+        // Mixed flags including animation (e.g. ICC + Animation: 0x20 | 0x02 = 0x22)
+        header[20] = 0x22;
+        assert!(is_animated_webp(&header));
+    }
+
+    #[test]
+    fn is_animated_webp_rejects_static_webp_and_other_formats() {
+        let mut header = vec![0u8; 24];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[8..12].copy_from_slice(b"WEBP");
+
+        // Simple lossy (VP8 )
+        header[12..16].copy_from_slice(b"VP8 ");
+        assert!(!is_animated_webp(&header));
+
+        // Simple lossless (VP8L)
+        header[12..16].copy_from_slice(b"VP8L");
+        assert!(!is_animated_webp(&header));
+
+        // Extended (VP8X) without animation flag (e.g. only alpha: 0x10)
+        header[12..16].copy_from_slice(b"VP8X");
+        header[20] = 0x10;
+        assert!(!is_animated_webp(&header));
+
+        // Truncated data
+        assert!(!is_animated_webp(&header[..20]));
+        assert!(!is_animated_webp(b"RIFFWEBP"));
+        assert!(!is_animated_webp(b""));
+
+        // Non-WebP RIFF (e.g. WAV audio)
+        let mut wav = vec![0u8; 24];
+        wav[0..4].copy_from_slice(b"RIFF");
+        wav[8..12].copy_from_slice(b"WAVE");
+        assert!(!is_animated_webp(&wav));
     }
 }
