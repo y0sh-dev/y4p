@@ -23,16 +23,16 @@ use std::time::Duration;
 
 use crate::core::constants::{
     IMAGE_BREAKER_COOLDOWN_SECS, IMAGE_BREAKER_THRESHOLD, IMAGE_CONCURRENCY_LIMIT,
-    IMAGE_INGEST_JPEG_QUALITY, IMAGE_OUTPUT_HINT_CAP_BYTES, IMAGE_THROTTLE_WAIT_MS, LOG_WARN,
+    IMAGE_OUTPUT_HINT_CAP_BYTES, IMAGE_THROTTLE_WAIT_MS, LOG_WARN,
     MSG_IMAGE_TOOL_MISSING, log_image_breaker_closed, log_image_breaker_open,
     log_image_scratch_unavailable, log_image_throttled,
 };
-use crate::core::utils::detect_image_mime;
+use crate::core::utils::{detect_image_mime, is_animated_webp};
 use crate::breaker::{CircuitBreaker, PermitOutcome};
 use crate::magick;
 use crate::pipeline::{PipelineError, Transfer};
 use crate::throttle::ProcessThrottle;
-use crate::transcode::{self, InputFormat, OutputFormat, Quality, Transcode};
+use crate::transcode::{self, InputFormat, OutputFormat, Transcode};
 
 /// Bytes inspected when classifying a payload. Binary image signatures fit
 /// in 12; the rest is slack for leading whitespace before an SVG prolog.
@@ -41,19 +41,21 @@ const SNIFF_HEAD_BYTES: usize = 512;
 /// What an ingested image of format `input` is converted to, or `None` to
 /// store it untouched.
 ///
-/// - PNG and BMP become lossless WebP: bit-exact, metadata removed, and
-///   normally much smaller (BMP is uncompressed).
-/// - JPEG becomes lossy WebP at `IMAGE_INGEST_JPEG_QUALITY`: JPEG is where
-///   EXIF/GPS from phones and cameras lives, so it must be re-encoded to be
-///   stripped, and lossless WebP would make it several times larger.
-/// - GIF and WebP are left alone. The transcoder keeps only the first frame
+/// - PNG, BMP, JPEG and static WebP all become lossless PNG: pixels bit-exact
+///   (the decode of a JPEG or WebP is kept as is, with no further generation
+///   loss), EXIF orientation baked in, every metadata block removed. PNG is
+///   the one raster MIME every Wayland paste target requests, so a stored
+///   `image/webp` could not be pasted into most applications.
+/// - GIF and animated WebP are left alone: transcoding keeps only the first frame
 ///   (a safety property for untrusted input), which would silently destroy
-///   an animation the user copied.
+///   animations the user copied.
+///
+/// A JPEG or WebP source grows when re-encoded losslessly (several times for
+/// a photo); that is the price of an encoding every client accepts.
 pub fn ingest_target(input: InputFormat) -> Option<OutputFormat> {
     match input {
-        InputFormat::Png | InputFormat::Bmp => Some(OutputFormat::WebpLossless),
-        InputFormat::Jpeg => Some(OutputFormat::WebpLossy(Quality::new(IMAGE_INGEST_JPEG_QUALITY))),
-        InputFormat::Gif | InputFormat::Webp => None,
+        InputFormat::Png | InputFormat::Bmp | InputFormat::Jpeg | InputFormat::Webp => Some(OutputFormat::Png),
+        InputFormat::Gif => None,
     }
 }
 
@@ -125,6 +127,9 @@ where
         return (mime, payload);
     }
     let Some(input) = classify(&mime, &payload) else { return (mime, payload) };
+    if input == InputFormat::Webp && is_animated_webp(&payload) {
+        return (mime, payload);
+    }
     let Some(output) = ingest_target(input) else { return (mime, payload) };
 
     let Some(permit) = breaker.acquire() else { return (mime, payload) };
@@ -251,11 +256,30 @@ mod tests {
         generate(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"])
     }
 
+    /// A converter reply that passes `is_valid_output` for the PNG target.
+    fn fake_png() -> Vec<u8> {
+        let mut data = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        data.extend_from_slice(b"payload");
+        data
+    }
+
+    /// A WebP payload: valid *input* for the classifier, but now a wrong-kind
+    /// *reply* for the PNG target.
     fn fake_webp() -> Vec<u8> {
         let mut data = b"RIFF".to_vec();
         data.extend_from_slice(&[0, 0, 0, 0]);
         data.extend_from_slice(b"WEBP");
         data.extend_from_slice(b"payload");
+        data
+    }
+
+    fn fake_animated_webp() -> Vec<u8> {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(b"RIFF");
+        data[8..12].copy_from_slice(b"WEBP");
+        data[12..16].copy_from_slice(b"VP8X");
+        data[20] = 0x02; // Animation flag
+        data.extend_from_slice(b"extra_frame_data");
         data
     }
 
@@ -334,7 +358,7 @@ mod tests {
             ("image/png", svg),
         ];
         for (mime, payload) in cases {
-            let (routed, called) = route_recording(mime, payload.clone(), Ok(fake_webp()));
+            let (routed, called) = route_recording(mime, payload.clone(), Ok(fake_png()));
             assert!(called.is_none(), "converter invoked for {mime}");
             assert_eq!(routed, (mime.to_owned(), payload));
         }
@@ -345,26 +369,30 @@ mod tests {
         let mut avif = vec![0, 0, 0, 0x20];
         avif.extend_from_slice(b"ftypavif");
         avif.extend_from_slice(&[0; 16]);
-        let (routed, called) = route_recording("image/avif", avif.clone(), Ok(fake_webp()));
+        let (routed, called) = route_recording("image/avif", avif.clone(), Ok(fake_png()));
         assert!(called.is_none());
         assert_eq!(routed, ("image/avif".to_owned(), avif));
     }
 
     #[test]
-    fn animated_capable_formats_are_left_untouched_by_policy() {
+    fn gif_is_left_untouched_by_policy_so_its_animation_survives() {
         let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
-        let mut webp = fake_webp();
-        webp.extend_from_slice(&[0; 16]);
-        for (mime, payload) in [("image/gif", gif), ("image/webp", webp)] {
-            let (routed, called) = route_recording(mime, payload.clone(), Ok(fake_webp()));
-            assert!(called.is_none(), "{mime} must not be re-encoded");
-            assert_eq!(routed, (mime.to_owned(), payload));
-        }
+        let (routed, called) = route_recording("image/gif", gif.clone(), Ok(fake_png()));
+        assert!(called.is_none(), "image/gif must not be re-encoded");
+        assert_eq!(routed, ("image/gif".to_owned(), gif));
+    }
+
+    #[test]
+    fn animated_webp_is_left_untouched_by_policy_so_its_animation_survives() {
+        let webp = fake_animated_webp();
+        let (routed, called) = route_recording("image/webp", webp.clone(), Ok(fake_png()));
+        assert!(called.is_none(), "animated webp must not be re-encoded");
+        assert_eq!(routed, ("image/webp".to_owned(), webp));
     }
 
     #[test]
     fn empty_payload_bypasses_even_when_labelled_as_a_raster_image() {
-        let (routed, called) = route_recording("image/png", Vec::new(), Ok(fake_webp()));
+        let (routed, called) = route_recording("image/png", Vec::new(), Ok(fake_png()));
         assert!(called.is_none(), "no process may be spawned for zero bytes");
         assert_eq!(routed, ("image/png".to_owned(), Vec::new()));
     }
@@ -372,35 +400,56 @@ mod tests {
     // --- policy and classification ---
 
     #[test]
-    fn png_is_routed_to_lossless_webp_and_mime_and_bytes_are_replaced() {
+    fn png_is_routed_to_png_and_the_bytes_are_replaced() {
         let original = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
-        let (routed, called) = route_recording("image/png", original, Ok(fake_webp()));
-        assert_eq!(called, Some(Transcode { input: InputFormat::Png, output: OutputFormat::WebpLossless }));
-        assert_eq!(routed, ("image/webp".to_owned(), fake_webp()));
+        let (routed, called) = route_recording("image/png", original, Ok(fake_png()));
+        assert_eq!(called, Some(Transcode { input: InputFormat::Png, output: OutputFormat::Png }));
+        assert_eq!(routed, ("image/png".to_owned(), fake_png()));
     }
 
     #[test]
-    fn jpeg_is_routed_to_lossy_webp_at_the_ingest_quality() {
+    fn jpeg_is_routed_to_lossless_png() {
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
-        let (routed, called) = route_recording("image/jpeg", jpeg, Ok(fake_webp()));
-        let expected = OutputFormat::WebpLossy(Quality::new(IMAGE_INGEST_JPEG_QUALITY));
-        assert_eq!(called, Some(Transcode { input: InputFormat::Jpeg, output: expected }));
-        assert_eq!(routed.0, "image/webp");
+        let (routed, called) = route_recording("image/jpeg", jpeg, Ok(fake_png()));
+        assert_eq!(called, Some(Transcode { input: InputFormat::Jpeg, output: OutputFormat::Png }));
+        assert_eq!(routed, ("image/png".to_owned(), fake_png()));
+    }
+
+    #[test]
+    fn webp_is_routed_to_lossless_png_so_that_it_can_be_pasted() {
+        let mut webp = fake_webp();
+        webp.extend_from_slice(&[0; 16]);
+        let (routed, called) = route_recording("image/webp", webp, Ok(fake_png()));
+        assert_eq!(called, Some(Transcode { input: InputFormat::Webp, output: OutputFormat::Png }));
+        assert_eq!(routed, ("image/png".to_owned(), fake_png()));
     }
 
     #[test]
     fn bmp_without_a_signature_is_routed_by_its_declared_mime() {
         let bmp = b"BM\x36\x00\x00\x00".to_vec();
-        let (routed, called) = route_recording("image/bmp", bmp, Ok(fake_webp()));
-        assert_eq!(called, Some(Transcode { input: InputFormat::Bmp, output: OutputFormat::WebpLossless }));
-        assert_eq!(routed.0, "image/webp");
+        let (routed, called) = route_recording("image/bmp", bmp, Ok(fake_png()));
+        assert_eq!(called, Some(Transcode { input: InputFormat::Bmp, output: OutputFormat::Png }));
+        assert_eq!(routed.1, fake_png());
+    }
+
+    #[test]
+    fn every_raster_input_but_gif_targets_png_and_never_webp() {
+        for (input, expected) in [
+            (InputFormat::Png, Some(OutputFormat::Png)),
+            (InputFormat::Bmp, Some(OutputFormat::Png)),
+            (InputFormat::Jpeg, Some(OutputFormat::Png)),
+            (InputFormat::Webp, Some(OutputFormat::Png)),
+            (InputFormat::Gif, None),
+        ] {
+            assert_eq!(ingest_target(input), expected, "{input:?}");
+        }
     }
 
     #[test]
     fn recognised_bytes_outrank_a_wrong_label() {
         // JPEG bytes labelled as PNG are decoded as the JPEG they are.
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
-        let (_, called) = route_recording("image/png", jpeg, Ok(fake_webp()));
+        let (_, called) = route_recording("image/png", jpeg, Ok(fake_png()));
         assert_eq!(called.map(|job| job.input), Some(InputFormat::Jpeg));
     }
 
@@ -418,7 +467,7 @@ mod tests {
             // "Success" that produced nothing, or the wrong kind of file:
             Ok(Vec::new()),
             Ok(b"not an image at all".to_vec()),
-            Ok(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]), // PNG where WebP was promised
+            Ok(fake_webp()), // WebP where PNG was promised
         ];
         for reply in replies {
             let (routed, called) = route_recording("image/png", original.clone(), reply);
@@ -429,15 +478,49 @@ mod tests {
 
     // --- end to end with the real magick ---
 
+    /// Decoded-pixel hash (`%#`) of an image, independent of its container.
+    fn pixel_signature(image: Vec<u8>) -> String {
+        let mut out = Vec::new();
+        magick::run(&["-", "-format", "%#", "info:"], std::io::Cursor::new(image), &mut out).unwrap();
+        String::from_utf8(out).unwrap().trim().to_owned()
+    }
+
     #[test]
-    fn real_png_is_transcoded_to_a_smaller_valid_webp() {
+    fn real_png_is_rewritten_as_a_pixel_identical_stripped_png() {
         if !magick_or_skip() { return; }
-        let original = png();
+        let original = generate(&[
+            "-size", "32x32", "plasma:fractal", "-depth", "8",
+            "-set", "comment", "SECRETCOMMENT", "png:-",
+        ]);
+        assert!(contains(&original, b"SECRETCOMMENT"), "fixture must carry the metadata");
         let (mime, data) = route_for_ingest("image/png".to_owned(), original.clone());
-        assert_eq!(mime, "image/webp");
-        assert_eq!(&data[..4], b"RIFF");
-        assert_eq!(&data[8..12], b"WEBP");
+        assert_eq!(mime, "image/png");
+        assert_eq!(detect_image_mime(&data), Some("image/png"));
+        assert!(!contains(&data, b"SECRETCOMMENT"));
         assert_ne!(data, original);
+        assert_eq!(pixel_signature(data), pixel_signature(original), "lossless means every pixel survives");
+    }
+
+    #[test]
+    fn real_bmp_and_webp_are_rewritten_as_pixel_identical_png() {
+        if !magick_or_skip() { return; }
+        let png = generate(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let expected = pixel_signature(png.clone());
+        let fixtures: [(&str, &[&str]); 2] = [
+            ("image/bmp", &["-", "bmp:-"]),
+            ("image/webp", &["-", "-define", "webp:lossless=true", "webp:-"]),
+        ];
+        for (mime, args) in fixtures {
+            let label = mime;
+            let mut source = Vec::new();
+            magick::run(args, std::io::Cursor::new(png.clone()), &mut source).unwrap();
+            assert_ne!(detect_image_mime(&source), Some("image/png"), "fixture must not already be a PNG ({label})");
+
+            let (routed_mime, data) = route_for_ingest(mime.to_owned(), source);
+            assert_eq!(routed_mime, "image/png", "{label}");
+            assert_eq!(detect_image_mime(&data), Some("image/png"), "{label}");
+            assert_eq!(pixel_signature(data), expected, "{label} altered pixel data");
+        }
     }
 
     #[test]
@@ -452,7 +535,8 @@ mod tests {
         assert!(contains(&jpeg, b"SECRETCOMMENT"));
 
         let (mime, data) = route_for_ingest("image/jpeg".to_owned(), jpeg);
-        assert_eq!(mime, "image/webp");
+        assert_eq!(mime, "image/png");
+        assert_eq!(detect_image_mime(&data), Some("image/png"));
         assert!(!contains(&data, b"SECRETCOMMENT"));
     }
 
@@ -498,7 +582,7 @@ mod tests {
         trip(&breaker);
 
         // Open: the converter is not even invoked, and the original is kept.
-        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
+        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
         assert!(called.is_none(), "no conversion (hence no child process) while open");
         assert_eq!(routed, ("image/png".to_owned(), png_header()));
     }
@@ -582,8 +666,8 @@ mod tests {
         let breaker = fresh_breaker();
         route_on(&breaker, "image/png", png_header(), Err(failed()));
         route_on(&breaker, "image/png", png_header(), Err(failed()));
-        let (routed, _) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
-        assert_eq!(routed.0, "image/webp");
+        let (routed, _) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
+        assert_eq!(routed.1, fake_png());
         route_on(&breaker, "image/png", png_header(), Err(failed()));
         route_on(&breaker, "image/png", png_header(), Err(failed()));
         assert_eq!(breaker.state(), BreakerState::Closed);
@@ -595,14 +679,14 @@ mod tests {
         trip(&breaker);
         std::thread::sleep(Duration::from_millis(60));
 
-        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
+        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
         assert!(called.is_some(), "the canary must actually be attempted");
-        assert_eq!(routed, ("image/webp".to_owned(), fake_webp()));
+        assert_eq!(routed, ("image/png".to_owned(), fake_png()));
         assert_eq!(breaker.state(), BreakerState::Closed);
 
-        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
+        let (routed, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
         assert!(called.is_some());
-        assert_eq!(routed.0, "image/webp", "normal service resumed");
+        assert_eq!(routed.1, fake_png(), "normal service resumed");
     }
 
     #[test]
@@ -616,7 +700,7 @@ mod tests {
         assert_eq!(routed, ("image/png".to_owned(), png_header()));
         assert_eq!(breaker.state(), BreakerState::Open);
 
-        let (_, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
+        let (_, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
         assert!(called.is_none(), "back in cooldown");
     }
 
@@ -628,14 +712,14 @@ mod tests {
         let nested_called = Cell::new(false);
         let outer = route_with("image/png".to_owned(), png_header(), &breaker, &roomy_throttle(), |_, _, out| {
             // While this canary is running, a second image arrives.
-            let (inner, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_webp()));
+            let (inner, called) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
             nested_called.set(called.is_some());
             assert_eq!(inner, ("image/png".to_owned(), png_header()), "bypassed with the original intact");
-            *out = fake_webp();
+            *out = fake_png();
             Ok(Transfer { bytes_in: 0, bytes_out: out.len() as u64 })
         });
         assert!(!nested_called.get(), "the second image must not start a second probe");
-        assert_eq!(outer.0, "image/webp");
+        assert_eq!(outer.1, fake_png());
         assert_eq!(breaker.state(), BreakerState::Closed);
     }
 
@@ -661,7 +745,7 @@ mod tests {
     /// A converter reply that would convert successfully, used to prove that
     /// a refused request really never reaches the converter.
     fn would_succeed() -> Result<Vec<u8>, PipelineError> {
-        Ok(fake_webp())
+        Ok(fake_png())
     }
 
     #[test]
@@ -733,7 +817,7 @@ mod tests {
         drop(held);
         let (routed, called) = route_through(&breaker, &throttle, "image/png", png_header(), would_succeed());
         assert!(called.is_some(), "the next image must be allowed to probe");
-        assert_eq!(routed.0, "image/webp");
+        assert_eq!(routed.1, fake_png());
         assert_eq!(breaker.state(), BreakerState::Closed);
     }
 
@@ -815,7 +899,7 @@ mod tests {
                 route_with("image/png".to_owned(), png_header(), breaker, throttle, |_, _, out| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
-                    *out = fake_webp();
+                    *out = fake_png();
                     Ok(Transfer { bytes_in: 0, bytes_out: out.len() as u64 })
                 })
             });
@@ -830,7 +914,7 @@ mod tests {
             }
 
             release_tx.send(()).unwrap();
-            assert_eq!(first.join().unwrap().0, "image/webp", "the admitted conversion still completes");
+            assert_eq!(first.join().unwrap().1, fake_png(), "the admitted conversion still completes");
         });
         assert_eq!(breaker.state(), BreakerState::Closed, "a threshold-1 breaker would have opened on one counted fault");
         assert_eq!(throttle.in_use(), 0);
@@ -849,7 +933,7 @@ mod tests {
             });
             std::thread::sleep(Duration::from_millis(50));
             drop(held);
-            assert_eq!(waiter.join().unwrap().0, "image/webp");
+            assert_eq!(waiter.join().unwrap().1, fake_png());
         });
         assert_eq!(throttle.in_use(), 0);
     }
@@ -871,10 +955,10 @@ mod tests {
                         peak.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(10));
                         running.fetch_sub(1, Ordering::SeqCst);
-                        *out = fake_webp();
+                        *out = fake_png();
                         Ok(Transfer { bytes_in: 0, bytes_out: out.len() as u64 })
                     });
-                    assert_eq!(routed, ("image/webp".to_owned(), fake_webp()));
+                    assert_eq!(routed, ("image/png".to_owned(), fake_png()));
                 });
             }
         });
@@ -890,7 +974,7 @@ mod tests {
 
         let (routed, called) = route_through(&breaker, &throttle, "image/png", png_header(), would_succeed());
         assert!(called.is_some(), "a poisoned lock must not disable conversion");
-        assert_eq!(routed.0, "image/webp");
+        assert_eq!(routed.1, fake_png());
 
         let _held = throttle.acquire().unwrap();
         let (routed, called) = route_through(&breaker, &throttle, "image/png", png_header(), would_succeed());
@@ -918,7 +1002,7 @@ mod tests {
                         running.fetch_sub(1, Ordering::SeqCst);
                         result
                     });
-                    assert_eq!(routed.0, "image/webp");
+                    assert_ne!(routed.1, original, "a real conversion rewrites the bytes");
                 });
             }
         });
