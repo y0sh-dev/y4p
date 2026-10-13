@@ -1,93 +1,93 @@
-# Hybrid Persistence & Pin Protection
+# 02 — Hybrid Storage & Pin Protection
 
-`y4p` keeps two kinds of state on disk.
+`y4p` keeps two kinds of state on disk: a SQLite database, and a plain directory of cache files. It treats them as strictly separate concerns and never lets one leak into the other.
 
-A SQLite database, and a plain directory of cache files. It treats them as strictly separate concerns, and never lets one leak into the other.
+Crate involved: `y4p-storage` (`crates/storage/`). This document explains the split, how schema migrations stay safe across upgrades, how Pin protection was layered on top without disturbing either store, and how rotation reached near-O(1) cost.
 
-This document explains why that split exists, how Pin protection — introduced in v0.2.0 — was layered on top of it without disturbing either side, and how v0.2.5's storage optimizations (O(1) rotation, `TEXT`-native text) sharpened both without changing that original split at all.
+| Location | Contents | Created with |
+| :--- | :--- | :--- |
+| `$XDG_DATA_HOME/y4p/y4p.sqlite` (default `~/.local/share/y4p/`) | Metadata, searchable text, small inline payloads | directory `0700`, file `0600` |
+| `$XDG_CACHE_HOME/y4p/<hash>.cache` (default `~/.cache/y4p/`) | Image payloads | directory `0700` |
 
 ---
 
-## Why SQLite and the filesystem are kept apart
+## 1. Why SQLite and the Filesystem Are Kept Apart
 
-Every clipboard entry needs two things. Fast metadata lookup — `list`, `search`, MRU ordering. And durable storage for the actual payload.
-
-A single SQLite table could technically do both. Store the image bytes in a BLOB column, right alongside everything else. But then every large binary the user ever copies gets written directly into the same B-Tree pages that `list` and `search` need to scan — for queries that have nothing to do with that image at all.
+Every clipboard entry needs fast metadata lookup (`list`, `search`, MRU ordering) and durable storage for the payload. A single table could do both, with image bytes in a `BLOB` column. But then every large binary the user ever copies lands in the same B-tree pages that `list` and `search` must scan for queries that have nothing to do with that image.
 
 ```text
-   clipboard event
+   clipboard event (final bytes, after image routing)
         |
         v
-  +-----------------------+        +---------------------------+
-  |  storage::db  (SQL)   |        |  storage::cache  (files)  |
-  |                       |        |                           |
-  |  id, timestamp, mime  |  hash  |  ~/.cache/y4p/<hash>.cache |
-  |  size, preview, hash  |<------>|  (large binaries only)    |
-  |  is_pinned            |        |                           |
-  +-----------------------+        +---------------------------+
+  +-----------------------+        +-----------------------------+
+  |  storage::db  (SQL)   |        |  storage::cache  (files)    |
+  |                       |  hash  |                             |
+  |  id, timestamp, mime  |<------>|  ~/.cache/y4p/<hash>.cache  |
+  |  size, preview, hash  |        |  (image payloads only)      |
+  |  content, is_pinned   |        |                             |
+  +-----------------------+        +-----------------------------+
         ^
         |
    list / search / show
-   scan only this table —
-   never touch the cache files
+   scan only this table;
+   they never touch the cache files
 ```
 
-Routing large binaries to `~/.cache/y4p/` instead keeps SQLite's page cache full of exactly what `list` and `search` need. Small rows of metadata. Searchable text. Nothing else.
+The routing rule is exact (`upsert_record`, [`crates/storage/src/db.rs:L48`](../crates/storage/src/db.rs)):
 
-That's what keeps those operations close to O(1) regardless of total history size. Twenty text snippets, or twenty text snippets plus a few hundred megabytes of screenshots sitting in the cache directory — the query cost barely moves.
+| Payload | `content` column | Cache file |
+| :--- | :--- | :--- |
+| MIME starts with `image/` (or contains `gif`) | `NULL` | `<hash>.cache` |
+| Text-like MIME and valid UTF-8 | bound as `TEXT` | none |
+| Anything else | `BLOB` | none |
 
-`storage/db.rs` (pure SQL, no filesystem I/O) and `storage/cache.rs` (filesystem only, no SQLite) enforce this split at the module boundary. The facade in `storage/mod.rs` is the *only* code allowed to know both exist. That's what stops the separation from eroding over time, as new features get added.
+Keeping images out of SQLite leaves its page cache full of exactly what `list` and `search` need: small metadata rows and searchable text. That keeps those operations close to O(1) in the size of the binary history. Twenty snippets, or twenty snippets plus hundreds of megabytes of screenshots in the cache directory: the query cost barely moves.
 
-Deduplication is what ties the two stores together. Every payload gets fingerprinted with SHA3-256 on ingest. That hash becomes both the SQLite `UNIQUE` key, and the cache filename. Copy the same image twice, and you update one row's timestamp — you never write a second copy to disk, in either store.
+> **Invariant — the facade is the only code that knows both stores.** `db.rs` is pure SQL with no filesystem I/O beyond the SQLite file; `cache.rs` is filesystem only with no SQLite. `ClipboardDb` ([`lib.rs:L64`](../crates/storage/src/lib.rs)) is the sole coordinator, which is what stops the separation eroding as features are added.
+
+### 1.1 Deduplication ties the stores together
+
+Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path).
+
+The daemon computes the hash **after** image routing (see [00](00_overview.md) section 5), so the key always describes the bytes actually stored. `ClipboardDb::insert_raw` (used by `y4p store`) computes the same digest itself.
 
 ---
 
-## Why `PRAGMA user_version` gates schema changes
+## 2. Why `PRAGMA user_version` Gates Schema Changes
 
-A clipboard database outlives any single version of the binary.
+A clipboard database outlives any single version of the binary. Anyone who has run `y4p` for months has real history in whatever schema shape their installed binary used. A migration must never be able to touch a row it does not need to.
 
-Someone who's had `y4p` running for months has real history, sitting in whatever schema shape the binary had when they installed it. Any migration has one non-negotiable requirement: it must never be able to touch a row it doesn't need to.
-
-`schema.rs` reads SQLite's built-in `PRAGMA user_version` once, at startup. It runs only the migrations the on-disk file is actually missing:
+`SchemaManager::initialize` ([`crates/storage/src/schema.rs:L16`](../crates/storage/src/schema.rs)) reads SQLite's built-in `user_version` once, at open, and runs only the migrations the file is missing (`SCHEMA_VERSION = 3`):
 
 ```rust
-// src/storage/schema.rs
-if version < 1 {
-    Self::migrate_to_v1(conn)?;
-}
-if version < 2 {
-    Self::migrate_to_v2(conn)?;
-}
-if version < 3 {
-    Self::migrate_to_v3(conn)?;
-}
-if version < SCHEMA_VERSION {
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-}
+if version < 1 { Self::migrate_to_v1(conn)?; }
+if version < 2 { Self::migrate_to_v2(conn)?; }
+if version < 3 { Self::migrate_to_v3(conn)?; }
+if version < SCHEMA_VERSION { conn.pragma_update(None, "user_version", SCHEMA_VERSION)?; }
 ```
 
-Each `migrate_to_vN` is additive by construction. `CREATE TABLE IF NOT EXISTS`. `ALTER TABLE ... ADD COLUMN ... DEFAULT`. `CREATE INDEX IF NOT EXISTS`.
+| Migration | Change | Why it is safe |
+| :--- | :--- | :--- |
+| v1 | `CREATE TABLE IF NOT EXISTS clipboard (...)`, `idx_ts` | Re-running is a no-op |
+| v2 | `ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0` (only if the column is absent) | Existing rows simply become "unpinned"; none is rewritten, dropped or reinterpreted |
+| v3 | `UPDATE ... SET content = CAST(content AS TEXT)` scoped by `TEXT_MIME_SQL_PREDICATE` | `CAST` to the class a value already has just relabels it; a metadata-only backfill |
 
-Re-running a migration that already applied is a safe no-op, not an error. And a brand-new install runs every migration in sequence, ending up byte-for-byte equivalent to an old install that migrated one version at a time.
+> **Invariant — migrations are additive and idempotent.** A brand-new install runs every migration in sequence and ends byte-for-byte equivalent to an old install that migrated one version at a time. No export/import step, no "your history was reset" surprise.
 
-This is the mechanism that made Pin protection possible to ship without a data-migration story of its own. `migrate_to_v2` adds `is_pinned INTEGER NOT NULL DEFAULT 0` to the existing `clipboard` table. Every row that existed before that version simply becomes "unpinned." No row gets rewritten. No row gets dropped. No row gets reinterpreted.
+One statement deliberately sits **outside** the version gate: `DROP INDEX IF EXISTS idx_pinned` followed by `CREATE INDEX IF NOT EXISTS idx_pinned_ts ON clipboard(is_pinned, timestamp DESC)`. A database that reached v2 before `idx_pinned_ts` existed would otherwise keep the stale single-column index forever, since `migrate_to_v2` never runs again for it. Both statements are cheap no-ops once correct, so they self-heal on every start.
 
-`migrate_to_v3` — the newest one — leans on the exact same guarantee for a very different kind of change: moving textual content from `BLOB` storage class to `TEXT` (the next section explains why that move matters). It runs one `UPDATE ... SET content = CAST(content AS TEXT)`, scoped to rows matching `TEXT_MIME_SQL_PREDICATE` — the same textual-MIME definition `upsert_record` and `search` use (see below). `CAST` on a value that's already the target storage class just relabels it — the bytes on disk don't change, so this is a metadata-only backfill, not a rewrite of anyone's clipboard history. A user upgrading from a v0.2.0 database gets the new, faster storage class for their existing rows automatically, the first time the new binary opens their database — no export/import step, no "your history was reset" surprise.
+Connection pragmas applied at open: `journal_mode = WAL`, `synchronous = NORMAL`, `temp_store = MEMORY`, `mmap_size = 256 MiB`, `cache_size = -64000` (about 64 MB), plus a `busy_timeout` of `SQLITE_TIMEOUT_MS`.
 
 ---
 
-## Why pinned records are fully exempt, not just deprioritized
+## 3. Why Pinned Records Are Fully Exempt, Not Just Deprioritised
 
-`Y4P_MAX_HISTORY` exists so the database doesn't grow forever.
+`Y4P_MAX_HISTORY` (or `[general] max_history` in `y4p.toml`) exists so the database does not grow forever. Before Pin protection, "trim to N entries" meant "keep the N most recent". Once entries can be marked important, "deprioritise eviction for pinned rows" is not enough: a snippet the user explicitly protected must never vanish because the copy *rate* passed the limit while nobody was watching.
 
-Before Pin protection, "trim to N entries" meant one thing: keep the N most recent, drop the rest.
-
-Once some entries are marked important enough to pin, "deprioritize eviction for pinned rows" isn't good enough. A snippet the user explicitly protected must never disappear — just because the history *rate* passed the limit while nobody was watching.
-
-The chosen policy is stricter than priority-based eviction. Pinned rows are removed from the eviction pool entirely. And from the quota count entirely, too. Both halves of the rotation query — the query deciding what to evict, and the query defining what counts toward the `LIMIT` — are scoped to `is_pinned = 0`:
+The chosen policy is stricter than priority-based eviction. Pinned rows are removed from the eviction pool **and** from the quota count. The selection that defines what expires is scoped to `is_pinned = 0`:
 
 ```sql
--- src/storage/db.rs — upsert_record's rotation step
+-- crates/storage/src/db.rs:L135-L144 — upsert_record's rotation step
 DELETE FROM clipboard
 WHERE id IN (
     SELECT id FROM clipboard
@@ -97,89 +97,86 @@ WHERE id IN (
 )
 ```
 
-The `is_pinned = 0` filter, present in *both* the outer delete and the inner row selection, is the detail that makes this correct, rather than just "mostly correct."
+The same scoped selection (returning `hash` instead of `id`) runs first, so the matching cache files can be removed after commit.
 
-If only the outer `DELETE` were scoped — and the inner "keep the newest N" query ranked *all* rows, pinned included — then every pinned record would still occupy one of the N slots in that ranking. The unpinned history would silently shrink to `N minus pinned count`, instead of leaving a full `N` unpinned slots available.
-
-Filtering both halves is what delivers the real guarantee. Pin ten records, and you neither risk their deletion, nor lose ten slots of your normal history.
+The `is_pinned = 0` inside the subquery is what makes this correct rather than "mostly correct". If the inner query ranked *all* rows, every pinned record would still occupy one of the N slots, and the unpinned history would silently shrink to `N - pinned_count`. Scoped, pinning ten records neither risks their deletion nor costs you ten slots of ordinary history.
 
 ```text
               upsert_record() rotation step
-              ------------------------------
 
    +----------+   +----------+   +----------+   +----------+
    | pinned   |   | unpinned |   | unpinned |   |   ...    |
-   | (excluded|   | slot 1   |   | slot 2   |   | slot N   |
-   | forever) |   |          |   |          |   |          |
+   | excluded |   | slot 1   |   | slot 2   |   | slot N   |
    +----------+   +----------+   +----------+   +----------+
         ^
         |
-   never evicted, never counted —
-   no matter how old it gets
+   never evicted, never counted,
+   however old it gets
 ```
 
-`delete <target>` and `wipe --force` deliberately sit outside this protection.
-
-Pin guards against *automatic* rotation quietly discarding something you wanted kept. It was never meant to override an *explicit* instruction to remove that exact record — or a maintenance command whose entire purpose is a full reset. Making pin state block those would turn a safety net for passive history churn into an obstacle for something you typed on purpose.
+> **Invariant — pin guards against automatic rotation only.** `delete <target>` and `wipe --force` deliberately sit outside the protection. Pin is a safety net for passive history churn; it was never meant to override an explicit instruction to remove that exact record, or a maintenance command whose purpose is a full reset.
 
 ---
 
-## Why `NOT IN` was replaced with `LIMIT -1 OFFSET`
+## 4. Why `NOT IN` Was Replaced with `LIMIT -1 OFFSET`
 
-The rotation query above didn't always look like that. Until recently, both halves read `id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)` — "delete anything that isn't in the kept set."
+Rotation used to read `id NOT IN (SELECT id FROM clipboard WHERE is_pinned = 0 ORDER BY timestamp DESC LIMIT ?1)`: "delete anything that is not in the kept set". That is intuitive to write and expensive at scale. SQLite must materialise the kept set (cost ~ N), then walk **every unpinned row**, testing each against it (cost ~ total history), however few rows actually need to expire on this insert. With tens of thousands of entries, every clipboard copy paid an O(total history) tax.
 
-That phrasing is intuitive to write, and expensive to run at scale.
-
-To evaluate a `NOT IN (subquery)`, SQLite first has to materialize the entire subquery — every one of the N kept rows — into a temporary lookup structure in memory (in practice, something functioning like a checklist it can test membership against quickly: think of it as SQLite building a giant paper checklist of "rows to keep", then walking every single unpinned row in the table one by one, asking "is your ID on this checklist?"). Then it walks *every unpinned row in the table*, checking each one against that checklist. The checklist-building cost is roughly proportional to how much history you keep; the checklist-walking cost is proportional to your *entire* unpinned history, no matter how few rows actually need to expire on this particular insert.
-
-With a history capped at a few hundred entries, that's unnoticeable. With tens of thousands — the exact regime `Y4P_MAX_HISTORY` exists to make possible — every single clipboard copy was paying an O(total history) tax just to figure out which one or two rows had aged out.
-
-`LIMIT -1 OFFSET ?1`, combined with the `idx_pinned_ts` index on `(is_pinned, timestamp DESC)`, asks a completely different question: "skip the first N rows in this index, and give me everything after that." SQLite can answer that by seeking directly to position N in the index — no checklist, no full walk. The cost now scales with *how many rows actually expired*, which on a steady-state daemon is almost always zero or one.
+`LIMIT -1 OFFSET ?1`, combined with `idx_pinned_ts` on `(is_pinned, timestamp DESC)`, asks a different question: "skip the first N rows of this index and give me everything after". SQLite seeks straight to position N; the cost scales with how many rows actually expired, which on a steady-state daemon is almost always zero or one.
 
 ```text
    Before: NOT IN (subquery)              After: LIMIT -1 OFFSET
 
-   1. build checklist of N kept rows      1. seek to position N in
+   1. build set of N kept rows            1. seek to position N in
       (memory cost ~ N)                      idx_pinned_ts (O(log N))
-   2. walk ALL unpinned rows,              2. read forward from there —
-      test each against checklist            only the expiring rows
-      (cost ~ total history size)            (cost ~ rows actually expiring)
+   2. walk ALL unpinned rows,              2. read forward from there:
+      test each against the set               only the expiring rows
+      (cost ~ total history size)             (cost ~ rows actually expiring)
 ```
 
-The `-1` in `LIMIT -1 OFFSET ?1` isn't a typo — it's SQLite's syntax for "no limit," used here purely to unlock the `OFFSET` clause. `SELECT ... LIMIT -1 OFFSET N` means "every row after skipping the first N," which is exactly the "everything beyond the kept quota" set this needed all along.
+The `-1` is not a typo: it is SQLite's spelling of "no limit", used purely to unlock the `OFFSET` clause.
 
 ---
 
-## Why text is stored as `TEXT`, not `BLOB`, from the start
+## 5. Why Text Is Stored as `TEXT`, Not `BLOB`
 
-Every piece of clipboard content used to land in the same `content BLOB` column, regardless of whether it was a screenshot or a line of copied shell output.
+Every payload once landed in a `content BLOB` column. That was convenient for the schema and costly for `search`: `BLOB` carries no encoding assumption, so each `content LIKE ?` first needed `CAST(content AS TEXT)`, allocating and reinterpreting bytes as UTF-8 on every candidate row, on every search.
 
-That uniformity was convenient for the schema, and costly for search. SQLite's `BLOB` storage class carries no assumption about encoding — it's just bytes. So every time `search`'s `content LIKE ?` needed to compare a row's content against a keyword, it first had to run `CAST(content AS TEXT)`: allocate a new buffer, walk the raw bytes, and reinterpret them as UTF-8 text, on every single matching candidate row, every time a search ran.
-
-For a screenshot that never gets searched, that cost never mattered — the mime filter excludes it long before the `CAST` would run. For a text snippet, which is exactly the kind of thing `search` exists to find, it meant paying an encoding-detection tax on content that was textual from the moment it was copied.
-
-The fix removes the guesswork instead of speeding it up. At insert time, `upsert_record` already knows the mime type. If it looks textual (`is_text_like_mime`, see below) and the bytes genuinely decode as valid UTF-8, the row is inserted with `content` bound as a Rust `&str` rather than `&[u8]` — which hands SQLite a value that adopts `TEXT` storage class directly, no cast required on the way in, and none required on the way back out.
+The fix removes the guesswork rather than speeding it up. At insert time `upsert_record` already knows the MIME. If it is text-like and the bytes decode as valid UTF-8, `content` is bound as a Rust `&str`, which SQLite stores as `TEXT` with no cast on the way in or out.
 
 ```text
    Before                                  After
 
    copy text  --> content: BLOB            copy text  --> content: TEXT
-                       |                                        |
-   search "foo"        v                   search "foo"         v
-        |         CAST(content AS TEXT)         |          content LIKE '%foo%'
-        |         LIKE '%foo%'                  |          (no cast — already
-        +-------> (cast on every candidate)     +--------> comparable as-is)
+   search "foo"                            search "foo"
+        |                                       |
+   CAST(content AS TEXT) LIKE '%foo%'      content LIKE '%foo%'   (already comparable)
 ```
 
-### One definition of "textual", shared by every code path
+Bytes that merely *claim* a textual MIME but fail UTF-8 validation fall back to ordinary `BLOB` storage, so nothing here can corrupt or misrepresent non-text content. Because SQLite's column affinity does not force a single storage class per column, `TEXT` and `BLOB` rows coexist in `content` without altering `CREATE TABLE`; `migrate_to_v3` only backfills.
 
-Four places have to agree on which MIME types count as text: `upsert_record` (TEXT vs BLOB at insert time), `search_metadata` and `validate_keywords` (which rows `search` may match) and `migrate_to_v3` (which legacy rows to backfill). If any one of them used a narrower or wider rule than the others, the failure would be silent: a row stored as `BLOB` that `search` still tries to `LIKE`-match, or a row `search` skips even though it was stored as perfectly searchable text. Earlier versions did drift this way: `application/json` and `application/xhtml+xml` fell out of search because the SQL filter only knew `%text%` and `%UTF8%`.
+### 5.1 One definition of "textual", shared by every code path
 
-There is now a single source of truth, `TEXT_LIKE_MIME_HINTS` (`src/core/constants.rs`): `text`, `json`, `xml`, `xhtml`, `utf8`, `string` and `uri-list`. It is consumed in two forms that are kept in step:
+Four places must agree on which MIME types count as text: `upsert_record` (TEXT vs BLOB), `search_metadata` and `validate_keywords` (which rows `search` may match), and `migrate_to_v3` (which legacy rows to backfill). If any used a narrower or wider rule, the failure would be silent: a `BLOB` row `search` still tries to `LIKE`, or a searchable row `search` skips. Earlier versions did drift this way: `application/json` and `application/xhtml+xml` fell out of search.
 
-- `core::utils::is_text_like_mime` applies the hints as case-insensitive substring tests in Rust. Parameters such as `; charset=utf-8` are ignored, and `image/*`, `audio/*` and `video/*` are rejected first, so `image/svg+xml` never counts as text despite containing `xml`. `upsert_record` calls this.
-- `TEXT_MIME_SQL_PREDICATE` (`src/storage/db.rs`) is the equivalent SQL fragment: `mime NOT LIKE 'image/%'` AND any of the hints as `mime LIKE '%hint%'`. `search_metadata`, `validate_keywords` and `migrate_to_v3` all interpolate this one constant instead of carrying their own `WHERE` clause.
+There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/constants.rs:L139`](../crates/core/src/constants.rs)): `text`, `json`, `xml`, `xhtml`, `utf8`, `string`, `uri-list`. It is consumed in two forms kept in step:
 
-Images are excluded on both sides for a structural reason, not just a semantic one: their payloads are offloaded to `FileCache` and stored with `content = NULL`, so there is nothing for `content LIKE ?` to match.
+| Form | Where | Behaviour |
+| :--- | :--- | :--- |
+| `core::utils::is_text_like_mime` | `y4p-core`, used by `upsert_record` | Case-insensitive substring tests; parameters such as `; charset=utf-8` ignored; `image/*`, `audio/*`, `video/*` rejected first, so `image/svg+xml` never counts as text |
+| `TEXT_MIME_SQL_PREDICATE` ([`db.rs:L19`](../crates/storage/src/db.rs)) | `y4p-storage`, interpolated by `search_metadata`, `validate_keywords`, `migrate_to_v3` | `mime NOT LIKE 'image/%'` AND any hint as `mime LIKE '%hint%'` |
 
-Bytes that merely *claim* a textual mime but fail UTF-8 validation still fall back to ordinary `BLOB` storage — nothing about this optimization risks corrupting or misrepresenting content that isn't actually text. And because SQLite's column *type affinity* doesn't force a single storage class per column, `TEXT` and `BLOB` rows coexist in the same `content` column without any change to the table's `CREATE TABLE` definition — `migrate_to_v3` only had to backfill existing rows, never alter the schema itself.
+> **Invariant — images are excluded on both sides for a structural reason.** Their payloads live in `FileCache` with `content = NULL`, so there is nothing for `content LIKE ?` to match.
+
+---
+
+## 6. The Egress Handle: `ContentLocation`
+
+`locate_content` ([`lib.rs:L201`](../crates/storage/src/lib.rs)) answers "where does this record's payload live?" without materialising it:
+
+| Variant | Meaning | Served by |
+| :--- | :--- | :--- |
+| `InlineBlob(rowid)` | Payload is in the SQLite row | `get_content_by_id` into a `Vec<u8>` (small by construction) |
+| `CacheFile(path)` | Payload is `<hash>.cache` on disk | `sendfile(2)` straight from the file (see [01](01_wayland_streaming_io.md) section 4) |
+
+> **Invariant — large payloads are never copied through the heap on restore.** The daemon translates `ContentLocation` into `wayland::state::SourcePayload`; `y4p-wayland` never sees storage types.

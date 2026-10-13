@@ -1,51 +1,81 @@
-# Wayland Protocol & Streaming I/O
+# 01 — Wayland Protocol & Streaming I/O
 
-`y4p` talks to the compositor through `ext-data-control-v1`.
+`y4p` talks to the compositor through `ext-data-control-v1`, which hands over clipboard data one file descriptor at a time. Every decision below follows from one constraint: a clipboard manager is background infrastructure. It has to move that data, sometimes 70 MB+ of image, without becoming the reason the desktop feels slow.
 
-This protocol hands you clipboard data one file descriptor at a time. Every decision in this document comes back to the same constraint: a clipboard manager is background infrastructure. It has to move that data — sometimes 70MB+ of lossless image — without becoming the reason the desktop feels slow.
+Crates involved: `y4p-wayland` (protocol handlers, pipe plumbing) and `y4p-daemon` (event loop, restore dispatch). The persistence side of the contract is in [02](02_hybrid_storage_and_pin.md) and [03](03_concurrency_and_memory.md).
 
 ---
 
-## Why one thread watches both Wayland and IPC
+## 1. One Thread Watches Both Wayland and IPC
 
-The daemon has two independent sources of work.
-
-Wayland protocol events: a new clipboard offer just arrived. IPC commands: someone ran `y4p copy-to 3` on the socket.
-
-The obvious design spawns a thread per source. `y4p` doesn't. Both are watched on the *same* thread, with a single `libc::poll` call:
+The daemon has two independent sources of work: Wayland events (a new offer arrived) and IPC commands (someone ran `y4p copy-to 3`). It does not spawn a thread per source. Both descriptors are watched by one `poll(2)` call on the same thread:
 
 ```rust
-// src/daemon/mod.rs — the daemon's main loop
+// crates/daemon/src/lib.rs:L127-L134 — the daemon's main loop
 let mut poll_fds = [
     libc::pollfd { fd: conn.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
     libc::pollfd { fd: listener.as_fd().as_raw_fd(),  events: libc::POLLIN, revents: 0 },
 ];
 
+// SAFETY: `poll_fds` is a valid, correctly-sized array of `pollfd` ...
 if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 ```
 
-Why does this matter?
+```text
+   +-----------------------------------------------------------+
+   |  daemon main thread                                       |
+   |                                                           |
+   |   poll(wayland_fd, ipc_listener_fd, 500 ms)               |
+   |        |                       |                          |
+   |        v                       v                          |
+   |   dispatch events         accept_and_dispatch             |
+   |   (Selection, Offer,      (Exit / Restore / Status /      |
+   |    GlobalRemove ...)       Pause / Resume)                |
+   +-----------------------------------------------------------+
+        never performs disk I/O, hashing or image conversion
+```
 
-A thread that only exists to block on `recv()` still costs something. A kernel stack. A scheduler entry. A context switch, every time it wakes up. That's pure overhead for a process that's idle almost all the time.
+| Property | Consequence |
+| :--- | :--- |
+| Kernel wakes the process only on real activity | 0 % CPU between clipboard events; no helper threads parked on `recv()` |
+| 500 ms timeout is a watchdog, not a busy-loop | `is_exiting()` and the seat-rebind self-heal (`bind_data_device`, [lib.rs:L170](../crates/daemon/src/lib.rs)) are re-evaluated even with zero I/O |
+| Wayland and IPC handling share one thread | No lock between "event" and "command"; they can never run concurrently |
+| Everything that *needs* concurrency is pushed off-thread | Reads of offered payloads, image conversion, hashing and SQLite writes never stall the loop |
 
-`poll(2)` puts the kernel in charge of watching both descriptors at once. It only wakes the process when one of them actually has data.
-
-That's what lets the daemon sit at genuinely 0% CPU between clipboard events — instead of spending cycles just to discover there's nothing to do.
-
-The 500ms timeout isn't a busy-loop interval, either. It's a watchdog. It makes sure `is_exiting()`, and the seat-rebind self-heal check in `bind_data_device`, still get re-evaluated periodically — even with zero I/O activity.
-
-One tradeoff this buys: no locking between "Wayland event" and "IPC command" handling. They can never run concurrently with each other, because they're the same thread. Anything that *does* need real concurrency — disk I/O, hashing — is pushed off this thread entirely instead. More on that in [03](03_concurrency_and_memory.md).
+> **Invariant — the poll loop never blocks on payload work.** Anything proportional to payload size runs on a spawned thread (ingestion read, egress write) or on the `DbWorker` (conversion, hashing, persistence).
 
 ---
 
-## How ingestion reads, normalises, then hashes
+## 2. Ingestion: Bounded Read, Normalise, Forward
 
-Turning a compositor's pipe into a stored record is three distinct decisions — how much to read, how to interpret it, and when to fingerprint it — and `y4p` keeps them in that fixed order rather than interleaving them.
+Turning a compositor pipe into a stored record is a sequence of distinct decisions. `y4p-wayland` owns the first four; the rest belong to the daemon's worker (see section 6 for the full contract).
 
-First, the whole payload is read in one bounded call, `read_bounded_payload`, capped by `MAX_PAYLOAD_BYTES` (256MiB, `src/core/constants.rs`):
+```text
+ Selection event
+      |
+      v
+ [gate]      is_sensitive(mimes)?  provider_locks > 0?  paused?   -> return, no pipe opened
+      |
+      v
+ [select]    select_mime(mimes, target_mime, drop_rtf)
+      |
+      v
+ [read]      offer.receive(mime, write_fd)  ->  read_bounded_payload(read_file, MAX_PAYLOAD_BYTES)
+      |
+      v
+ [normalise] normalise_payload(mime, payload)
+      |
+      v
+ [forward]   job_tx.send(ClipboardJob { mime, data })      (daemon mode)
+             state.rx_buf = payload                        (Action Mode: `y4p paste-from`)
+```
+
+### 2.1 Bounded read: `read_bounded_payload`
+
+The whole payload is read in one bounded call, capped by `MAX_PAYLOAD_BYTES` (256 MiB, [`crates/core/src/constants.rs:L43`](../crates/core/src/constants.rs)):
 
 ```rust
-// src/wayland/handlers/data_control/device.rs
+// crates/wayland/src/handlers/data_control/device.rs:L145
 fn read_bounded_payload<R: Read>(reader: R, limit: u64) -> Option<Vec<u8>> {
     let mut payload = Vec::new();
     let mut bounded = reader.take(limit + 1); // one probe byte beyond the cap
@@ -53,79 +83,85 @@ fn read_bounded_payload<R: Read>(reader: R, limit: u64) -> Option<Vec<u8>> {
     if payload.is_empty() || payload.len() as u64 > limit { return None; }
     Some(payload)
 }
-
-// ingest_and_send, and Action Mode's synchronous read
-let Some(payload) = read_bounded_payload(read_file, MAX_PAYLOAD_BYTES) else { return; };
 ```
 
-The cap means a misbehaving clipboard source can't turn one ingestion into an unbounded allocation. The `limit + 1` is the subtle part. `Read::take` stops *silently* at its cap: no error, no flag, just a clean `Ok(_)`. If the reader were capped at exactly `limit`, a stream that is truly larger would be cut off mid-transfer and look identical to one that happened to be exactly `limit` bytes long. The truncated bytes would then be hashed and persisted as if they were the whole clipboard entry: silent corruption, and a corrupt entry that restores "successfully".
+`Read::take` stops *silently* at its cap: no error, no flag, just `Ok(_)`. If the reader were capped at exactly `limit`, an oversized stream would be cut off mid-transfer and look identical to one that happened to be exactly `limit` bytes long, and the truncated bytes would be hashed and persisted as if they were the whole entry: silent corruption that restores "successfully".
 
-Reading one extra byte removes the ambiguity. If more than `limit` bytes come back, the stream was oversized, so the whole payload is discarded (`None`) rather than kept as a partial. A stream of exactly `limit` bytes still passes. An I/O error or an empty read also yields `None`, so every failure mode ends the same way: nothing is stored.
+Reading one extra byte removes the ambiguity:
 
-`read_to_end` is the standard library's own fully-buffered read; there's no bespoke chunk loop or page-aligned buffer to maintain here, because nothing on this path needs one — ingestion already runs off the daemon's main `poll` loop entirely, on its own per-selection spawned thread (see above), so a straightforward buffered read costs nothing the design cares about.
+| Stream | Result |
+| :--- | :--- |
+| `len <= limit` | `Some(payload)` |
+| `len == limit` exactly | `Some(payload)` (still passes) |
+| `len > limit` | `None`: the whole payload is discarded, never truncated |
+| I/O error or empty read | `None` |
 
-Second, the buffered payload is normalised, and — where the offered label can't be trusted outright — re-identified from its own bytes. `normalise_payload` re-detects images by their magic bytes (`core::utils::detect_image_mime`) and rewrites `text/uri-list` payloads into plain, percent-decoded paths (`core::utils::normalize_uri_list`):
+> **Invariant — no partial payloads.** Every failure mode of the read ends the same way: nothing is stored.
 
-```rust
-// src/wayland/handlers/data_control/device.rs
-let Some((final_mime, payload)) = normalise_payload(mime_to_get, payload) else { return; };
-```
+`read_to_end` is the standard library's own fully-buffered read. There is no bespoke chunk loop or page-aligned buffer, because nothing on this path needs one: the read already runs off the poll loop, on its own per-selection thread.
 
-Only then is the result hashed, exactly once, over the bytes that are actually about to be persisted:
+### 2.2 Normalisation: `normalise_payload`
 
-```rust
-let mut hasher = Sha3_256::new();
-hasher.update(&payload);
-let hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-```
+Where the offered label cannot be trusted outright, the payload is re-identified from its own bytes:
 
-Hashing after normalisation, not before, is what makes deduplication correct: two offers that normalise to the same `text/uri-list` paths — different `file://` escaping, say — collapse into the same fingerprint, because the hash is computed over what they both became, not over how each one happened to arrive.
+| Input | Treatment |
+| :--- | :--- |
+| `text/uri-list` (matched by `mime_base_eq`: case, whitespace and parameters ignored) | `core::utils::normalize_uri_list`: percent-decoded, `file:` scheme and authority stripped, one path per line. `None` if nothing valid remains |
+| Anything else | `core::utils::detect_image_mime` re-labels by magic bytes (PNG, JPEG, GIF, WebP, AVIF, SVG); bytes are never altered |
+
+The result is a plain `(mime, data)` pair. Normalisation is lossless and sits **before** hashing, so two offers that normalise to the same paths (different `file://` escaping, say) collapse into the same fingerprint.
 
 ---
 
-## Why `provider_locks` exists
+## 3. Why `provider_locks` Exists
 
-`ext-data-control-v1` can't tell "the user copied something new" apart from "the compositor is re-offering content the daemon itself just set."
+`ext-data-control-v1` cannot tell "the user copied something new" apart from "the compositor is re-offering content the daemon itself just set". Without a way to distinguish them, `copy-to` would immediately trigger the daemon's own ingestion handler, re-hash and re-store the content it just placed on the clipboard: a feedback loop that only touches a timestamp on every restore.
 
-Without a way to distinguish those, restoring a history entry (`copy-to`) would immediately trigger the daemon's own ingestion handler. It would re-hash and re-store the exact content it just placed on the clipboard. A feedback loop — one that does nothing useful, and just touches a timestamp on every restore.
-
-`y4p` closes that loop with a plain counter.
-
-Right before handing data to the compositor, it increments the lock:
+`y4p` closes the loop with a plain counter. Before handing data to the compositor, restore increments it:
 
 ```rust
-// src/daemon/mod.rs — handle_restore_request
+// crates/daemon/src/lib.rs:L212 — handle_restore_request
 state.provider_locks += 1;
 ```
 
-And the ingestion handler checks it first, before doing any work at all:
+and the ingestion handler checks it first, before doing any work:
 
 ```rust
-// src/wayland/handlers/data_control/device.rs
+// crates/wayland/src/handlers/data_control/device.rs:L25
 if state.provider_locks > 0 {
     state.provider_locks -= 1;
     return;
 }
 ```
 
-This works cleanly because both sides run on the same single-threaded event loop described above. There's no race between "increment" and "check" to guard against — so a plain `usize` is enough. No atomics. No mutex.
-
-That's the point, really. Use the simplest tool that actually fits the concurrency model you have. Adding synchronization the design doesn't need is just more surface area to get wrong later.
+> **Invariant — the counter is single-threaded by construction.** Both sides run on the one event-loop thread of section 1, so there is no race between "increment" and "check". A plain `u32` field of `WaylandState` is enough: no atomics, no mutex. Use the simplest tool that fits the concurrency model you actually have.
 
 ---
 
-## Zero-copy egress for cached payloads
+## 4. Zero-Copy Egress for Cached Payloads
 
-Restoring a *text* entry is cheap either way — it's already a small `Vec<u8>` sitting in the process.
+Restoring a *text* entry is cheap either way: it is a small `Vec<u8>`. Restoring an *image* from `~/.cache/y4p/<hash>.cache` is different. Naively, `read()` the whole file into a `Vec<u8>`, then `write()` it to the requesting client's pipe: the payload crosses userspace twice for a transfer that never needed to touch this process's heap.
 
-Restoring an *image* from `~/.cache/y4p/<hash>.cache` is a different story. Naively: `read()` the whole file into a `Vec<u8>`, then `write()` that `Vec` back out to the requesting client's pipe. The full payload crosses the userspace boundary twice, for a transfer that never needed to touch this process's heap in the first place.
+`storage::ContentLocation` routes around that. A record's payload is either `InlineBlob` (small, in the SQLite row) or `CacheFile` (on disk), and egress branches on it:
 
-`storage::ContentLocation` exists to route around that.
-
-A record's payload is either `InlineBlob` — small, lives in the SQLite row — or `CacheFile` — large, lives on disk. Egress branches on which one it is. A `CacheFile` payload goes to `sendfile(2)`, not a read/write pair:
+```text
+  copy-to  --IPC-->  handle_restore_request
+                          |
+                          v
+                 read_db.locate_content(id)
+                    /                \
+          InlineBlob(id)          CacheFile(path)
+                |                        |
+      get_content_by_id           SourcePayload::File(path)
+                |                        |
+      SourcePayload::Owned(Vec)          |
+                |                        v
+                v              spawned thread: send_via_sendfile
+      spawned thread: write_all          cache file -> pipe, in-kernel
+```
 
 ```rust
-// src/wayland/handlers/data_control/source.rs
+// crates/wayland/src/handlers/data_control/source.rs:L35
 SourcePayload::File(path) => {
     let path = path.clone();
     std::thread::spawn(move || {
@@ -134,8 +170,34 @@ SourcePayload::File(path) => {
 }
 ```
 
-`sendfile(2)` copies file-to-pipe entirely inside the kernel. This process's heap never holds the image — not even briefly.
+| Aspect | Behaviour |
+| :--- | :--- |
+| Transfer | `sendfile(2)` copies file-to-pipe inside the kernel; the image never enters this process's heap |
+| Chunking | At most `1 << 30` bytes per call, defensively below any kernel ceiling |
+| Interruption | `EINTR` retries; `EPIPE`/`ECONNRESET` (receiver left) end quietly |
+| Fallback | `fallback_copy` (64 KiB userspace loop, resuming from the offset `sendfile` reached) only if the kernel reports `EINVAL`/`ENOSYS` for this destination |
+| Isolation | Own thread, so a slow reader can never stall the poll loop |
 
-The transfer runs on its own spawned thread, same as the owned-payload path already does. That way, a slow reader on the other end can never stall the daemon's main poll loop.
+> **Invariant — egress never re-encodes.** The stored bytes go out exactly as saved. Cross-format image matching is deliberately refused in `mime_is_compatible`, because `y4p` cannot turn one encoding into another on request.
 
-A userspace copy loop still exists as a fallback (`fallback_copy`). It only kicks in if `sendfile(2)` itself reports it can't be used against this destination — `EINVAL` or `ENOSYS`. Rare, for a plain pipe. But cheap insurance against an exotic kernel silently producing a truncated paste instead of a working one.
+For `Owned` payloads the only transformation is markup stripping: if the stored MIME is HTML/XHTML and the requester asked for a non-markup type, `strip_html_tags` runs; asking for the markup MIME itself returns the original bytes. Alternate MIMEs (`HTML_MIME_ALTS`, `TEXT_MIME_ALTS`) are advertised alongside the stored one so the paste target can pick what it understands.
+
+---
+
+## 5. Action Mode (`y4p paste-from`)
+
+`paste_from_os` ([`crates/wayland/src/lib.rs:L29`](../crates/wayland/src/lib.rs)) uses the same `WaylandState` with `job_tx = None` and a `target_mime`. It runs a poll-based loop with a 200 ms sub-timeout under a 1 s absolute watchdog, and performs the same bounded read and normalisation synchronously into `state.rx_buf`.
+
+> **Invariant — one boundary guard, two consumers.** `paste-from` returns exactly the bytes the daemon would have forwarded to the worker (before image routing, which is a persistence concern).
+
+---
+
+## 6. The Stream I/O Contract Between Crates
+
+| Hand-off | From -> To | Type | Guarantee |
+| :--- | :--- | :--- | :--- |
+| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::Sender<ClipboardJob>`, `ClipboardJob { mime, data }` | `data` is non-empty, at most `MAX_PAYLOAD_BYTES`, already normalised; no hash, no conversion |
+| Persistence | `y4p-daemon` -> `y4p-storage` | `insert_with_hash(mime, data, hash, max_history)` | `hash` is SHA3-256 over the final bytes (see [03](03_concurrency_and_memory.md)) |
+| Egress | `y4p-storage` -> `y4p-daemon` -> `y4p-wayland` | `ContentLocation` -> `SourcePayload` | Large payloads are passed as a path, never materialised |
+
+> **Invariant — `y4p-wayland` is a pure sensor.** It depends on neither `y4p-storage`, `y4p-image` nor `sha3`; it never converts, fingerprints or persists a payload.
