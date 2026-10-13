@@ -39,7 +39,7 @@ pub fn delete_run(args: &[String], db: &mut ClipboardDb) {
     }
 }
 
-/// Purge the entire database and optimize file structure.
+/// Purge the entire database and optimise file structure.
 pub fn wipe_run(args: &[String], db: &mut ClipboardDb) {
     let ctx = ArgContext::parse(args);
 

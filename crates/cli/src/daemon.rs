@@ -26,9 +26,9 @@ pub fn run(args: &[String]) -> Option<bool> {
         return None;
     }
 
-    // Notify initialization start. (The "ready" confirmation — printed only
+    // Notify initialisation start. (The "ready" confirmation — printed only
     // once the daemon has actually bound the compositor and its data device
-    // — comes from src/daemon/mod.rs; printing it here too was a duplicate.)
+    // — comes from crates/daemon/src/lib.rs; printing it here too was a duplicate.)
     println!("{}{}", LOG_INFO, MSG_DAEMON_START);
 
     if ctx.verbose {

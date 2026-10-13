@@ -27,7 +27,7 @@ pub struct ArgContext {
     pub use_id: bool,
     /// Ordered list of non-flag arguments.
     pub positionals: Vec<String>,
-    /// List of flags not recognized by the global parser.
+    /// List of flags not recognised by the global parser.
     pub unknown_flags: Vec<String>,
 }
 
@@ -112,7 +112,7 @@ pub fn parse_range(arg: Option<&String>, default_limit: usize) -> Result<RangeSe
             // so this could overflow: a panic in debug builds, silent
             // wraparound in release. `saturating_add` makes the ceiling
             // "however far a usize can go" instead of undefined/panicking
-            // behavior — the subsequent `.min(len - 1)` clamp in
+            // behaviour — the subsequent `.min(len - 1)` clamp in
             // `cli/list.rs` already bounds it to something sane in practice.
             (Some(start), None) => Ok(RangeSelection::Range(start, start.saturating_add(default_limit))),
             (None, Some(end)) => Ok(RangeSelection::Range(0, end)),

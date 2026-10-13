@@ -18,7 +18,7 @@ use super::{make_pipe, is_sensitive};
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
     fn event(state: &mut Self, _: &ExtDataControlDeviceV1, ev: ext_data_control_device_v1::Event, _: &(), conn: &Connection, _: &QueueHandle<Self>) {
         if let ext_data_control_device_v1::Event::Selection { id } = ev {
-            // Update synchronization status
+            // Update synchronisation status
             state.selection_received = true;
 
             // Prevent self-ingestion by checking active provider locks
@@ -50,7 +50,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             let drop_rtf = state.config.should_drop_rtf();
             let Some(mime_to_get) = select_mime(&mimes, state.target_mime.as_deref(), drop_rtf) else { return; };
 
-            // Initialize data transfer pipe
+            // Initialise data transfer pipe
             let (read_file, write_fd) = match make_pipe() {
                 Some(p) => p,
                 None => return,

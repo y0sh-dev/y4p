@@ -36,7 +36,7 @@ pub fn paste_from_os(mime: &str) -> Vec<u8> {
     let config = std::sync::Arc::new(crate::core::config::Config::load());
     let mut state = WaylandState::new_action(mime.to_string(), false, config);
 
-    // 1. Synchronize to bind initial protocols (Manager & Seat)
+    // 1. Synchronise to bind initial protocols (Manager & Seat)
     let _ = event_queue.roundtrip(&mut state);
 
     if let (Some(manager), Some(seat)) = (&state.manager, &state.seat) {

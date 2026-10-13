@@ -55,7 +55,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 if Some(name) == state.seat_id {
                     state.seat = None;
                     state.seat_id = None;
-                    // Critical: Clear the dependent device to trigger re-initialization
+                    // Critical: Clear the dependent device to trigger re-initialisation
                     state.device = None;
 
                     if state.verbose { 

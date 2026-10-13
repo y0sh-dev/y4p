@@ -31,7 +31,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::time::Duration;
 use std::sync::Arc;
 
-/// Initialize and run the clipboard daemon with a unified, high-performance event loop.
+/// Initialise and run the clipboard daemon with a unified, high-performance event loop.
 ///
 /// Returns `true` if the daemon actually reached its serving state (bound
 /// the socket, connected to the compositor, obtained the data-control
@@ -186,7 +186,7 @@ fn bind_data_device(
 /// Serve a historical record with broad MIME compatibility.
 ///
 /// Kernel-level egress: uses `locate_content` instead of always
-/// materializing the payload into memory. Large binaries (images) living in
+/// materialising the payload into memory. Large binaries (images) living in
 /// the on-disk cache are handed to the data source as a `SourcePayload::File`,
 /// so `wayland/handlers/data_control/source.rs` can transfer them straight
 /// from disk to the requesting client's pipe via `sendfile(2)` — this
