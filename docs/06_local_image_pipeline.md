@@ -1,157 +1,260 @@
-# 06 — Local Image Pipeline & Defense-in-Depth Hardening
+# 06 — Local Image Pipeline & Defence-in-Depth Hardening
 
-This document details the architecture, security sandboxing, and resource governance of `y4p`'s local image processing pipeline introduced across the v0.5.x cycle.
+This document details the architecture, sandboxing and resource governance of `y4p`'s local image pipeline: the part of ingestion that handles untrusted raster images.
 
-The [Overview](00_overview.md) explains how daemon and CLI communicate. This document focuses on the execution boundaries that protect the daemon process while ingesting, transcoding, and caching visual payloads.
+Crate involved: `y4p-image` (`crates/image/`), depending only on `std`, `libc` and `y4p-core`. It knows nothing about SQLite, Wayland or the daemon. Its sole consumer is the `y4p-daemon` worker (`process_job`, see [00](00_overview.md) section 5 and [03](03_concurrency_and_memory.md) section 2).
 
 ---
 
 ## 1. Architectural Motivation
 
-Wayland clipboards routinely handle high-resolution screenshots, raw bitmapped framebuffers, and multi-megabyte visual assets alongside plain UTF-8 text.
+Wayland clipboards routinely carry high-resolution screenshots, framebuffers and multi-megabyte assets next to plain text. Treating image bytes like text creates acute hazards:
 
-Treating image data identically to text creates acute hazards:
-1. **Memory Exhaustion (OOM)**: Storing multi-megabyte image binaries directly inline within SQLite degrades B-tree query locality and bloats the write-ahead log (WAL).
-2. **Decompression Bombs**: Malicious or malformed image headers (e.g. dimensions advertising 100,000 x 100,000 pixels) can induce severe CPU exhaustion or memory starvation during decoding.
-3. **Privilege & Multi-User Hazards**: Image decoders occasionally spill working state onto disk; writing to shared public directories invites symlink traversal and data leakage.
+1. **Metadata leakage.** Photos and screenshots carry EXIF (including GPS and device identifiers), XMP, IPTC and embedded text chunks. A clipboard history that persists them verbatim retains data the user never meant to keep.
+2. **Decompression bombs.** A tiny file whose header advertises enormous dimensions can induce severe CPU or memory exhaustion in a decoder.
+3. **Decoder attack surface.** ImageMagick auto-detects formats and can route attacker-chosen bytes into any of ~100 coders, including scriptable ones with a long vulnerability history.
+4. **Shared-directory hazards.** Decoders spill working state to disk. In a shared `/tmp`, predictable names invite symlink races and leak a decoded clipboard image.
+5. **Inline bloat.** Multi-megabyte binaries inside SQLite degrade B-tree locality and bloat the WAL (see [02](02_hybrid_storage_and_pin.md)): converted images are stored in `~/.cache/y4p/<hash>.cache` instead.
 
-To address these concerns, `y4p` routes image assets through an isolated pipeline (`src/image/`) before committing metadata to SQLite and binary blobs to the deduplicated filesystem cache (`~/.cache/y4p/blobs/`).
+To address these, `y4p` routes raster images through an isolated pipeline before the SQLite row and cache file are written.
+
+> **Invariant — never lose data, never make things worse.** Whatever goes wrong in this crate, the caller still receives a usable `(mime, bytes)` pair: the converted pair on success, the original pair **byte for byte** on bypass or on any failure.
 
 ---
 
-## 2. Ingestion Boundaries & Format Sniffing
-
-MIME types advertised by Wayland source applications cannot be trusted unconditionally. An application advertising `image/png` may supply corrupted stream bytes or an executable polyglot.
-
-Before allocating decompression buffers or spawning external transcode helpers, `y4p` validates payload headers via magic byte sniffing:
+## 2. Where It Sits, and What It Decides
 
 ```text
-[ Incoming Byte Stream ]
-           |
-           v
- [ Magic Byte Sniffer ]
-           |-- 89 50 4E 47 0D 0A 1A 0A -> ImageFormat::Png
-           |-- FF D8 FF                -> ImageFormat::Jpeg
-           |-- 47 49 46 38 [37|39] 61  -> ImageFormat::Gif
-           |-- 52 49 46 46 .... 57 45 42 50 -> ImageFormat::Webp
-           |
-           +-- Non-matching -> Rejected early without memory allocation
+  y4p-wayland  --ClipboardJob{mime,data}-->  DbWorker thread
+                                                  |
+                                                  v
+                                   route::route_for_ingest(mime, data)
+                                                  |
+                         +------------------------+-------------------------+
+                         |                                                  |
+                  bypass (original)                                  convert via magick
+        text, HTML, uri-list, SVG, AVIF,                  PNG, BMP  -> lossless WebP
+        GIF, WebP, empty, unknown                         JPEG      -> lossy WebP (q90)
+        breaker open, throttle saturated,
+        magick missing, no scratch dir,
+        conversion failed
+                         \                                                  /
+                          +-----------------> (mime, bytes) <---------------+
+                                                  |
+                                                  v
+                                   SHA3-256 over the final bytes -> insert_with_hash
 ```
 
-If the leading bytes fail to match a supported graphical container, ingestion is aborted immediately. The daemon avoids invoking heavier parsing stages or allocating working memory for unrecognised streams.
+| Module | Role |
+| :--- | :--- |
+| `route.rs` | Classification and the conversion/bypass decision (`route_for_ingest`, testable core `route_with`) |
+| `transcode.rs` | Closed-enum argument construction for `magick`; resource limits; the compile-time timeout assertion |
+| `magick.rs` | Availability probe (cached once per process) and isolated runs |
+| `sandbox.rs` | Private scratch directory (`ScratchDir`) and the environment whitelist (`child_env`) |
+| `pipeline.rs` | Streaming relay to a child, process-group watchdog, `PipelineError` |
+| `throttle.rs` | Counting semaphore bounding concurrent converter processes |
+| `breaker.rs` | Three-state circuit breaker over converter faults |
+
+### 2.1 What is converted, and why
+
+| Input | Output | Reason |
+| :--- | :--- | :--- |
+| PNG, BMP | lossless WebP (ImageMagick quality 100) | Bit-exact pixels, metadata removed, normally much smaller (BMP is uncompressed) |
+| JPEG | lossy WebP, `IMAGE_INGEST_JPEG_QUALITY = 90` | JPEG is where phone and camera EXIF/GPS lives, so it must be re-encoded to be stripped; lossless WebP would inflate it several times over |
+| GIF, WebP | untouched | The transcoder keeps only the first frame, which would silently destroy an animation the user copied |
+| SVG, AVIF, anything else | untouched | Vector and scriptable formats never reach a raster decoder; AVIF is not a supported input |
+
+Lossless WebP is always encoded at quality 100: in lossless mode ImageMagick maps any lower quality onto libwebp's near-lossless pre-processing, which *does* alter pixels (measured: 59 of 16 384 pixels differ at quality 75, 118 at 50). Only 100 is exact.
 
 ---
 
-## 3. Sandboxing & Workspace Isolation (`ScratchDir`)
+## 3. Ingestion Boundaries & Format Sniffing
 
-When transforming or normalising image streams (e.g. converting uncompressed pixel buffers into deduplicated PNG formats), `y4p` invokes ImageMagick utilities with strict sandboxing invariants.
+MIME types advertised by Wayland sources cannot be trusted unconditionally. An application advertising `image/png` may supply corrupted bytes, or a different format entirely. So the **bytes outrank the label**.
 
-### Disk Spillage and the Shared `/tmp` Vulnerability
-Under memory-constrained workloads, ImageMagick can spill intermediate raster allocations onto disk. Defaulting to `/tmp` on multi-user systems introduces serious risks:
-- Other local users can observe temporary file naming conventions.
-- Unprivileged users can stage symlink races targeting predictable paths.
-- Shared temporary directories frequently lack restrictive umask controls.
-
-### RAII Scratch Directory (`src/image/sandbox.rs`)
-`y4p` encapsulates temporary working directories inside `ScratchDir`, an RAII guard guaranteeing POSIX mode `0700` (`rwx------`):
-
-```rust
-pub struct ScratchDir {
-    path: PathBuf,
-}
+```text
+ [ Incoming payload ]
+          |
+          v
+ [ Magic-byte sniff of the first 512 bytes ]   core::utils::detect_image_mime
+          |-- 89 50 4E 47            -> image/png
+          |-- FF D8 FF               -> image/jpeg
+          |-- 47 49 46 38 ("GIF8")   -> image/gif
+          |-- "RIFF" .... "WEBP"     -> image/webp
+          |-- .... "ftyp" avif/avis  -> image/avif
+          |-- "<?xml" | "<svg"       -> image/svg+xml   (after leading whitespace)
+          |
+          +-- no signature -> the declared MIME decides (BMP has no short signature)
 ```
 
-1. **Resolution Priority**: The directory resolver attempts to anchor scratch storage inside `$XDG_RUNTIME_DIR/y4p/scratch/` (mounted on tmpfs with user-only permissions by default). If `$XDG_RUNTIME_DIR` is unavailable, it falls back to a securely permissions-checked directory under `std::env::temp_dir()`.
-2. **Permission Hardening**: Directory creation strictly verifies or sets POSIX mode `0700`.
-3. **Deterministic Cleanup**: The `Drop` implementation removes the directory tree completely upon normal return, error return, or unwinding.
+When the leading bytes identify an image, that identification is final: an SVG announced as `image/png` is recognised as SVG and bypassed instead of being handed to a raster decoder. Payloads that classify to nothing cost nothing: no process, no allocation beyond the input.
 
-### Child Environment Whitelist (`child_env`)
-Spawning child processes with full inherited environments exposes execution to unintended variables (such as `MAGICK_CONFIGURE_PATH`, `LD_PRELOAD`, or proxy variables).
-
-`y4p` executes child helpers with a positive environment whitelist:
-- `PATH`: Retained for resolving standard system binaries.
-- `MAGICK_TEMPORARY_PATH`: Explicitly pinned to the active `ScratchDir`.
-- `TMPDIR`: Explicitly pinned to the active `ScratchDir`.
-
-All other parent environment variables are stripped.
+> **Invariant — the decoder is pinned, never guessed.** `transcode.rs` passes the input as `png:-[0]`, `jpeg:-[0]`, `bmp:-[0]` and so on. A pinned coder makes a mislabelled or disguised payload fail to decode instead of reaching a different parser, and `[0]` selects the first frame so an animated input cannot expand into a frame sequence. Vector and scriptable formats are deliberately not representable in `InputFormat`.
 
 ---
 
-## 4. Defense-in-Depth Resource Controls
+## 4. Argument Construction
 
-`y4p` enforces multiple concentric safety boundaries to ensure that rogue images cannot stall or destabilise the clipboard daemon.
+Every argument handed to `magick` is derived from closed enums and compile-time constants, never from clipboard-controlled text, so no option, `coder:` prefix or filename can be smuggled in. The vector is built in the one safe order ([`crates/image/src/transcode.rs:L203`](../crates/image/src/transcode.rs)):
+
+| # | Tokens | Why this position |
+| :--- | :--- | :--- |
+| 1 | `-limit width\|height\|memory\|map\|disk\|time <value>` | Ceilings are active before any byte is decoded, so a bomb is rejected at the header, not after allocation |
+| 2 | pinned decoder `fmt:-[0]` | See section 3 |
+| 3 | `-auto-orient` | Orientation lives in EXIF; stripping first would turn a rotated photo sideways. The rotation is baked into the pixels, then the tag is dropped |
+| 4 | `-strip` | Removes every profile and comment: EXIF incl. GPS, XMP, IPTC, ICC, text chunks. **Not a switch: every transcode strips** |
+| 5 | encoder settings, output `webp:-` | `webp:lossless=true` with quality 100, or `webp:lossless=false` with the clamped quality |
+
+`Quality` clamps to 1..=100 on construction, so no input can make `magick` reject the option.
+
+---
+
+## 5. Sandboxing & Workspace Isolation (`ScratchDir`)
+
+### 5.1 Why not `/tmp`
+
+With `-limit disk` set, ImageMagick moves its pixel cache to temporary files once memory and map limits are exhausted. In a shared `/tmp` those files are readable-by-name side channels and a symlink-race target, and they contain a decoded clipboard image.
+
+### 5.2 Resolution and verification ([`crates/image/src/sandbox.rs`](../crates/image/src/sandbox.rs))
+
+The converter is pointed at a directory only the current user can enter:
+
+1. `$XDG_RUNTIME_DIR/y4p-magick`, provided `$XDG_RUNTIME_DIR` is an absolute path to a real directory (not a symlink) owned by the current user with no group/other permissions; otherwise
+2. `/tmp/y4p-magick-<uid>`.
+
+Nothing is taken on trust. Every candidate is `lstat`ed, must be a real directory owned by the effective uid, and is tightened to `0700` if it was ours but looser. A symlink, a plain file or someone else's directory is never used and never followed. If **neither** location qualifies, creation fails and the converter is **not run at all**: falling back to the shared default would defeat the purpose.
+
+Each conversion gets its own fresh subdirectory (`run-<pid>-<n>`, mode `0700`), removed by the RAII `Drop` of `ScratchDir`, which also cleans up after a child killed by the watchdog and keeps concurrent conversions out of each other's files.
+
+### 5.3 Child environment whitelist (`child_env`)
+
+A child that inherits the full environment can be steered by `MAGICK_CONFIGURE_PATH`, `MAGICK_HOME`, `MAGICK_CODER_MODULE_PATH`, `HOME`, `XDG_CONFIG_HOME` (any of which can substitute ImageMagick's security policy or coders), `LD_PRELOAD` or `LD_LIBRARY_PATH`. `ChildEnv::apply` first clears the environment, then sets exactly:
+
+| Variable | Value |
+| :--- | :--- |
+| `PATH` | inherited, so `magick` can be found |
+| `MAGICK_TEMPORARY_PATH` | the active `ScratchDir` |
+| `TMPDIR` | the active `ScratchDir` |
+
+Everything else is stripped. The system-wide policy in `/etc/ImageMagick-*` still applies.
+
+---
+
+## 6. Defence-in-Depth Resource Controls
+
+Concentric boundaries make sure a rogue image cannot stall or destabilise the daemon.
 
 ```text
 +-----------------------------------------------------------------+
-| Parent Watchdog (IMAGE_TRANSCODE_TIMEOUT_SECS = 15s)            |
-| kill(-pgid, SIGKILL) terminates stalled process trees           |
+| Parent watchdog: IMAGE_TRANSCODE_TIMEOUT_SECS = 15 s            |
+| kill(-pgid, SIGKILL) terminates the whole process group         |
 |                                                                 |
 |   +-----------------------------------------------------------+ |
-|   | Child Limit (IMAGE_LIMIT_TIME_SECS = 10s)                 | |
-|   | -limit time 10 triggers controlled internal exit          | |
+|   | Child limit: IMAGE_LIMIT_TIME_SECS = 10 s                 | |
+|   | `-limit time 10` -> ImageMagick ends itself with a        | |
+|   | diagnostic                                                | |
 |   |                                                           | |
 |   |   +-----------------------------------------------------+ | |
-|   |   | Memory Quotas                                       | | |
-|   |   | -limit memory 256MiB -limit map 512MiB              | | |
-|   |   | -limit disk 1GiB                                    | | |
+|   |   | Resource quotas (`-limit`)                          | | |
+|   |   | width/height 16384 px, memory 256MiB, map 512MiB,   | | |
+|   |   | disk 1GiB                                           | | |
 |   |   +-----------------------------------------------------+ | |
 |   +-----------------------------------------------------------+ |
 +-----------------------------------------------------------------+
 ```
 
-### Compile-Time Timeout Assertion
-To guarantee that the child process's internal CPU limit fires before the parent's external SIGKILL watchdog, the codebase enforces an invariant at compile time:
+16384 px comfortably covers an 8K screenshot (7680x4320). The inner layers handle the cooperative case (a bomb is rejected with ImageMagick's own diagnostic); the outer watchdog handles a child that ignores its limits (blocked, deadlocked).
+
+### 6.1 Process-group kill
+
+The child starts as the leader of its own process group (`process_group(0)`). On timeout the watchdog SIGKILLs the **group**, which reaches any helper the child spawned. That matters beyond tidiness: a surviving grandchild would hold the stdout/stderr pipes open, the reader threads would never see EOF, and the pipeline would hang even after the "kill". The watchdog only signals while the child is unreaped, so the pid cannot name an unrelated process.
+
+### 6.2 Compile-time timeout assertion
+
+`IMAGE_LIMIT_TIME_SECS` is a string (it is handed to `magick` as an argument), so the assertion parses it in a `const fn` and fails the build on anything but a whole number of seconds below the outer budget:
 
 ```rust
+// crates/image/src/transcode.rs:L161
 const _: () = assert!(
-    IMAGE_LIMIT_TIME_SECS < IMAGE_TRANSCODE_TIMEOUT_SECS,
-    "internal ImageMagick CPU time limit must be strictly shorter than outer watchdog timeout"
+    parse_secs(IMAGE_LIMIT_TIME_SECS) >= 1 && parse_secs(IMAGE_LIMIT_TIME_SECS) < IMAGE_TRANSCODE_TIMEOUT_SECS,
+    "IMAGE_LIMIT_TIME_SECS must be a whole number of seconds below IMAGE_TRANSCODE_TIMEOUT_SECS",
 );
 ```
 
-This ensures that CPU-intensive operations yield structured diagnostic errors from the child helper before the parent is forced to tear down the process group via `SIGKILL`.
+> **Invariant — the child's own CPU limit always fires first.** A runaway conversion ends with the converter's structured diagnostic; only a child that ignores its limit meets the SIGKILL.
+
+### 6.3 Streaming without deadlock
+
+`run_filter_in_env` relays through three cooperating threads: one feeds the child's stdin in 64 KiB chunks, one drains stderr to EOF while keeping only the first 8 KiB (a chatty child can never block on a full stderr pipe), and the calling thread relays stdout into the output buffer. Each pipe always has a live peer, whatever order the child reads and writes in. A `BrokenPipe` on the feed is not an error (the child stopped reading); the exit status is the authoritative verdict. On any `Err` the output buffer may be partial and is discarded.
+
+The output `Vec` is reserved up front from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB), since every ingest conversion is compressing; outgrowing the hint is harmless.
 
 ---
 
-## 5. Concurrency Throttling & Self-Healing Circuit Breaker
+## 7. Concurrency Throttling & the Self-Healing Circuit Breaker
 
-### Bounded Concurrency
-Clipboard bursts (such as rapid repeated copy operations or automated clipboard flooding) can trigger concurrent transcoding processes. `y4p` bounds active transcode jobs using a bounded concurrency controller (`src/image/throttle.rs`), queuing or dropping excess transcode requests to prevent thread starvation and load spikes.
+### 7.1 Bounded concurrency (`throttle.rs`)
 
-### Self-Healing Circuit Breaker (`src/image/breaker.rs`)
-To protect against persistent system-level transcode failures (e.g. missing external dependencies, corrupted helper libraries, or persistent pipeline bugs), the pipeline incorporates a three-state circuit breaker:
+A burst of copied images (a held-down shortcut, a script injecting into the clipboard) would otherwise fork one `magick` per image. `ProcessThrottle` is a counting semaphore (`Mutex` + `Condvar`) admitting at most `IMAGE_CONCURRENCY_LIMIT = 2` conversions. A caller that finds every slot busy waits up to `IMAGE_THROTTLE_WAIT_MS = 1000`, then keeps the **original** bytes. Saturation is load, not a converter fault, so it never counts towards the breaker.
+
+### 7.2 Circuit breaker (`breaker.rs`)
+
+A converter that keeps failing (crashing, broken libraries, hanging) must not be re-spawned for every image: each attempt burns CPU and delays the save.
 
 ```text
-     +-----------------[ Success / Normal ]-----------------+
-     |                                                      |
-     v                                                      |
-+--------+         Consecutive Failures >= Threshold     +------+
-| Closed | --------------------------------------------> | Open |
-+--------+                                               +------+
-     ^                                                      |
-     |                     Cooldown Elapsed                 |
-     |                       (Probe Call)                   |
-     |                                                      v
-     +------------------ [ Success ] ----------------- +-----------+
-                                                       | Half-Open |
-                                                       +-----------+
-                                                            |
-                                        [ Failure ] --------+
+            IMAGE_BREAKER_THRESHOLD (3) consecutive faults
+   Closed ----------------------------------------------> Open (cooldown: 30 s)
+     ^                                                        |
+     |                                                        | cooldown elapsed
+     |  canary succeeds                                       v
+     +------------------------------------------------- Half-Open
+                                                    one canary conversion;
+                                       canary fails  ----->  back to Open
 ```
 
-- **Closed**: Normal operations. Transcodes are dispatched as standard.
-- **Open**: Consecutive transcode failures exceeded the threshold. Incoming transcode requests fail fast without spawning processes, protecting system resources.
-- **Half-Open**: Following a configurable cooldown window, a single probe transcode is permitted. If the probe succeeds, the breaker resets to `Closed`. If it fails, the cooldown timer restarts in `Open`.
-- **Fault-Isolation Exception**: Environmental errors originating from directory isolation (`ScratchDir` creation failure) are classified separately from transcode execution failures. Environmental faults do not penalise the circuit breaker's transcode health counter, eliminating false-positive circuit trips.
+- **Closed:** normal operation.
+- **Open:** conversion is skipped entirely; images are stored unmodified and no process is spawned.
+- **Half-Open:** exactly one canary attempt decides whether to resume.
+
+The breaker only does bookkeeping: the caller decides what counts as a fault. In `route.rs`:
+
+| Outcome | Breaker accounting |
+| :--- | :--- |
+| `Failed` (non-zero exit / signal), `Timeout`, `Child` I/O error | **Fault** |
+| `Ok` but the output is empty or has the wrong signature | **Fault** (a "success" producing no usable file) |
+| `Spawn` (`magick` missing) | Neutral: a static condition handled by the availability probe |
+| `Isolation` (no private scratch directory) | Neutral: a property of the host, not of the converter |
+| `Source` / `Sink` (the caller's own streams) | Neutral |
+| Throttle saturated | Neutral (permit released) |
+
+> **Invariant — environmental faults never trip the breaker.** Directory-isolation failures and missing tools are classified separately from transcode failures, eliminating false-positive circuit trips.
+
+A missing `magick` is reported once per process (`MSG_IMAGE_TOOL_MISSING`) and images are saved unmodified, metadata included.
 
 ---
 
-## 6. Zero-Copy Trajectory & Future Milestones
+## 8. Failure Semantics at a Glance
 
-Across the v0.5.x cycle, the image pipeline eliminated unnecessary reallocations across the transcode hot path:
-- Slice-based magic sniffing operates over borrowed immutable buffers ($O(1)$ allocation).
-- Intermediate scratch files are piped directly through OS file descriptors without redundant user-space vector copying.
+| Situation | Result stored | Process spawned? |
+| :--- | :--- | :--- |
+| Text, HTML, uri-list, SVG, AVIF, GIF, WebP | original | no |
+| Empty payload | original | no |
+| Breaker open | original | no |
+| Throttle wait expired | original | no |
+| `magick` missing / no private scratch directory | original (one warning) | no |
+| Corrupt or over-limit image | original | yes, then discarded |
+| Conversion exceeds 15 s | original | yes, group killed |
+| Converted output invalid | original | yes, then discarded |
+| Success | converted WebP; hash covers the converted bytes | yes |
 
-This design establishes the architectural foundation for subsequent milestones:
-- **v0.6.x (The Great Modularization)**: Physical crate decoupling of `y4p-core`, `y4p-wayland`, `y4p-storage`, and `y4p-image`.
-- **v0.7.x (The Zero-Copy Zenith)**: Transitioning pipe and file staging directly to Linux `splice(2)` and `memfd_create(2)` primitives, eliminating user-space buffering entirely.
+In every row the fingerprint is computed over what is stored, so deduplication stays consistent whether or not conversion happened. A deterministic conversion also means the same image copied twice yields the same fingerprint.
+
+---
+
+## 9. Zero-Copy Trajectory
+
+The chunked `Read`/`Write` relay is the working implementation. `pipeline.rs` already carries a `splice(2)` primitive (`try_splice` / `splice_all`) with a capability-aware fallback, deliberately not wired into the converter path yet; the `Read`/`Write` boundary is the seam where it can replace the chunked copy without changing any caller.
+
+The v0.6.x cycle (The Great Modularization) physically decoupled `y4p-core`, `y4p-storage`, `y4p-image`, `y4p-wayland`, `y4p-daemon` and `y4p-cli`, and in v0.6.7 moved conversion and hashing out of the Wayland sensor into the daemon worker.
+
+**Deferred beyond v0.7.0:** Zero-Copy Stage 2 (Buffer Lifecycle Unification: aligning buffer lifetimes and descriptor passing across crate boundaries), including a descriptor-to-descriptor path from the compositor pipe to the converter. It is out of scope for the v0.7.0 release.

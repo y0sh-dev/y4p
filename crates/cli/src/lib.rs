@@ -4,7 +4,7 @@
 // crates/cli/src/lib.rs
 
 // `cli` is the CLI entry point: exiting with a clear error/exit code on an
-// unrecoverable input is the correct behavior here, unlike the resident
+// unrecoverable input is the correct behaviour here, unlike the resident
 // daemon/storage/wayland layers this crate otherwise denies unwrap/expect/
 // panic in (see [lints.clippy] in Cargo.toml).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -46,7 +46,7 @@ pub enum CliAction {
     PasteFrom(String),
 }
 
-/// Central command dispatcher. Standardized to use mutable references for database
+/// Central command dispatcher. Standardised to use mutable references for database
 /// operations to prevent ownership move conflicts across match arms.
 pub fn handle_command(args: &[String], mut db: ClipboardDb) -> CliAction {
     // 1. Intercept global flags and help requests early

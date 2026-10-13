@@ -19,7 +19,7 @@ pub struct OfferData {
 /// Where a `SourceMetadata`'s bytes actually live.
 ///
 /// Added for kernel-level egress (PERFORMANCE.md "Next Frontier"): before
-/// this, `SourceMetadata` always held a fully-materialized `Vec<u8>`, even
+/// this, `SourceMetadata` always held a fully-materialised `Vec<u8>`, even
 /// for large cached binaries (images) -- meaning a `copy-to` of a 70MB image
 /// read the whole file into memory in `get_content_by_id`, then the old
 /// `source.rs` Send handler unconditionally `.clone()`d it again before

@@ -17,7 +17,7 @@ use crate::core::constants::*;
 
 /// Evaluates if the requested MIME type is compatible with the target type.
 /// Supports category-level matching for the text group. Both sides are
-/// compared via their normalized base type (case- and whitespace-
+/// compared via their normalised base type (case- and whitespace-
 /// insensitive, parameters stripped — see `core::utils::mime_base`), so
 /// `TEXT/PLAIN`, `text/plain; charset=utf-8` and `text/plain;charset=UTF-8`
 /// are all treated identically. Zero allocations throughout.

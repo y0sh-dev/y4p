@@ -153,7 +153,7 @@ pub const MIME_URI_LIST: &str = "text/uri-list";
 //
 // Plain text ranks above rich markup: Electron/Chromium apps (Discord,
 // Slack, ...) routinely announce text/html alongside text/plain even for a
-// plain-text selection, but only serialize actual HTML on request — a
+// plain-text selection, but only serialise actual HTML on request — a
 // non-rich selection gets an empty payload for text/html, which used to
 // make ingestion discard the whole clipboard event (see device.rs's
 // `if payload.is_empty()` check). Plain text is present whenever anything

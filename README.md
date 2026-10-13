@@ -8,12 +8,14 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)](https://wayland.freedesktop.org)
-[![Version](https://img.shields.io/badge/version-0.6.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.6.9-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` is a standalone clipboard manager, built natively for Wayland.
 
 It runs as a single daemon — no separate monitor process, no separate provider process — that watches the clipboard, serves history back out, and persists everything to disk.
-Engineered with strict zero-loss integrity and defense-in-depth resource controls, it seamlessly handles text streams, binary payloads, and high-resolution images with deterministic performance.
+Engineered with strict zero-loss integrity and defence-in-depth resource controls, it seamlessly handles text streams, binary payloads, and high-resolution images with deterministic performance.
+
+[日本語版 README](README_ja.md)
 
 </div>
 
@@ -33,8 +35,8 @@ Engineered with strict zero-loss integrity and defense-in-depth resource control
 - **Hybrid Storage**: Fast, searchable SQLite engine for text metadata paired with content-addressed filesystem caching for binary blobs.
 - **Script-First CLI**: Deterministic command interface with immutable entry IDs and strict argument parsing for shell pipeline integration (`fzf`, `rofi`).
 - **Zero-Loss Integrity**: Pinned entries are strictly immune to ring buffer rotation; zero schema corruption across migrations.
-- **Local Image Pipeline**: Bounded concurrency transcode engine with isolated scratch directories, timeout watchdogs, and memory limits.
-- **Robust & Dependency-Free**: Panic-free execution path with zero third-party dependencies outside the Rust standard library and SQLite.
+- **Local Image Pipeline**: Privacy-stripping image transcoding with isolated scratch directories, a process-group timeout watchdog, resource limits, bounded concurrency and a self-healing circuit breaker.
+- **Robust by Construction**: Panic-free execution path (`unwrap`, `expect` and `panic!` are denied workspace-wide by lints) and a deliberately small, pinned dependency set.
 
 ---
 
@@ -93,13 +95,13 @@ y4p help
 <summary><strong>Verification & Tests</strong></summary>
 
 ```bash
-# Run unit and integration tests
-cargo test
+# Run unit tests across every workspace crate
+cargo test --workspace
 
 # Strict linter checks
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Full automated verification suite
+# Full automated verification suite (both of the above)
 bash scripts/check.sh
 ```
 
@@ -122,10 +124,40 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 ---
 
+## Architecture at a Glance
+
+`y4p` is a Cargo workspace. The root package is a thin composition root (`src/main.rs`); every domain lives in its own crate, and dependencies flow strictly inward towards `y4p-core`.
+
+| Crate | Responsibility |
+| :--- | :--- |
+| [`crates/core`](crates/core) (`y4p-core`) | Constants, XDG paths, `y4p.toml` parser, MIME helpers, exit flag |
+| [`crates/storage`](crates/storage) (`y4p-storage`) | SQLite store, schema migrations, filesystem blob cache |
+| [`crates/image`](crates/image) (`y4p-image`) | Image sniffing, sandboxed transcoding, circuit breaker, throttle |
+| [`crates/wayland`](crates/wayland) (`y4p-wayland`) | `ext-data-control-v1` handlers and streaming clipboard I/O |
+| [`crates/daemon`](crates/daemon) (`y4p-daemon`) | Event loop, IPC socket, background worker (image routing, hashing, persistence) |
+| [`crates/cli`](crates/cli) (`y4p-cli`) | Strict argument parsing, command handlers, output formatting |
+
+---
+
 ## Documentation
 
-- [`docs/00_overview.md`](docs/00_overview.md) — Architectural overview, single-threaded I/O multiplexing, and ring buffer invariants.
-- [`docs/AI_POLICY.md`](docs/AI_POLICY.md) — Shared policies and guidelines on Generative AI (LLMs) usage.
+The `docs/` directory contains the technical architecture documents. Start with the overview; each other file is a self-contained theme.
+
+| Document | Theme |
+| :--- | :--- |
+| [`00_overview.md`](docs/00_overview.md) | Workspace topology, crate responsibilities, dependency direction, the ingestion stream contract |
+| [`01_wayland_streaming_io.md`](docs/01_wayland_streaming_io.md) | Single-thread I/O multiplexing, bounded reads, `provider_locks`, zero-copy `sendfile(2)` egress |
+| [`02_hybrid_storage_and_pin.md`](docs/02_hybrid_storage_and_pin.md) | SQLite / cache bifurcation, idempotent migrations, absolute pin protection |
+| [`03_concurrency_and_memory.md`](docs/03_concurrency_and_memory.md) | Single-writer worker, WAL concurrency, `open_read_only`, payload memory lifecycle |
+| [`04_strict_cli_and_stable_id.md`](docs/04_strict_cli_and_stable_id.md) | MRU vs stable ID coordinate spaces, correlated-subquery search, the `--raw` contract |
+| [`05_filter_pipeline_and_app_rules.md`](docs/05_filter_pipeline_and_app_rules.md) | Ingress gate and MIME selection, dynamic egress, `y4p.toml` |
+| [`06_local_image_pipeline.md`](docs/06_local_image_pipeline.md) | Magic sniffing, scratch sandbox, hierarchical timeouts, circuit breaker |
+
+Project governance and planning:
+
+- [`.github/AI_POLICY.md`](.github/AI_POLICY.md) — Shared policies and guidelines on Generative AI (LLMs) usage.
+- [`ROADMAP_MODULARIZATION.md`](ROADMAP_MODULARIZATION.md) — The v0.6.x workspace modularisation roadmap.
+- [`README_ja.md`](README_ja.md) — Japanese README (日本語版).
 
 ---
 

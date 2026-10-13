@@ -22,7 +22,7 @@ fn strip_file_scheme(line: &[u8]) -> &[u8] {
     }
 }
 
-/// Normalizes a raw `text/uri-list` payload (RFC 2483) into a plain,
+/// Normalises a raw `text/uri-list` payload (RFC 2483) into a plain,
 /// newline-joined list of filesystem paths: comment/blank lines dropped,
 /// the `file:` scheme (and Authority) stripped, percent-decoded.
 ///
@@ -218,7 +218,7 @@ mod tests {
         // The naive </> toggle has no notion of quoted attribute values, so
         // a literal '<' inside one (invalid HTML, but real-world markup
         // isn't always well-formed) still opens tag-mode early — the
-        // deterministic, documented behavior rather than a full HTML parse.
+        // deterministic, documented behaviour rather than a full HTML parse.
         let input = br#"<span title="a < b">text</span>"#;
         assert_eq!(strip_html_tags(input), b"text");
     }

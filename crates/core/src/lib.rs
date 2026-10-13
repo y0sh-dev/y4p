@@ -30,7 +30,7 @@ pub fn get_max_history() -> usize {
         .unwrap_or_else(|| config::Config::load().general.max_history)
 }
 
-/// Securely resolve and initialize the database path following XDG Data Home specs.
+/// Securely resolve and initialise the database path following XDG Data Home specs.
 /// Returns PathBuf to ensure platform-native path encoding stability.
 pub fn get_db_path() -> PathBuf {
     let mut path = if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {

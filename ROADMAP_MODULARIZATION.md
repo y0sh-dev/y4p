@@ -38,9 +38,9 @@ y4p/ (Project Root)
 
 ### Invariants:
 1. **Root Binary Compatibility**: `src/main.rs` remains at the root level as a thin wiring entrypoint. Standard CLI commands (`cargo run`, `cargo build --release`, `y4p <cmd>`) retain 100% operational compatibility.
-2. **Crate Autonomy**: Each workspace member under `crates/` maintains its own `Cargo.toml`, internal `src/lib.rs`, and isolated `tests/`.
+2. **Crate Autonomy**: Each workspace member under `crates/` maintains its own `Cargo.toml` and internal `src/lib.rs`. Unit tests remain inline (`#[cfg(test)]`) so that crate internals stay private; an external `tests/` directory was considered and cancelled (see v0.6.8).
 3. **Strict Inward Dependency Flow**: Crate dependencies strictly flow inward towards `core`. Circular dependencies are physically prohibited at the compiler level.
-4. **Zero Panic Guarantee**: All crates retain `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`.
+4. **Zero Panic Guarantee**: `clippy::unwrap_used`, `clippy::expect_used` and `clippy::panic` are denied once in `[workspace.lints.clippy]`, which every member inherits with `[lints] workspace = true`. Test code and the CLI entry crate carve out their own `allow` overrides.
 
 ---
 
@@ -79,12 +79,15 @@ Visual progress checklist across the modularization development cycle:
   - Image routing and SHA3-256 fingerprinting moved into the `y4p-daemon` worker (`process_job`), together with the 7 ingestion tests.
   - *Not performed in this milestone:* relocating inline unit tests to dedicated `tests/` directories (originally planned here; placement pending confirmation with the human supervisor).
 
-- [ ] **v0.6.8: Pre-Distillation Hardening & Feature Polish**
-  - System-wide regression hardening / reserved slot for future capability insertion.
-  - Zero-Copy Preparation Stage 2 (Buffer Lifecycle Unification), carried over from the former v0.6.7: align buffer lifetimes and descriptor passing mechanisms across crate boundaries. *(Placement pending confirmation with the human supervisor.)*
+- [x] **v0.6.8: Pre-Distillation Architecture Review & Fast-Track Resolution**
+  - *Test Encapsulation Resolution:* Retained inline unit tests (`#[cfg(test)]`) to uphold strict crate encapsulation and zero-panic library guarantees, avoiding synthetic visibility escalations (`#[doc(hidden)] pub`). Dedicated `tests/` targets remain reserved for public contract validation.
+  - *Zero-Copy Trajectory:* Preparation Stage 2 (cross-crate descriptor passing and buffer lifecycle unification) is scheduled for the dedicated post-v0.7.0 cycle (v0.8.x) to protect release stability and avoid high-risk I/O changes immediately prior to major release.
+  - *Fast-Track to Release:* Per protocol §6.2, concluded remaining roadmap objectives and advanced directly to documentation distillation and workspace freeze (v0.6.9).
 
-- [ ] **v0.6.9: Documentation Distillation & Workspace Architecture Freeze**
-  - Distil workspace layout, crate dependencies, and architecture invariants into `docs/`.
+- [x] **v0.6.9: Documentation Distillation & Workspace Architecture Freeze**
+  - Distil workspace layout, crate dependencies, and architecture invariants into `docs/` (`00` through `06`), synchronised with the `crates/*` layout and the v0.6.7 stream contract (`ClipboardJob { mime, data }` from `y4p-wayland` to the `y4p-daemon` worker).
+  - Unify the documentation layout (numbered sections, boundary diagrams, invariant blocks, concise tables).
+  - Relocate `docs/AI_POLICY.md` to `.github/AI_POLICY.md` and `docs/README_ja.md` to the project root as `README_ja.md`.
   - Prepare for `v0.7.0` release branch.
 
 - [ ] **v0.7.0: Official Major Release: The Great Modularization**

@@ -46,7 +46,7 @@ impl Dispatch<ExtDataControlSourceV1, SourceMetadata> for WaylandState {
                                 send_via_sendfile(&path, fd);
                             });
                         }
-                        // S-07: uri-list is normalized to plain paths at ingest
+                        // S-07: uri-list is normalised to plain paths at ingest
                         // (see core::utils::normalize_uri_list), so the
                         // per-offer file:// rewrite this used to do on egress
                         // is no longer needed — every consumer gets the same

@@ -8,7 +8,7 @@ use crate::core::constants::*;
 use crate::utils::ArgContext;
 use std::io::{self, Read, Write};
 
-/// Ingest data from stdin, persist to database, and synchronize to system clipboard.
+/// Ingest data from stdin, persist to database, and synchronise to system clipboard.
 pub fn run(args: &[String], db: &mut ClipboardDb) {
     let ctx = ArgContext::parse(args);
 
@@ -58,7 +58,7 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
                 println!("{}", log_save(mime, buffer.len()));
             }
 
-            // IPC: Notify the running daemon to synchronize this new ID
+            // IPC: Notify the running daemon to synchronise this new ID
             use std::os::unix::net::UnixStream;
             if let Ok(mut stream) = UnixStream::connect(crate::core::get_socket_path()) {
                 let mut payload = vec![IPC_CMD_RESTORE];
@@ -75,7 +75,7 @@ pub fn run(args: &[String], db: &mut ClipboardDb) {
         Ok(_) => {
             // Sentinel -1: insert_raw deliberately skipped storage (e.g. a
             // sensitive MIME hint). Nothing was persisted, so there is
-            // nothing to synchronize back to the daemon.
+            // nothing to synchronise back to the daemon.
             if ctx.verbose {
                 println!("{}payload skipped by storage policy; not synchronized.", LOG_INFO);
             }
