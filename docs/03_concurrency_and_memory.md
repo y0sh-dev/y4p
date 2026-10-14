@@ -13,9 +13,9 @@ SQLite allows exactly one writer at a time. A second connection that tries to wr
 `y4p` avoids the problem structurally rather than defensively: only one thread in the process ever holds a write connection.
 
 ```rust
-// crates/daemon/src/worker.rs:L26-L45
+// crates/daemon/src/worker.rs:L30-L49
 pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
-    let (tx, rx) = mpsc::channel::<ClipboardJob>();
+    let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
 
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
@@ -31,18 +31,18 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
 }
 ```
 
-`ClipboardDb` moves *into* the spawned thread and is never shared. Rust's ownership model turns "only this thread can write" into a compile-time fact rather than a convention someone must remember at each call site. Every other part of the daemon that wants something persisted builds a `ClipboardJob` and sends it down a cloned `mpsc::Sender`.
+`ClipboardDb` moves *into* the spawned thread and is never shared. Rust's ownership model turns "only this thread can write" into a compile-time fact rather than a convention someone must remember at each call site. Every other part of the daemon that wants something persisted builds a `ClipboardJob` and offers it to a cloned `mpsc::SyncSender` (bounded; see section 2.1).
 
 > **Invariant — the channel is the only coupling between "something happened on the clipboard" and "something was written to disk".** There is nothing on the other side of it to conflict with, so it cannot produce a lock conflict.
 
 ```text
    Wayland Selection event
         |
-        v  (per-selection thread: bounded read + normalise)
+        v  (per-selection thread, at most 8: bounded read + normalise)
    ClipboardJob { mime, data }
         |
         v
-   mpsc channel  -->  DbWorker thread  -->  SQLite (single writer, WAL)
+   bounded channel (64)  -->  DbWorker thread  -->  SQLite (single writer, WAL)
         |                 |                         ^
         |                 +- process_job:           | readers never block the writer
         |                    image route, SHA3-256  |
@@ -54,7 +54,7 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
 
 ## 2. What the Worker Does Besides Writing (v0.6.7)
 
-Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L67`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
+Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L71`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
 
 ```text
    ClipboardJob { mime, data }
@@ -76,7 +76,39 @@ Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`w
 | Conversion runs on the worker | The wayland ingestion thread never spawns `magick` or hashes; the cost is that a slow conversion delays the jobs queued behind it |
 | Conversion is bounded | Timeout, process throttle and circuit breaker cap how long and how often ([06](06_local_image_pipeline.md)) |
 
-> **Known trade-off — the queue has no back-pressure.** `mpsc::channel` is unbounded. Queued jobs hold their payloads (up to `MAX_PAYLOAD_BYTES` each) until the worker reaches them, so a burst of large copies behind a slow conversion grows memory until the worker catches up. In practice the selection rate and the conversion bounds keep this small; it is documented here because it is a property of the design, not an accident.
+### 2.1 Bounded Queue, Backpressure and Load Shedding (v0.7.1)
+
+Because conversion runs on the worker, a slow image delays every job behind it. The queue therefore has two bounds, applied in this order ([`crates/wayland/src/ingest.rs`](../crates/wayland/src/ingest.rs)):
+
+```text
+   Selection event
+        |
+        v
+   ReaderGate::try_acquire()  --- full (8 readers) ---> shed (counted), NO pipe, NO thread
+        |  permit
+        v
+   make_pipe()  ->  reader thread: bounded read + normalise
+        |
+        v
+   enqueue(): try_send into the sync_channel(64), polling every 5 ms for up to 2 s
+        |                         |
+      queued                    still full after 2 s
+        |                         |
+   permit released           shed (counted), payload dropped, permit released
+```
+
+| Mechanism | Constant | Effect |
+| :--- | :--- | :--- |
+| Reader gate | `INGEST_MAX_CONCURRENT_READERS` = 8 | Checked **before** the pipe is created, so a burst of selections can neither exhaust file descriptors (`EMFILE`) nor threads. A refused selection costs one atomic compare-and-swap |
+| Bounded channel | `INGEST_QUEUE_CAPACITY` = 64 | `sync_channel`; a full queue hands the job back (`TrySendError::Full`), so retrying never clones the payload |
+| Patience | `INGEST_ENQUEUE_WAIT_MS` = 2000 | A reader whose queue is full waits **while keeping its gate permit**: this is the backpressure, because it makes new selections hit the gate instead of piling payloads up in memory |
+| Shedding | counters `shed_readers`, `shed_queue` | Once patience is spent the payload is dropped. Totals appear in `y4p status` and the first, second, fourth, eighth, ... shed is logged |
+
+> **Invariant — overload loses the newest copy, never the queued ones and never the event loop.** Waiting happens on the reader's own thread; the Wayland poll loop only ever performs the gate's compare-and-swap. A shed is always counted and surfaced; a worker that has gone away is *not* counted as shedding. A thread that cannot be spawned (`Builder::spawn` returns an error instead of panicking) is also shed, and dropping its closure frees the pipe and the permit.
+
+Why drop the newest rather than evict the oldest: `std` offers no way to remove from the middle of a channel, and keeping queued work intact preserves arrival order, which the worker guarantees.
+
+> **Known trade-off — the bound is a count, not a byte budget.** 64 queued payloads of 256 MiB would still be 16 GiB; the measured and worst-case figures, and the proposed byte budget, are in [`PERFORMANCE.md`](../PERFORMANCE.md) section 4.
 
 ---
 
@@ -127,7 +159,7 @@ A long-lived process must not retain what it no longer needs. A payload's buffer
 | :--- | :--- | :--- |
 | 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized |
 | 2. Normalise | same thread | `text/uri-list` produces one new `Vec`; everything else is moved, not copied |
-| 3. Hand-off | `mpsc` channel | The `ClipboardJob` is **moved**; the bytes are never cloned |
+| 3. Hand-off | bounded channel | The `ClipboardJob` is **moved**; the bytes are never cloned. A full queue sheds instead of growing (section 2.1) |
 | 4. Route | `DbWorker` | Text and unsupported types: moved straight through. Images: output buffer pre-sized from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB) to avoid repeated doubling; on success the original `Vec` is dropped |
 | 5. Persist | `DbWorker` | `insert_with_hash` borrows `&data`; text is bound as `&str` with no copy |
 | 6. Reclaim | `DbWorker` | `mime`, `data`, `hash` drop at the end of the loop iteration |
@@ -142,7 +174,7 @@ During a conversion the original and the converted image coexist briefly (the pe
 
 ## 6. Lock-Free Counters and Exit Coordination
 
-**Metrics.** `DaemonMetrics` ([`crates/daemon/src/metrics.rs`](../crates/daemon/src/metrics.rs)) holds `AtomicU64` ingress/egress counters and an `AtomicI64` last-event timestamp, written with `Ordering::Relaxed` from the worker and read from the event loop when IPC `Status` arrives. No mutex anywhere in the type: the counters are independent statistics, so no ordering between them is required.
+**Metrics.** `DaemonMetrics` ([`crates/daemon/src/metrics.rs`](../crates/daemon/src/metrics.rs)) holds `AtomicU64` ingress/egress counters and an `AtomicI64` last-event timestamp, written with `Ordering::Relaxed` from the worker and read from the event loop when IPC `Status` arrives. No mutex anywhere in the type: the counters are independent statistics, so no ordering between them is required. The status line also carries `shed_readers=` and `shed_queue=`, the overload totals of [section 2.1](#21-bounded-queue-backpressure-and-load-shedding-v071), owned by `y4p-wayland` (`IngestStats`) and passed in by the event loop because the daemon's metrics type cannot see the sensor layer's state.
 
 **Exit.** `SIG_EXIT` is a single `AtomicBool` in `y4p-core` shared by `main.rs`'s `ctrlc` handler and the daemon loop. The handler only sets the flag (a second Ctrl+C force-exits with status 1). The loop re-checks `is_exiting()` at least every 500 ms because of its `poll` timeout, so no socket round-trip is needed to wake it. A non-daemon invocation exits with status 130 on SIGINT and never touches the daemon's socket.
 

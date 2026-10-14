@@ -42,6 +42,32 @@ pub const SOCKET_FILE_NAME: &str = "y4p.sock";
 // and persisted as corrupt data.
 pub const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
+// --- Ingestion Backpressure & Concurrency Bounds ---
+// Capacity of the bounded channel between the Wayland ingestion threads and
+// the database worker. A count, not a byte budget: the worst-case resident
+// payload memory is (INGEST_QUEUE_CAPACITY + INGEST_MAX_CONCURRENT_READERS)
+// * MAX_PAYLOAD_BYTES, reached only if every slot holds a maximal payload.
+pub const INGEST_QUEUE_CAPACITY: usize = 64;
+// Simultaneous ingestion readers (one thread, one pipe read end and one
+// payload buffer each). Checked *before* the pipe is allocated, so a burst of
+// selection changes can neither exhaust file descriptors (`EMFILE`) nor spawn
+// an unbounded number of threads.
+pub const INGEST_MAX_CONCURRENT_READERS: usize = 8;
+// How long a reader waits for room in a full queue before its payload is shed.
+// The worker may be busy with a slow image conversion (bounded by
+// IMAGE_TRANSCODE_TIMEOUT_SECS), so this is a patience budget, not a deadline
+// for the worker.
+pub const INGEST_ENQUEUE_WAIT_MS: u64 = 2000;
+// Polling interval while waiting for queue room (`std` offers no timed send).
+pub const INGEST_ENQUEUE_POLL_MS: u64 = 5;
+// A zero-capacity `sync_channel` is a rendezvous channel: `try_send` succeeds
+// only while the worker is already blocked in `recv`, so nearly every payload
+// would be shed. A zero reader limit would admit nobody. Both are build errors.
+const _: () = assert!(
+    INGEST_QUEUE_CAPACITY >= 1 && INGEST_MAX_CONCURRENT_READERS >= 1,
+    "the ingestion bounds must admit at least one reader and one queued payload",
+);
+
 // --- Local Image Pipeline ---
 // External converter executable, resolved through `PATH` (ImageMagick 7).
 pub const MAGICK_PROGRAM: &str = "magick";
@@ -256,6 +282,12 @@ pub fn log_image_scratch_unavailable(reason: &str) -> String {
 
 pub fn log_image_throttled(wait_ms: u64) -> String {
     format!("{}image converter saturated for {}ms; image saved unmodified", LOG_WARN, wait_ms)
+}
+
+/// Logged for the 1st, 2nd, 4th, 8th, ... shed, so a sustained overload does
+/// not flood the log while the first occurrence is never silent.
+pub fn log_ingest_shed(reason: &str, total: u64) -> String {
+    format!("{}ingestion overloaded ({}); clipboard payload dropped (total shed: {})", LOG_WARN, reason, total)
 }
 
 pub fn log_save(mime: &str, size: usize) -> String {

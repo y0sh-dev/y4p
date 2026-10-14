@@ -17,7 +17,8 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              |
              v
  [Stage 1: Gate]  --------------------> sensitive hint? self-restore? paused?  -> discard silently
-             |                          (checked before any pipe is opened)
+             |                          reader limit (8) reached?                 -> shed, counted
+             |                          (all checked before any pipe is opened)
              v
  [Stage 2: MIME Priority & Filtering]
              |-- drop RTF if [mime] drop_rtf is enabled
@@ -32,7 +33,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              |
              v
  [Stage 5: Forward]
-             \-- mpsc::Sender<ClipboardJob { mime, data }>
+             \-- bounded SyncSender<ClipboardJob { mime, data }>  (queue full for 2 s -> shed, counted)
   ===========================================================  crate boundary: wayland | daemon
              |
              v
@@ -61,14 +62,14 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 
 ### 1.2 Stage 2: MIME selection
 
-`select_mime` ([`crates/wayland/src/handlers/data_control/device.rs:L106`](../crates/wayland/src/handlers/data_control/device.rs)):
+`select_mime` ([`crates/wayland/src/handlers/data_control/device.rs:L134`](../crates/wayland/src/handlers/data_control/device.rs)):
 
 | Mode | `target_mime` | Rule |
 | :--- | :--- | :--- |
 | Action Mode (`y4p paste-from <mime>`) | `Some` | The offer matching by `mime_base_eq` (case, whitespace and parameters ignored). `drop_rtf` is **not** consulted: an explicit request is honoured, RTF included |
 | Daemon ingestion | `None` | First hit in `MIME_PRIORITY_ORDER`, else any `image/*`, else any `text/*`, else anything. `drop_rtf` is applied at **every** step, so RTF is never selected when enabled, even as the last-resort catch-all |
 
-`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L156`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
+`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L182`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
 
 ### 1.3 Why the order matters
 

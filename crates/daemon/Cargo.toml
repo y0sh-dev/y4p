@@ -18,6 +18,13 @@ libc.workspace = true
 # Payload fingerprints; must agree with the storage layer's digest.
 sha3.workspace = true
 
+# Std-only baseline harness (`cargo bench -p y4p-daemon --bench baseline`); it
+# lives here because the daemon is the one crate that sees every ingestion
+# stage. `harness = false`: no benchmarking crate is used.
+[[bench]]
+name = "baseline"
+harness = false
+
 # Panic-free policy (`unwrap_used`/`expect_used`/`panic` = deny, plus the
 # unsafe-documentation and clone lints) is defined once in the workspace root
 # and inherited here; see `[workspace.lints.clippy]` in the root manifest.

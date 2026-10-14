@@ -7,7 +7,7 @@
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)](https://wayland.freedesktop.org)
+[![Platform](https://img.shields.io/badge/platform-Wayland-lightgreen.svg)](https://wayland.freedesktop.org)
 [![Version](https://img.shields.io/badge/version-0.7.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` は、Wayland向けにネイティブ設計された、スタンドアロンのクリップボードマネージャーです。
@@ -164,7 +164,8 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 プロジェクトの運営に関する文書:
 
 - [`.github/AI_POLICY.md`](.github/AI_POLICY.md) — 生成AI（LLM）の利用に関する方針（英語）。
-- [`ROADMAP_MODULARIZATION.md`](ROADMAP_MODULARIZATION.md) — v0.6.xのワークスペース分割ロードマップ（英語）。
+- [`PERFORMANCE.md`](PERFORMANCE.md) — 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
+- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md) — v0.8.0 へ向かう v0.7.x ゼロコピーのロードマップ（英語）。
 - [`README.md`](README.md) — 英語版README。
 
 ---
