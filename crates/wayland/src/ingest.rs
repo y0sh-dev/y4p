@@ -44,10 +44,21 @@ impl ReaderGate {
     /// Admits one more reader, or `None` when `limit` readers already exist.
     /// The returned permit frees its slot when dropped, on every exit path.
     pub fn try_acquire(self: &Arc<Self>) -> Option<ReaderPermit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.limit).then_some(n + 1))
-            .ok()
-            .map(|_| ReaderPermit { gate: Arc::clone(self) })
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ReaderPermit { gate: Arc::clone(self) }),
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub fn active(&self) -> usize {
