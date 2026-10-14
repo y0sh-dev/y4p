@@ -7,7 +7,7 @@
 
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Wayland-lightgerm.svg)](https://wayland.freedesktop.org)
+[![Platform](https://img.shields.io/badge/platform-Wayland-lightgreen.svg)](https://wayland.freedesktop.org)
 [![Version](https://img.shields.io/badge/version-0.7.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` is a standalone clipboard manager, built natively for Wayland.
@@ -156,7 +156,8 @@ The `docs/` directory contains the technical architecture documents. Start with 
 Project governance and planning:
 
 - [`.github/AI_POLICY.md`](.github/AI_POLICY.md) — Shared policies and guidelines on Generative AI (LLMs) usage.
-- [`ROADMAP_MODULARIZATION.md`](ROADMAP_MODULARIZATION.md) — The v0.6.x workspace modularisation roadmap.
+- [`PERFORMANCE.md`](PERFORMANCE.md) — Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
+- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md) — The v0.7.x zero-copy roadmap towards v0.8.0.
 - [`README_ja.md`](README_ja.md) — Japanese README (日本語版).
 
 ---
