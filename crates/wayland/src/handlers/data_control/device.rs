@@ -10,8 +10,11 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 use std::io::Read;
 use std::os::fd::AsFd;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use crate::state::{WaylandState, OfferData, ClipboardJob};
+use crate::ingest::{self, Enqueue, IngestStats, ReaderPermit};
 use crate::core::constants::*;
 use super::{make_pipe, is_sensitive};
 
@@ -50,6 +53,22 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             let drop_rtf = state.config.should_drop_rtf();
             let Some(mime_to_get) = select_mime(&mimes, state.target_mime.as_deref(), drop_rtf) else { return; };
 
+            // Daemon mode only: admit this reader *before* any descriptor is
+            // allocated. A refusal costs nothing and cannot hit `EMFILE`;
+            // the permit then lives until the payload has been queued.
+            let permit = if state.job_tx.is_some() {
+                match state.reader_gate.try_acquire() {
+                    Some(permit) => Some(permit),
+                    None => {
+                        let total = state.ingest_stats.record_shed_reader();
+                        ingest::report_shed("too many concurrent readers", total);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
             // Initialise data transfer pipe
             let (read_file, write_fd) = match make_pipe() {
                 Some(p) => p,
@@ -64,9 +83,18 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             // Offload ingestion and persistence to the worker thread
             if let Some(ref tx) = state.job_tx {
                 let job_tx_clone = tx.clone();
-                std::thread::spawn(move || {
-                    ingest_and_send(read_file, mime_to_get, &job_tx_clone);
+                let stats = Arc::clone(&state.ingest_stats);
+                let enqueue_wait = Duration::from_millis(INGEST_ENQUEUE_WAIT_MS);
+                // `Builder::spawn` reports a refused thread instead of
+                // panicking like `thread::spawn`; the closure (and with it the
+                // pipe and the permit) is then dropped, which frees everything.
+                let spawned = std::thread::Builder::new().name("y4p-ingest".to_owned()).spawn(move || {
+                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, permit, enqueue_wait);
                 });
+                if spawned.is_err() {
+                    let total = state.ingest_stats.record_shed_reader();
+                    ingest::report_shed("could not start a reader thread", total);
+                }
             } else {
                 // Action Mode: synchronous read for immediate CLI processing.
                 // Applies the same boundary guard and normalisation as the
@@ -124,11 +152,25 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
 /// dedicated per-selection thread the handler spawns. This layer only drains
 /// the pipe and normalises: image transcoding and fingerprinting are the
 /// worker's concern, so this thread never spawns `magick` or hashes anything.
-fn ingest_and_send(read_file: std::fs::File, mime_to_get: String, job_tx: &mpsc::Sender<ClipboardJob>) {
+///
+/// `_permit` is held until the payload is queued or shed, so a full queue
+/// keeps its readers' gate slots occupied: that is the backpressure which
+/// makes new selections get refused instead of piling up payloads in memory.
+fn ingest_and_send(
+    read_file: std::fs::File,
+    mime_to_get: String,
+    job_tx: &SyncSender<ClipboardJob>,
+    stats: &IngestStats,
+    _permit: Option<ReaderPermit>,
+    enqueue_wait: Duration,
+) {
     let Some(payload) = read_bounded_payload(read_file, MAX_PAYLOAD_BYTES) else { return; };
     let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
 
-    let _ = job_tx.send(ClipboardJob { mime, data });
+    if ingest::enqueue(job_tx, ClipboardJob { mime, data }, enqueue_wait) == Enqueue::Shed {
+        let total = stats.record_shed_queue();
+        ingest::report_shed("worker queue full", total);
+    }
 }
 
 /// Reads at most `limit` bytes from an already-`offer.receive()`d pipe.
@@ -193,6 +235,114 @@ mod tests {
 
     fn mimes(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- ingest_and_send: bounded hand-off, shedding and permit lifetime ---
+
+    use crate::ingest::ReaderGate;
+    use std::io::Write;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Instant;
+
+    /// A pipe whose write end already carries `bytes` and is closed, so the
+    /// read end yields exactly them and then EOF (what a finished transfer looks like).
+    fn filled_pipe(bytes: &[u8]) -> std::fs::File {
+        let (read_file, write_fd) = make_pipe().unwrap();
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(bytes).unwrap();
+        read_file
+    }
+
+    fn gate_with_one_permit() -> (Arc<ReaderGate>, Option<ReaderPermit>) {
+        let gate = Arc::new(ReaderGate::new(1));
+        let permit = gate.try_acquire();
+        assert!(permit.is_some());
+        assert_eq!(gate.active(), 1);
+        (gate, permit)
+    }
+
+    #[test]
+    fn ingest_and_send_queues_the_normalised_payload_and_releases_the_permit() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(2);
+        let stats = IngestStats::default();
+        let (gate, permit) = gate_with_one_permit();
+
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
+
+        let queued = rx.try_recv().unwrap();
+        assert_eq!((queued.mime.as_str(), queued.data.as_slice()), ("text/plain", b"hello".as_slice()));
+        assert_eq!(stats.shed_queue(), 0);
+        assert_eq!(gate.active(), 0, "the permit must be returned once the payload is queued");
+    }
+
+    #[test]
+    fn ingest_and_send_sheds_the_newest_payload_when_the_queue_stays_full() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        tx.send(ClipboardJob { mime: "text/plain".to_owned(), data: b"older".to_vec() }).unwrap();
+        let (gate, permit) = gate_with_one_permit();
+
+        let wait = Duration::from_millis(30);
+        let started = Instant::now();
+        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, permit, wait);
+
+        assert!(started.elapsed() >= wait, "backpressure: the reader must wait before shedding");
+        assert_eq!(stats.shed_queue(), 1);
+        assert_eq!(rx.try_recv().unwrap().data, b"older", "queued work is never displaced");
+        assert!(rx.try_recv().is_err(), "the shed payload must not have been queued");
+        assert_eq!(gate.active(), 0, "a shed reader still returns its permit");
+    }
+
+    #[test]
+    fn ingest_and_send_holds_its_permit_while_it_waits_for_queue_room() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = Arc::new(IngestStats::default());
+        tx.send(ClipboardJob { mime: "text/plain".to_owned(), data: b"older".to_vec() }).unwrap();
+        let (gate, permit) = gate_with_one_permit();
+
+        let reader = {
+            let stats = Arc::clone(&stats);
+            let pipe = filled_pipe(b"newer");
+            std::thread::spawn(move || {
+                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10));
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(gate.active(), 1, "a blocked reader keeps its slot: that is the backpressure");
+        assert!(gate.try_acquire().is_none(), "so a further selection is refused instead of piling up");
+
+        assert_eq!(rx.recv().unwrap().data, b"older");
+        reader.join().unwrap();
+        assert_eq!(rx.recv().unwrap().data, b"newer", "the waiting payload is delivered once room appears");
+        assert_eq!(stats.shed_queue(), 0);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn ingest_and_send_discards_empty_transfers_without_counting_them_as_shed() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let (gate, permit) = gate_with_one_permit();
+
+        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.shed_queue(), 0, "an empty read is not overload");
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn ingest_and_send_with_a_gone_worker_is_not_counted_as_overload() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        drop(rx);
+        let stats = IngestStats::default();
+        let (gate, permit) = gate_with_one_permit();
+
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10));
+
+        assert_eq!(stats.shed_queue(), 0, "shutdown is not shedding");
+        assert_eq!(gate.active(), 0);
     }
 
     #[test]

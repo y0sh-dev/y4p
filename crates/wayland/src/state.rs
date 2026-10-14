@@ -11,6 +11,8 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use crate::core::constants::INGEST_MAX_CONCURRENT_READERS;
+use crate::ingest::{IngestStats, ReaderGate};
 
 pub struct OfferData {
     pub mimes: Arc<Mutex<Vec<String>>>,
@@ -53,7 +55,13 @@ pub struct WaylandState {
     pub seat: Option<WlSeat>,
     pub seat_id: Option<u32>,
     pub device: Option<ExtDataControlDeviceV1>,
-    pub job_tx: Option<mpsc::Sender<ClipboardJob>>,
+    /// Bounded queue to the daemon's worker (`None` in Action Mode). Never
+    /// block on it from the event loop: see `crate::ingest::enqueue`.
+    pub job_tx: Option<mpsc::SyncSender<ClipboardJob>>,
+    /// Caps simultaneous ingestion readers; checked before a pipe is allocated.
+    pub reader_gate: Arc<ReaderGate>,
+    /// What overload has cost so far; read by the daemon for `y4p status`.
+    pub ingest_stats: Arc<IngestStats>,
     pub verbose: bool,
     // Action-mode-only: the specific MIME `y4p paste-from <mime>` was asked
     // for. `None` in daemon mode, where no single MIME is being awaited —
@@ -76,7 +84,7 @@ impl WaylandState {
     // layer must not depend on `storage`) — the daemon keeps its read-side
     // `ClipboardDb` handle in its own scope and passes it explicitly to
     // whatever needs it (see `daemon::handle_restore_request`).
-    pub fn new_daemon(job_tx: mpsc::Sender<ClipboardJob>, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
+    pub fn new_daemon(job_tx: mpsc::SyncSender<ClipboardJob>, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
         Self {
             manager: None,
             manager_id: None,
@@ -84,6 +92,8 @@ impl WaylandState {
             seat_id: None,
             device: None,
             job_tx: Some(job_tx),
+            reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
+            ingest_stats: Arc::new(IngestStats::default()),
             verbose,
             target_mime: None,
             rx_buf: Vec::new(),
@@ -103,6 +113,8 @@ impl WaylandState {
             seat_id: None,
             device: None,
             job_tx: None,
+            reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
+            ingest_stats: Arc::new(IngestStats::default()),
             verbose,
             target_mime: Some(target_mime),
             rx_buf: Vec::new(),
