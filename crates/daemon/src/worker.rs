@@ -18,13 +18,17 @@ use std::sync::{mpsc, Arc};
 /// `process_job`): the Wayland layer hands over normalised raw payloads and
 /// never blocks on `magick`. Jobs are therefore also persisted strictly in
 /// arrival order.
+///
+/// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
+/// conversion included, falls behind, producers wait and then shed rather than
+/// letting payloads accumulate (see `y4p_wayland::ingest`).
 pub struct DbWorker {
-    tx: mpsc::Sender<ClipboardJob>,
+    tx: mpsc::SyncSender<ClipboardJob>,
 }
 
 impl DbWorker {
     pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<ClipboardJob>();
+        let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
@@ -46,7 +50,7 @@ impl DbWorker {
 
     /// Clone of the submission channel, handed to the ingestion path so jobs
     /// can be queued without touching the worker thread directly.
-    pub fn sender(&self) -> mpsc::Sender<ClipboardJob> {
+    pub fn sender(&self) -> mpsc::SyncSender<ClipboardJob> {
         self.tx.clone()
     }
 }
