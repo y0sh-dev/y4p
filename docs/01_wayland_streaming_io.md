@@ -55,6 +55,7 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
       |
       v
  [gate]      is_sensitive(mimes)?  provider_locks > 0?  paused?   -> return, no pipe opened
+             reader_gate.try_acquire() fails (8 readers)?          -> shed, no pipe opened
       |
       v
  [select]    select_mime(mimes, target_mime, drop_rtf)
@@ -66,7 +67,7 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
  [normalise] normalise_payload(mime, payload)
       |
       v
- [forward]   job_tx.send(ClipboardJob { mime, data })      (daemon mode)
+ [forward]   ingest::enqueue(job_tx, ClipboardJob { mime, data }, 2 s)   (daemon mode; bounded, may shed)
              state.rx_buf = payload                        (Action Mode: `y4p paste-from`)
 ```
 
@@ -75,7 +76,7 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
 The whole payload is read in one bounded call, capped by `MAX_PAYLOAD_BYTES` (256 MiB, [`crates/core/src/constants.rs:L43`](../crates/core/src/constants.rs)):
 
 ```rust
-// crates/wayland/src/handlers/data_control/device.rs:L145
+// crates/wayland/src/handlers/data_control/device.rs:L187
 fn read_bounded_payload<R: Read>(reader: R, limit: u64) -> Option<Vec<u8>> {
     let mut payload = Vec::new();
     let mut bounded = reader.take(limit + 1); // one probe byte beyond the cap
@@ -120,14 +121,14 @@ The result is a plain `(mime, data)` pair. Normalisation is lossless and sits **
 `y4p` closes the loop with a plain counter. Before handing data to the compositor, restore increments it:
 
 ```rust
-// crates/daemon/src/lib.rs:L212 — handle_restore_request
+// crates/daemon/src/lib.rs:L214 — handle_restore_request
 state.provider_locks += 1;
 ```
 
 and the ingestion handler checks it first, before doing any work:
 
 ```rust
-// crates/wayland/src/handlers/data_control/device.rs:L25
+// crates/wayland/src/handlers/data_control/device.rs:L28
 if state.provider_locks > 0 {
     state.provider_locks -= 1;
     return;
@@ -196,7 +197,7 @@ For `Owned` payloads the only transformation is markup stripping: if the stored 
 
 | Hand-off | From -> To | Type | Guarantee |
 | :--- | :--- | :--- | :--- |
-| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::Sender<ClipboardJob>`, `ClipboardJob { mime, data }` | `data` is non-empty, at most `MAX_PAYLOAD_BYTES`, already normalised; no hash, no conversion |
+| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::SyncSender<ClipboardJob>` (capacity `INGEST_QUEUE_CAPACITY`), `ClipboardJob { mime, data }` | `data` is non-empty, at most `MAX_PAYLOAD_BYTES`, already normalised; no hash, no conversion |
 | Persistence | `y4p-daemon` -> `y4p-storage` | `insert_with_hash(mime, data, hash, max_history)` | `hash` is SHA3-256 over the final bytes (see [03](03_concurrency_and_memory.md)) |
 | Egress | `y4p-storage` -> `y4p-daemon` -> `y4p-wayland` | `ContentLocation` -> `SourcePayload` | Large payloads are passed as a path, never materialised |
 

@@ -20,7 +20,7 @@ The [README](../README.md) tells you *what* the tool does and how to run it. Eve
   (ext-data-control-v1)                                 /y4p/y4p.sock  (IPC)
           |                                                    |
           v                                                    v
-   y4p-wayland ----(mpsc: ClipboardJob {mime, data})--->  y4p-daemon
+   y4p-wayland ----(bounded: ClipboardJob {mime, data})-->  y4p-daemon
      (Ingress: read, normalise)                     worker: image route, SHA3-256,
           ^                                         single DB writer
           |                                                    |
@@ -121,7 +121,7 @@ Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event
 
 ## 4. Crossing the Wayland / Storage Boundary
 
-The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L200`](../crates/daemon/src/lib.rs):
+The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L202`](../crates/daemon/src/lib.rs):
 
 ```text
   storage::ClipboardDb::locate_content(id)
@@ -150,18 +150,18 @@ pub struct ClipboardJob {
 
 | Stage | Where | What happens |
 | :--- | :--- | :--- |
-| 1. Gate | `y4p-wayland` | Sensitive hints rejected before any pipe is opened |
+| 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened |
 | 2. Select | `y4p-wayland` | Richest MIME chosen by `MIME_PRIORITY_ORDER` |
 | 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte) |
 | 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
-| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, data }` over `mpsc` |
+| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, data }` over a bounded `sync_channel` (64); overload is shed and counted |
 | 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure) |
 | 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes |
 | 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash` |
 
 > **Invariant — the hash describes what is stored.** The fingerprint is computed last, after image routing, so a deduplicated row and its cache file are always keyed by the bytes actually saved.
 
-> **Invariant — the sensor never blocks on a converter.** Image transcoding and hashing no longer run on the per-selection ingestion thread. They run on the single `DbWorker` thread, so jobs are also persisted strictly in arrival order. The cost: a slow conversion (bounded by the timeout, throttle and breaker in [06](06_local_image_pipeline.md)) delays the jobs queued behind it.
+> **Invariant — the sensor never blocks on a converter.** Image transcoding and hashing no longer run on the per-selection ingestion thread. They run on the single `DbWorker` thread, so jobs are also persisted strictly in arrival order. The cost: a slow conversion (bounded by the timeout, throttle and breaker in [06](06_local_image_pipeline.md)) delays the jobs queued behind it, and the queue behind it is bounded: see [03](03_concurrency_and_memory.md) section 2.1.
 
 ---
 
