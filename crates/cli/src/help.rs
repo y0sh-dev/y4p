@@ -82,8 +82,9 @@ pub fn print_help() {
 
 
     println!("\nPRACTICAL EXAMPLES:");
-    println!("    # 1. High-speed selection with fzf using Stable IDs:");
-    println!("    $ y4p list 0-100 --raw --id | fzf | awk '{{print $1}}' | xargs -r y4p copy-to --id");
+    println!("    # 1. High-speed selection with fzf using Stable IDs");
+    println!("    #    (the index is padded inside the brackets, so extract it explicitly):");
+    println!("    $ y4p list 0-100 --raw --id | fzf | sed -E 's/^\\[ *([0-9]+)\\].*/\\1/' | xargs -r y4p copy-to --id");
     
     println!("\n    # 2. Extracting binary content from history:");
     println!("    $ y4p show 12 --id --raw > recovered_asset.png");

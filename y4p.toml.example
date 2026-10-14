@@ -17,7 +17,10 @@
 max_history = 256
 
 [mime]
-# Drop Rich Text Format (text/rtf, application/rtf) offers at ingress when
-# a corresponding plain text offer is already present, preventing bloat.
+# Exclude Rich Text Format (text/rtf, application/rtf) from the daemon's
+# automatic ingestion: when enabled, RTF is never selected as the offer to
+# store, even if it is the only one on offer. This applies only to the
+# daemon's own fallback choice; an explicit client request (for example
+# `y4p paste-from text/rtf`) is always honoured.
 # Default: true
 drop_rtf = true
