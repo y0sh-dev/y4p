@@ -54,7 +54,7 @@ Visual progress checklist across the zero-copy development cycle:
     - Profile v0.7.0 baseline across text ingestion, raster image conversion, SHA3-256 fingerprinting, and SQLite transactions.
     - Establish `PERFORMANCE.md` to document baseline latency, memory allocations, and throughput.
 
-- [ ] **v0.7.2: Buffer & Stream Descriptor Abstraction**
+- [x] **v0.7.2: Buffer & Stream Descriptor Abstraction**
   - Design zero-copy-capable payload abstractions in `crates/core` (`PayloadSource` / descriptor wrapper).
   - Define clear routing boundaries between small inline payloads (in-memory fast path, e.g. < 4 KiB text) and large streamed payloads (descriptor / file-backed streaming path).
   - Prepare interface contracts across `y4p-wayland`, `y4p-daemon`, and `y4p-image`.
