@@ -121,7 +121,7 @@ Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event
 
 ## 4. Crossing the Wayland / Storage Boundary
 
-The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L203`](../crates/daemon/src/lib.rs):
+The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L211`](../crates/daemon/src/lib.rs):
 
 ```text
   storage::ClipboardDb::locate_content(id)
@@ -144,22 +144,22 @@ The hand-off from sensor to worker is deliberately minimal:
 // crates/wayland/src/state.rs
 pub struct ClipboardJob {
     pub mime: String,
-    pub payload: Payload, // core::payload: Memory(Vec<u8>) | Stream(StreamDescriptor) | File(PathBuf)
+    pub payload: Payload, // core::payload: Memory(Vec<u8>) | Stream(StreamDescriptor) | File(PathBuf) | Spooled(Box<SpooledFile>)
 }
 ```
 
-Ingestion always sends `Payload::Memory` today (the bytes must be normalised first), built with `ClipboardJob::new(mime, data)`; the queue and the worker already accept a descriptor- or file-backed payload. Egress uses the same `Payload` type in `SourceMetadata`. See [01](01_wayland_streaming_io.md) section 2.3.
+Ingestion sends `Payload::Memory` for text and for payloads that end inside one page (built with `ClipboardJob::new(mime, data)`), and, since v0.7.3, `Payload::Spooled` for a large non-text payload: the ingestion thread drains the pipe into a spool file with `splice(2)`, fingerprinting it on the way, and the queue carries the file's path and digest instead of the bytes. Egress uses the same `Payload` type in `SourceMetadata`. See [01](01_wayland_streaming_io.md) sections 2.3 and 2.4.
 
 | Stage | Where | What happens |
 | :--- | :--- | :--- |
 | 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened |
 | 2. Select | `y4p-wayland` | Richest MIME chosen by `MIME_PRIORITY_ORDER` |
-| 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte) |
+| 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte). Large non-text payloads are spooled to a file with `splice(2)` and fingerprinted on the way (v0.7.3) |
 | 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
 | 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload }` over a bounded `sync_channel` (64); overload is shed and counted |
-| 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure) |
-| 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes |
-| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash` |
+| 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure); a spooled payload the converter would not touch skips this and the next step |
+| 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes (a spooled payload arrives with it, computed while it streamed in) |
+| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash`; a spooled image's file is renamed into the cache first |
 
 > **Invariant — the hash describes what is stored.** The fingerprint is computed last, after image routing, so a deduplicated row and its cache file are always keyed by the bytes actually saved.
 

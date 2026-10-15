@@ -8,6 +8,7 @@ Crate involved: `y4p-storage` (`crates/storage/`). This document explains the sp
 | :--- | :--- | :--- |
 | `$XDG_DATA_HOME/y4p/y4p.sqlite` (default `~/.local/share/y4p/`) | Metadata, searchable text, small inline payloads | directory `0700`, file `0600` |
 | `$XDG_CACHE_HOME/y4p/<hash>.cache` (default `~/.cache/y4p/`) | Image payloads | directory `0700` |
+| `$XDG_CACHE_HOME/y4p/spool/<pid>-<n>.part` | Large payloads in flight (v0.7.3); renamed to `<hash>.cache` or deleted, never listed by storage | directory `0700`, file `0600` |
 
 ---
 
@@ -47,7 +48,7 @@ Keeping images out of SQLite leaves its page cache full of exactly what `list` a
 
 ### 1.1 Deduplication ties the stores together
 
-Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path).
+Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path). Since v0.7.3 that same rule lets the daemon place a streamed image *before* the insert: a spool file is renamed to `<hash>.cache`, `FileCache::store` finds the path taken and writes nothing, and the storage crate needed no change ([01](01_wayland_streaming_io.md) section 2.4).
 
 The daemon computes the hash **after** image routing (see [00](00_overview.md) section 5), so the key always describes the bytes actually stored. `ClipboardDb::insert_raw` (used by `y4p store`) computes the same digest itself.
 
@@ -159,7 +160,7 @@ Bytes that merely *claim* a textual MIME but fail UTF-8 validation fall back to 
 
 Four places must agree on which MIME types count as text: `upsert_record` (TEXT vs BLOB), `search_metadata` and `validate_keywords` (which rows `search` may match), and `migrate_to_v3` (which legacy rows to backfill). If any used a narrower or wider rule, the failure would be silent: a `BLOB` row `search` still tries to `LIKE`, or a searchable row `search` skips. Earlier versions did drift this way: `application/json` and `application/xhtml+xml` fell out of search.
 
-There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/constants.rs:L169`](../crates/core/src/constants.rs)): `text`, `json`, `xml`, `xhtml`, `utf8`, `string`, `uri-list`. It is consumed in two forms kept in step:
+There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/constants.rs:L194`](../crates/core/src/constants.rs)): `text`, `json`, `xml`, `xhtml`, `utf8`, `string`, `uri-list`. It is consumed in two forms kept in step:
 
 | Form | Where | Behaviour |
 | :--- | :--- | :--- |

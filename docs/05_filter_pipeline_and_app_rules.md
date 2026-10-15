@@ -62,14 +62,14 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 
 ### 1.2 Stage 2: MIME selection
 
-`select_mime` ([`crates/wayland/src/handlers/data_control/device.rs:L135`](../crates/wayland/src/handlers/data_control/device.rs)):
+`select_mime` ([`crates/wayland/src/handlers/data_control/device.rs:L137`](../crates/wayland/src/handlers/data_control/device.rs)):
 
 | Mode | `target_mime` | Rule |
 | :--- | :--- | :--- |
 | Action Mode (`y4p paste-from <mime>`) | `Some` | The offer matching by `mime_base_eq` (case, whitespace and parameters ignored). `drop_rtf` is **not** consulted: an explicit request is honoured, RTF included |
 | Daemon ingestion | `None` | First hit in `MIME_PRIORITY_ORDER`, else any `image/*`, else any `text/*`, else anything. `drop_rtf` is applied at **every** step, so RTF is never selected when enabled, even as the last-resort catch-all |
 
-`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L193`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
+`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L218`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
 
 ### 1.3 Why the order matters
 
@@ -92,7 +92,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
    mime_is_compatible(requested, stored)?  --no-->  fd closed, nothing sent
               | yes
               v
-   File(path)  -> sendfile(2): cache file -> destination pipe
+   File(path)  -> sendfile(2): cache file -> destination pipe   (an adopted spool file is a cache file)
    Stream(fd)  -> sendfile(2) if addressable, else userspace copy
    Memory(data) -> write_all on a spawned thread
                   (HTML stored, plain text requested -> strip_html_tags first)
@@ -145,4 +145,4 @@ To honour the project's no-new-crates invariant, `y4p` avoids parsing frameworks
  3. Built-in defaults              DEFAULT_MAX_HISTORY = 256, drop_rtf = true
 ```
 
-`core::get_max_history()` ([`crates/core/src/lib.rs:L25`](../crates/core/src/lib.rs)) implements this chain. There is no command-line override. The result is full operation in minimal containers where no configuration file exists, while desktop users keep control over retention and MIME handling. A documented template ships as [`y4p.toml.example`](../y4p.toml.example).
+`core::get_max_history()` ([`crates/core/src/lib.rs:L27`](../crates/core/src/lib.rs)) implements this chain. There is no command-line override. The result is full operation in minimal containers where no configuration file exists, while desktop users keep control over retention and MIME handling. A documented template ships as [`y4p.toml.example`](../y4p.toml.example).

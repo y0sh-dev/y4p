@@ -13,16 +13,20 @@ SQLite allows exactly one writer at a time. A second connection that tries to wr
 `y4p` avoids the problem structurally rather than defensively: only one thread in the process ever holds a write connection.
 
 ```rust
-// crates/daemon/src/worker.rs:L37-L57
+// crates/daemon/src/worker.rs:L47-L71
 pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
     let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
 
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            let Some((mime, data)) = materialise(job) else { continue };
-            let (mime, data, hash) = process_job(mime, data);
-            match db.insert_with_hash(&mime, &data, &hash, max_history) {
-                Ok(_) => { metrics.record_ingress(); /* ... */ }
+            let ClipboardJob { mime, payload } = job;
+            let stored = match payload {
+                Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
+                payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+            };
+            match stored {
+                Ok(Some((mime, len))) => { metrics.record_ingress(); /* ... */ }
+                Ok(None) => {}
                 Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
             }
         }
@@ -47,6 +51,8 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
         |                 |                         ^
         |                 +- process_job:           | readers never block the writer
         |                    image route, SHA3-256  |
+        |                    (or, for a spooled     |
+        |                     payload: adopt file)  |
         +- main poll loop keeps running,            |
            never waits on this send       read_db --+  (list / search / restore lookups)
 ```
@@ -55,7 +61,7 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
 
 ## 2. What the Worker Does Besides Writing (v0.6.7)
 
-Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L91`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
+Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L202`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
 
 ```text
    ClipboardJob { mime, payload }  --materialise (no copy for Memory)-->  (mime, data)
@@ -76,6 +82,8 @@ Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`w
 | One consumer thread | Jobs are persisted strictly in arrival order; a fast text copy can no longer overtake a slow image copy |
 | Conversion runs on the worker | The wayland ingestion thread never spawns `magick` or hashes; the cost is that a slow conversion delays the jobs queued behind it |
 | Conversion is bounded | Timeout, process throttle and circuit breaker cap how long and how often ([06](06_local_image_pipeline.md)) |
+
+A *spooled* payload (v0.7.3; a large non-text one the ingestion thread already drained to a file with `splice(2)`, [01](01_wayland_streaming_io.md) section 2.4) takes `store_spooled` instead: if `wants_transcode` says the converter would rewrite it, it is read back and follows the table above; otherwise its digest, computed while it streamed in, is the key, and the file is mapped for the storage layer and, for an image, renamed into the cache. Neither the queue nor the worker holds such a payload's bytes on the heap, so the single worker thread also no longer spends its time hashing large payloads: the ingestion threads (up to 8, in parallel) did that.
 
 ### 2.1 Bounded Queue, Backpressure and Load Shedding (v0.7.1)
 
@@ -115,7 +123,7 @@ Why drop the newest rather than evict the oldest: `std` offers no way to remove 
 
 ## 3. WAL Concurrency and the Read-Side Handle
 
-The daemon opens a *second* `ClipboardDb` for reads served inside the daemon process itself (`read_db`, [`lib.rs:L90`](../crates/daemon/src/lib.rs)), rather than sharing the writer's connection. SQLite's WAL mode lets readers proceed concurrently with a writer without blocking either side. Splitting the handle costs nothing, and means a slow read (a restore lookup) can never, even in principle, block clipboard ingestion.
+The daemon opens a *second* `ClipboardDb` for reads served inside the daemon process itself (`read_db`, [`lib.rs:L91`](../crates/daemon/src/lib.rs)), rather than sharing the writer's connection. SQLite's WAL mode lets readers proceed concurrently with a writer without blocking either side. Splitting the handle costs nothing, and means a slow read (a restore lookup) can never, even in principle, block clipboard ingestion.
 
 | Handle | Owner | Used for |
 | :--- | :--- | :--- |
@@ -158,7 +166,7 @@ A long-lived process must not retain what it no longer needs. A payload's buffer
 
 | Step | Owner | Allocation behaviour |
 | :--- | :--- | :--- |
-| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized. A text-like MIME reserves one page up front (one allocation instead of 3-9; [`PERFORMANCE.md`](../PERFORMANCE.md) section 3.5) |
+| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized. A text-like MIME reserves one page up front (one allocation instead of 3-9; [`PERFORMANCE.md`](../PERFORMANCE.md) section 3.5). **A large non-text payload does not get a `Vec` at all (v0.7.3):** one 4 KiB head buffer, then `splice(2)` into a spool file with a 64 KiB stack buffer for the digest ([01](01_wayland_streaming_io.md) section 2.4); steps 2-6 below then concern what happens to a `Memory` payload |
 | 2. Normalise | same thread | `text/uri-list` produces one new `Vec`; everything else is moved, not copied |
 | 3. Hand-off | bounded channel | The `ClipboardJob` is **moved** and its `Payload::Memory` is handed to the worker without a copy; the bytes are never cloned. A full queue sheds instead of growing (section 2.1) |
 | 4. Route | `DbWorker` | Text and unsupported types: moved straight through. Images: output buffer pre-sized from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB) to avoid repeated doubling; on success the original `Vec` is dropped |
@@ -167,7 +175,7 @@ A long-lived process must not retain what it no longer needs. A payload's buffer
 
 Egress is lighter still: a cached image goes through `sendfile(2)` and never enters the heap ([01](01_wayland_streaming_io.md) section 4).
 
-> **Invariant — no ingested payload outlives its job.** The daemon holds no clipboard history in memory. Everything durable is in SQLite or the cache directory; process memory returns to its idle baseline once the queue drains. The one deliberate exception is egress: while the daemon owns the selection after a `copy-to`, the restored payload (an `Owned` text buffer, or just a path for a cached image) stays attached to the active data source until the compositor cancels it.
+> **Invariant — no ingested payload outlives its job.** The daemon holds no clipboard history in memory. Everything durable is in SQLite or the cache directory; process memory returns to its idle baseline once the queue drains. The same holds on disk for a spooled payload: its file is owned by a `SpooledFile` that unlinks it on drop, so a job that is shed, rejected or abandoned cannot leave one behind (only adoption into the cache, by `rename(2)`, keeps it). The one deliberate exception is egress: while the daemon owns the selection after a `copy-to`, the restored payload (an `Owned` text buffer, or just a path for a cached image) stays attached to the active data source until the compositor cancels it.
 
 During a conversion the original and the converted image coexist briefly (the peak is roughly the sum of the two), bounded by the 256 MiB read cap and the converter's own memory limits.
 
