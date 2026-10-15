@@ -20,7 +20,7 @@ The [README](../README.md) tells you *what* the tool does and how to run it. Eve
   (ext-data-control-v1)                                 /y4p/y4p.sock  (IPC)
           |                                                    |
           v                                                    v
-   y4p-wayland ----(bounded: ClipboardJob {mime, data})-->  y4p-daemon
+   y4p-wayland ----(bounded: ClipboardJob {mime, payload})-->  y4p-daemon
      (Ingress: read, normalise)                     worker: image route, SHA3-256,
           ^                                         single DB writer
           |                                                    |
@@ -102,7 +102,7 @@ Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event
 
 > **Invariant — `wayland` knows nothing about storage or images.** `y4p-wayland` depends on neither `y4p-storage`, `y4p-image` nor `sha3`. It speaks the protocol, drains pipes and normalises. Everything that interprets or persists a payload happens in `y4p-daemon`.
 
-> **Invariant — the daemon is the only translator.** `y4p-daemon` is the one crate allowed to see both `storage::ContentLocation` and `wayland::state::SourcePayload`, and it is where one is re-expressed as the other (see section 4).
+> **Invariant — the daemon is the only translator.** `y4p-daemon` is the one crate allowed to see both `storage::ContentLocation` and `core::payload::Payload`, and it is where one is re-expressed as the other (see section 4).
 
 ---
 
@@ -115,20 +115,20 @@ Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event
 | Sensor | `y4p-wayland` | `ext-data-control-v1`: ingest offers, serve history back out, pipe plumbing. | [01](01_wayland_streaming_io.md), [05](05_filter_pipeline_and_app_rules.md) |
 | Persistence | `y4p-storage` | `ClipboardDb` facade over `db.rs` (pure SQL) and `cache.rs` (files only). | [02](02_hybrid_storage_and_pin.md) |
 | Hardening | `y4p-image` | Sandboxed, bounded image transcoding with a circuit breaker. | [06](06_local_image_pipeline.md) |
-| Shared | `y4p-core` | XDG paths, config, constants, MIME helpers, exit flag. Depends on nothing in the project. | all |
+| Shared | `y4p-core` | XDG paths, config, constants, MIME helpers, the `Payload` vocabulary, exit flag. Depends on nothing in the project. | all |
 
 ---
 
 ## 4. Crossing the Wayland / Storage Boundary
 
-The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L202`](../crates/daemon/src/lib.rs):
+The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L203`](../crates/daemon/src/lib.rs):
 
 ```text
   storage::ClipboardDb::locate_content(id)
         |
         v
-  storage::ContentLocation                 wayland::state::SourcePayload
-    InlineBlob(rowid)  -- read_db ---->      Owned(Vec<u8>)
+  storage::ContentLocation                 core::payload::Payload
+    InlineBlob(rowid)  -- read_db ---->      Memory(Vec<u8>)
     CacheFile(path)    ----------------->    File(PathBuf)   --> sendfile(2)
 ```
 
@@ -144,9 +144,11 @@ The hand-off from sensor to worker is deliberately minimal:
 // crates/wayland/src/state.rs
 pub struct ClipboardJob {
     pub mime: String,
-    pub data: Vec<u8>,
+    pub payload: Payload, // core::payload: Memory(Vec<u8>) | Stream(StreamDescriptor) | File(PathBuf)
 }
 ```
+
+Ingestion always sends `Payload::Memory` today (the bytes must be normalised first), built with `ClipboardJob::new(mime, data)`; the queue and the worker already accept a descriptor- or file-backed payload. Egress uses the same `Payload` type in `SourceMetadata`. See [01](01_wayland_streaming_io.md) section 2.3.
 
 | Stage | Where | What happens |
 | :--- | :--- | :--- |
@@ -154,7 +156,7 @@ pub struct ClipboardJob {
 | 2. Select | `y4p-wayland` | Richest MIME chosen by `MIME_PRIORITY_ORDER` |
 | 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte) |
 | 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
-| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, data }` over a bounded `sync_channel` (64); overload is shed and counted |
+| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload }` over a bounded `sync_channel` (64); overload is shed and counted |
 | 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure) |
 | 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes |
 | 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash` |

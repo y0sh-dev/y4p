@@ -36,11 +36,22 @@ pub const SOCKET_FILE_NAME: &str = "y4p.sock";
 
 // --- Wayland Ingestion I/O ---
 // Upper bound on a single clipboard payload read from a compositor pipe
-// (device.rs's `read_bounded_payload`). Enforced by reading one byte beyond
+// (`core::payload::read_bounded`). Enforced by reading one byte beyond
 // this cap: a stream that is actually larger is thereby told apart from one
 // that exactly fits, and discarded outright rather than silently truncated
 // and persisted as corrupt data.
 pub const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+// --- Payload Routing ---
+// Boundary between the in-memory fast path and the kernel-streamed descriptor
+// path (see `core::payload::route_payload`). One OS page: below it a payload
+// costs less to copy through the heap than to set a descriptor transfer up
+// for, and clipboard text is overwhelmingly this small.
+pub const INLINE_PAYLOAD_THRESHOLD_BYTES: usize = 4096;
+// Ceiling on what a length hint may pre-allocate in `core::payload::read_bounded`.
+// A hint is advisory (a peer may lie), so it never reserves more than this
+// up front; real data beyond it still arrives, through ordinary growth.
+pub const PAYLOAD_PREALLOC_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 // --- Ingestion Backpressure & Concurrency Bounds ---
 // Capacity of the bounded channel between the Wayland ingestion threads and

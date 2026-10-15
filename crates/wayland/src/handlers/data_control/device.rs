@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::state::{WaylandState, OfferData, ClipboardJob};
 use crate::ingest::{self, Enqueue, IngestStats, ReaderPermit};
 use crate::core::constants::*;
+use crate::core::payload::{self, PayloadRoute};
 use super::{make_pipe, is_sensitive};
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
@@ -100,7 +101,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 // Applies the same boundary guard and normalisation as the
                 // daemon path (`ingest_and_send`) so `paste-from` returns
                 // exactly the bytes that would otherwise have been persisted.
-                if let Some(payload) = read_bounded_payload(read_file, MAX_PAYLOAD_BYTES)
+                if let Some(payload) = read_pipe_payload(read_file, &mime_to_get, MAX_PAYLOAD_BYTES)
                     && let Some((_, payload)) = normalise_payload(mime_to_get, payload)
                 {
                     state.rx_buf = payload;
@@ -164,36 +165,32 @@ fn ingest_and_send(
     _permit: Option<ReaderPermit>,
     enqueue_wait: Duration,
 ) {
-    let Some(payload) = read_bounded_payload(read_file, MAX_PAYLOAD_BYTES) else { return; };
+    let Some(payload) = read_pipe_payload(read_file, &mime_to_get, MAX_PAYLOAD_BYTES) else { return; };
     let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
 
-    if ingest::enqueue(job_tx, ClipboardJob { mime, data }, enqueue_wait) == Enqueue::Shed {
+    if ingest::enqueue(job_tx, ClipboardJob::new(mime, data), enqueue_wait) == Enqueue::Shed {
         let total = stats.record_shed_queue();
         ingest::report_shed("worker queue full", total);
     }
 }
 
-/// Reads at most `limit` bytes from an already-`offer.receive()`d pipe.
-/// Takes one byte more than `limit` so a stream that genuinely exceeds it
-/// can be told apart from one that exactly fits: `Read::take` stops
-/// silently at its cap with no error, so without this probe byte a
-/// truncated transfer and a complete one would both return `Ok(_)` with no
-/// way to distinguish them — and the truncated bytes already read would
-/// otherwise be persisted as if they were the whole payload (the
-/// Truncation vulnerability this guards against). Returns `None` on an I/O
-/// error, an empty read, or a stream that exceeded `limit`; in every case
-/// the caller discards whatever bytes were read rather than keeping a
-/// partial payload.
-fn read_bounded_payload<R: Read>(reader: R, limit: u64) -> Option<Vec<u8>> {
-    let mut payload = Vec::new();
-    let mut bounded = reader.take(limit + 1);
-    if bounded.read_to_end(&mut payload).is_err() {
-        return None;
-    }
-    if payload.is_empty() || payload.len() as u64 > limit {
-        return None;
-    }
-    Some(payload)
+/// Reads at most `limit` bytes from an already-`offer.receive()`d pipe, or
+/// `None` on an I/O error, an empty read, or a stream that exceeded `limit`
+/// (the partial bytes are discarded, never persisted as if complete: see
+/// `core::payload::read_bounded` for the probe-byte rule that makes an
+/// over-long stream distinguishable from one that exactly fits).
+///
+/// A Wayland pipe carries no length, so the buffer is pre-sized from the MIME
+/// alone (`core::payload::route_payload`): a text-like payload is almost always
+/// below one page, so reserving a page up front replaces the read loop's
+/// repeated regrowth by one allocation. Anything else starts empty and grows,
+/// since it may be a multi-megabyte image.
+fn read_pipe_payload<R: Read>(reader: R, mime: &str, limit: u64) -> Option<Vec<u8>> {
+    let capacity_hint = match payload::route_payload(mime, None) {
+        PayloadRoute::Inline => Some(INLINE_PAYLOAD_THRESHOLD_BYTES as u64),
+        PayloadRoute::Stream => None,
+    };
+    payload::read_bounded(reader, limit, capacity_hint).ok()
 }
 
 /// Normalises a raw payload against the MIME it was requested as, applying
@@ -270,7 +267,7 @@ mod tests {
         ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
 
         let queued = rx.try_recv().unwrap();
-        assert_eq!((queued.mime.as_str(), queued.data.as_slice()), ("text/plain", b"hello".as_slice()));
+        assert_eq!((queued.mime.as_str(), queued.payload.as_bytes()), ("text/plain", Some(b"hello".as_slice())));
         assert_eq!(stats.shed_queue(), 0);
         assert_eq!(gate.active(), 0, "the permit must be returned once the payload is queued");
     }
@@ -279,7 +276,7 @@ mod tests {
     fn ingest_and_send_sheds_the_newest_payload_when_the_queue_stays_full() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = IngestStats::default();
-        tx.send(ClipboardJob { mime: "text/plain".to_owned(), data: b"older".to_vec() }).unwrap();
+        tx.send(ClipboardJob::new("text/plain".to_owned(), b"older".to_vec())).unwrap();
         let (gate, permit) = gate_with_one_permit();
 
         let wait = Duration::from_millis(30);
@@ -288,7 +285,7 @@ mod tests {
 
         assert!(started.elapsed() >= wait, "backpressure: the reader must wait before shedding");
         assert_eq!(stats.shed_queue(), 1);
-        assert_eq!(rx.try_recv().unwrap().data, b"older", "queued work is never displaced");
+        assert_eq!(rx.try_recv().unwrap().payload.as_bytes(), Some(b"older".as_slice()), "queued work is never displaced");
         assert!(rx.try_recv().is_err(), "the shed payload must not have been queued");
         assert_eq!(gate.active(), 0, "a shed reader still returns its permit");
     }
@@ -297,7 +294,7 @@ mod tests {
     fn ingest_and_send_holds_its_permit_while_it_waits_for_queue_room() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = Arc::new(IngestStats::default());
-        tx.send(ClipboardJob { mime: "text/plain".to_owned(), data: b"older".to_vec() }).unwrap();
+        tx.send(ClipboardJob::new("text/plain".to_owned(), b"older".to_vec())).unwrap();
         let (gate, permit) = gate_with_one_permit();
 
         let reader = {
@@ -312,9 +309,9 @@ mod tests {
         assert_eq!(gate.active(), 1, "a blocked reader keeps its slot: that is the backpressure");
         assert!(gate.try_acquire().is_none(), "so a further selection is refused instead of piling up");
 
-        assert_eq!(rx.recv().unwrap().data, b"older");
+        assert_eq!(rx.recv().unwrap().payload.as_bytes(), Some(b"older".as_slice()));
         reader.join().unwrap();
-        assert_eq!(rx.recv().unwrap().data, b"newer", "the waiting payload is delivered once room appears");
+        assert_eq!(rx.recv().unwrap().payload.as_bytes(), Some(b"newer".as_slice()), "the waiting payload is delivered once room appears");
         assert_eq!(stats.shed_queue(), 0);
         assert_eq!(gate.active(), 0);
     }
@@ -420,39 +417,55 @@ mod tests {
         assert_eq!(select_mime(&offers, Some("text/plain"), true), None);
     }
 
-    // --- read_bounded_payload ---
+    // --- read_pipe_payload ---
 
     #[test]
-    fn read_bounded_payload_within_limit_returns_payload() {
+    fn read_pipe_payload_within_limit_returns_payload() {
         let data = b"hello".as_slice();
-        assert_eq!(read_bounded_payload(data, 10), Some(b"hello".to_vec()));
+        assert_eq!(read_pipe_payload(data, "text/plain", 10), Some(b"hello".to_vec()));
     }
 
     #[test]
-    fn read_bounded_payload_exactly_at_limit_returns_payload() {
+    fn read_pipe_payload_presizes_text_to_one_page_and_leaves_binary_to_grow() {
+        let text = read_pipe_payload(b"hello".as_slice(), "text/plain", 1 << 20).unwrap();
+        assert_eq!(text.capacity(), INLINE_PAYLOAD_THRESHOLD_BYTES, "text is reserved one page up front");
+
+        let image = read_pipe_payload(b"hello".as_slice(), "image/png", 1 << 20).unwrap();
+        assert!(image.capacity() < INLINE_PAYLOAD_THRESHOLD_BYTES, "an unhinted binary must not pre-reserve a page");
+    }
+
+    #[test]
+    fn read_pipe_payload_presize_never_exceeds_the_limit() {
+        let tiny = read_pipe_payload(b"hi".as_slice(), "text/plain", 8).unwrap();
+        assert!(tiny.capacity() < INLINE_PAYLOAD_THRESHOLD_BYTES, "the reservation is clamped to the limit");
+        assert_eq!(tiny, b"hi");
+    }
+
+    #[test]
+    fn read_pipe_payload_exactly_at_limit_returns_payload() {
         let data = b"abcde".as_slice();
-        assert_eq!(read_bounded_payload(data, 5), Some(b"abcde".to_vec()));
+        assert_eq!(read_pipe_payload(data, "text/plain", 5), Some(b"abcde".to_vec()));
     }
 
     #[test]
-    fn read_bounded_payload_exceeding_limit_by_one_byte_is_discarded() {
+    fn read_pipe_payload_exceeding_limit_by_one_byte_is_discarded() {
         let data = b"abcdef".as_slice();
-        assert_eq!(read_bounded_payload(data, 5), None);
+        assert_eq!(read_pipe_payload(data, "text/plain", 5), None);
     }
 
     #[test]
-    fn read_bounded_payload_massively_oversized_stream_is_discarded_not_truncated() {
+    fn read_pipe_payload_massively_oversized_stream_is_discarded_not_truncated() {
         // The crux of the truncation vulnerability: a stream far larger
         // than the limit must be rejected outright, never silently cut
         // down to `limit` bytes and handed back as if it were complete.
         let data = vec![b'x'; 1000];
-        assert_eq!(read_bounded_payload(data.as_slice(), 5), None);
+        assert_eq!(read_pipe_payload(data.as_slice(), "text/plain", 5), None);
     }
 
     #[test]
-    fn read_bounded_payload_empty_input_returns_none() {
+    fn read_pipe_payload_empty_input_returns_none() {
         let data = b"".as_slice();
-        assert_eq!(read_bounded_payload(data, 10), None);
+        assert_eq!(read_pipe_payload(data, "text/plain", 10), None);
     }
 
     // --- normalise_payload ---

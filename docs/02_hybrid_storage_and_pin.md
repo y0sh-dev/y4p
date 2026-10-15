@@ -159,7 +159,7 @@ Bytes that merely *claim* a textual MIME but fail UTF-8 validation fall back to 
 
 Four places must agree on which MIME types count as text: `upsert_record` (TEXT vs BLOB), `search_metadata` and `validate_keywords` (which rows `search` may match), and `migrate_to_v3` (which legacy rows to backfill). If any used a narrower or wider rule, the failure would be silent: a `BLOB` row `search` still tries to `LIKE`, or a searchable row `search` skips. Earlier versions did drift this way: `application/json` and `application/xhtml+xml` fell out of search.
 
-There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/constants.rs:L158`](../crates/core/src/constants.rs)): `text`, `json`, `xml`, `xhtml`, `utf8`, `string`, `uri-list`. It is consumed in two forms kept in step:
+There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/constants.rs:L169`](../crates/core/src/constants.rs)): `text`, `json`, `xml`, `xhtml`, `utf8`, `string`, `uri-list`. It is consumed in two forms kept in step:
 
 | Form | Where | Behaviour |
 | :--- | :--- | :--- |
@@ -179,4 +179,4 @@ There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/cons
 | `InlineBlob(rowid)` | Payload is in the SQLite row | `get_content_by_id` into a `Vec<u8>` (small by construction) |
 | `CacheFile(path)` | Payload is `<hash>.cache` on disk | `sendfile(2)` straight from the file (see [01](01_wayland_streaming_io.md) section 4) |
 
-> **Invariant — large payloads are never copied through the heap on restore.** The daemon translates `ContentLocation` into `wayland::state::SourcePayload`; `y4p-wayland` never sees storage types.
+> **Invariant — large payloads are never copied through the heap on restore.** The daemon translates `ContentLocation` into `core::payload::Payload`; `y4p-wayland` never sees storage types.

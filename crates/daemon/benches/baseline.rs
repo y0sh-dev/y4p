@@ -11,13 +11,14 @@
 //! cargo test  --workspace --all-targets           # smoke mode: one pass, no timing claims
 //! ```
 //!
-//! What is measured, and why these four groups:
+//! What is measured, and why these five groups:
 //!
 //! | Group   | Subject                                                     |
 //! | :------ | :---------------------------------------------------------- |
 //! | sha3    | digest and hex fingerprint over 64 B / 4 KiB / 64 KiB / 1 MiB |
 //! | mime    | MIME comparison, magic-byte sniffing, `text/uri-list` parsing |
 //! | queue   | bounded-channel hand-off, load shedding, reader gate, memory |
+//! | payload | routing decision, reader dispatch, bounded reads, pipe streams |
 //! | sqlite  | insert, insert + rotation, duplicate hit, metadata scans      |
 //!
 //! Besides time, every row reports allocation calls and bytes per operation
@@ -34,7 +35,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fmt::Write as _;
+use std::io::{Read, Write as _};
 use std::hint::black_box;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
@@ -44,6 +47,7 @@ use std::time::{Duration, Instant};
 
 use sha3::{Digest, Sha3_256};
 use y4p_core as core;
+use y4p_core::payload::{read_bounded, route_payload, Payload, PayloadReader, StreamDescriptor};
 use y4p_storage::ClipboardDb;
 use y4p_wayland::ingest::{self, Enqueue, ReaderGate};
 use y4p_wayland::state::ClipboardJob;
@@ -276,7 +280,7 @@ fn size_label(len: usize) -> String {
 }
 
 fn job(len: usize) -> ClipboardJob {
-    ClipboardJob { mime: "text/plain".to_owned(), data: vec![0x61; len] }
+    ClipboardJob::new("text/plain".to_owned(), vec![0x61; len])
 }
 
 fn uri_list(paths: usize) -> Vec<u8> {
@@ -326,6 +330,74 @@ fn bench_mime(mode: &Mode, rows: &mut Vec<Row>) {
             data.len() as u64,
             || normalize_uri_list(black_box(&data)),
         ));
+    }
+}
+
+fn bench_payload(mode: &Mode, rows: &mut Vec<Row>) {
+    let limit = core::constants::MAX_PAYLOAD_BYTES;
+    let inline = core::constants::INLINE_PAYLOAD_THRESHOLD_BYTES as u64;
+
+    // The routing decision itself: a comparison with a hint, one MIME scan without.
+    rows.push(mode.micro("payload", "route_payload (length hint)", 0, || route_payload(black_box("image/png"), black_box(Some(10_000)))));
+    rows.push(mode.micro("payload", "route_payload (no hint, text-like)", 0, || route_payload(black_box("text/plain"), black_box(None))));
+    rows.push(mode.micro("payload", "route_payload (no hint, binary)", 0, || route_payload(black_box("image/png"), black_box(None))));
+
+    // Reader dispatch: static `enum` versus the `Box<dyn Read>` it replaces. Both
+    // build a reader and read 4 KiB; the buffer moves in and out, so only the
+    // dispatch mechanism allocates (or not).
+    let data = payload(4096, 3);
+    let mut scratch = vec![0u8; 4096];
+    let mut owned = data.clone();
+    rows.push(mode.micro("payload", "PayloadReader::Memory build + read, 4 KiB (enum)", 4096, || {
+        let mut reader = Payload::Memory(std::mem::take(&mut owned)).into_reader();
+        let n = match &mut reader {
+            Ok(r) => r.read(&mut scratch).unwrap_or(0),
+            Err(_) => 0,
+        };
+        if let Ok(PayloadReader::Memory(cursor)) = reader {
+            owned = cursor.into_inner();
+        }
+        n
+    }));
+    rows.push(mode.micro("payload", "Box<dyn Read> build + read, 4 KiB (avoided)", 4096, || {
+        let mut reader: Box<dyn Read + '_> = Box::new(&data[..]);
+        reader.read(&mut scratch).unwrap_or(0)
+    }));
+
+    // Bounded reads. The hint is what `device.rs` passes for a text-like MIME:
+    // one page reserved up front instead of the read loop's regrowth.
+    for len in [64usize, 300, 4096] {
+        let bytes = payload(len, 9);
+        rows.push(mode.micro("payload", format!("read_bounded, {}, no hint", size_label(len)), len as u64, || {
+            read_bounded(black_box(&bytes[..]), limit, None).map(|v| v.len())
+        }));
+        rows.push(mode.micro("payload", format!("read_bounded, {}, 4 KiB hint", size_label(len)), len as u64, || {
+            read_bounded(black_box(&bytes[..]), limit, Some(inline)).map(|v| v.len())
+        }));
+    }
+    rows.push(mode.micro("payload", "Payload::Memory read_bounded, 4 KiB (hand-over)", 4096, || {
+        match Payload::Memory(std::mem::take(&mut owned)).read_bounded(limit) {
+            Ok(v) => {
+                owned = v;
+                true
+            }
+            Err(_) => false,
+        }
+    }));
+
+    // A real descriptor: pipe, write, close, read to EOF. The syscall floor that
+    // the v0.7.3 splice path has to beat; pipe set-up is part of every operation.
+    for len in [4096usize, 32 * 1024] {
+        let bytes = payload(len, 5);
+        rows.push(mode.micro("payload", format!("pipe stream read_bounded, {} (incl. pipe set-up)", size_label(len)), len as u64, || {
+            let Ok((reader, mut writer)) = std::io::pipe() else { return 0 };
+            if writer.write_all(&bytes).is_err() {
+                return 0;
+            }
+            drop(writer);
+            let stream = StreamDescriptor::new(OwnedFd::from(reader), Some(len as u64));
+            Payload::Stream(stream).read_bounded(limit).map(|v| v.len()).unwrap_or(0)
+        }));
     }
 }
 
@@ -651,6 +723,7 @@ fn run_measurements(root: &Path) -> Result<(), String> {
     let mut rows = Vec::new();
     bench_sha3(&mode, &mut rows);
     bench_mime(&mode, &mut rows);
+    bench_payload(&mode, &mut rows);
     bench_queue(&mode, &mut rows)?;
     bench_sqlite(&mode, &mut rows)?;
 

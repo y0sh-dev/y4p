@@ -9,44 +9,64 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_manager_v1::ExtDataControlManagerV1,
     ext_data_control_source_v1::ExtDataControlSourceV1,
 };
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use crate::core::constants::INGEST_MAX_CONCURRENT_READERS;
+use crate::core::payload::{Payload, PayloadError};
 use crate::ingest::{IngestStats, ReaderGate};
 
 pub struct OfferData {
     pub mimes: Arc<Mutex<Vec<String>>>,
 }
 
-/// Where a `SourceMetadata`'s bytes actually live.
+/// What a data source serves: its advertised MIME and where the bytes live.
 ///
-/// Added for kernel-level egress (PERFORMANCE.md "Next Frontier"): before
-/// this, `SourceMetadata` always held a fully-materialised `Vec<u8>`, even
-/// for large cached binaries (images) -- meaning a `copy-to` of a 70MB image
-/// read the whole file into memory in `get_content_by_id`, then the old
-/// `source.rs` Send handler unconditionally `.clone()`d it again before
-/// writing it out. `File` lets the Send handler skip both copies entirely
-/// and hand the destination pipe straight to `sendfile(2)`.
-pub enum SourcePayload {
-    /// Small/inline payload (text, or anything the DB stored directly in
-    /// its BLOB column) held in memory, same as before.
-    Owned(Vec<u8>),
-    /// Large binary payload living in the on-disk cache. The Send handler
-    /// opens this path itself and transfers it kernel-side.
-    File(PathBuf),
-}
-
+/// `payload` is the shared `core::payload::Payload`, so egress speaks the same
+/// vocabulary as ingress (`ClipboardJob`): an in-memory buffer, a streaming
+/// descriptor, or a file in the on-disk cache. The `Send` handler picks the
+/// transfer from the variant (see `handlers/data_control/source.rs`); a `File`
+/// or `Stream` payload never has to be materialised in this process's heap.
 pub struct SourceMetadata {
     pub mime: String,
-    pub payload: SourcePayload,
+    pub payload: Payload,
 }
 
 /// A normalised raw payload handed from the ingestion thread to the daemon's
 /// worker. Deliberately carries no fingerprint: image transcoding rewrites the
 /// bytes, so the digest is only meaningful once the worker has the final ones.
+///
+/// The payload is a `core::payload::Payload`, not a bare `Vec<u8>`: today the
+/// ingestion thread always hands over `Payload::Memory` (it must normalise the
+/// bytes first), but the queue and the worker already accept a descriptor- or
+/// file-backed payload, so a streamed ingest path can be added without
+/// touching either. Moving a `Memory` payload through the queue moves a pointer,
+/// never the bytes.
 pub struct ClipboardJob {
     pub mime: String,
-    pub data: Vec<u8>,
+    pub payload: Payload,
+}
+
+impl ClipboardJob {
+    /// The common case, and the shape every caller had before payloads became
+    /// polymorphic: a MIME and fully-materialised bytes.
+    pub fn new(mime: String, data: Vec<u8>) -> Self {
+        Self { mime, payload: Payload::memory(data) }
+    }
+
+    pub fn from_payload(mime: String, payload: Payload) -> Self {
+        Self { mime, payload }
+    }
+
+    /// Length in bytes when known without I/O (see `Payload::len_hint`).
+    pub fn len_hint(&self) -> Option<u64> {
+        self.payload.len_hint()
+    }
+
+    /// Materialises the job as `(mime, bytes)` with at most `limit` bytes. An
+    /// in-memory payload is validated and handed over without a copy.
+    pub fn into_bytes(self, limit: u64) -> Result<(String, Vec<u8>), PayloadError> {
+        let data = self.payload.read_bounded(limit)?;
+        Ok((self.mime, data))
+    }
 }
 
 pub struct WaylandState {
@@ -124,5 +144,33 @@ impl WaylandState {
             paused: false,
             config,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_built_from_bytes_is_an_in_memory_payload_with_a_known_length() {
+        let job = ClipboardJob::new("text/plain".to_owned(), b"abc".to_vec());
+        assert_eq!(job.len_hint(), Some(3));
+        assert_eq!(job.payload.as_bytes(), Some(b"abc".as_slice()));
+    }
+
+    #[test]
+    fn into_bytes_returns_the_mime_and_the_same_allocation() {
+        let data = b"abc".to_vec();
+        let ptr = data.as_ptr();
+        let (mime, out) = ClipboardJob::new("text/html".to_owned(), data).into_bytes(16).unwrap();
+        assert_eq!((mime.as_str(), out.as_slice()), ("text/html", b"abc".as_slice()));
+        assert_eq!(out.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn into_bytes_enforces_the_bound_and_rejects_nothing() {
+        assert!(ClipboardJob::new("text/plain".to_owned(), vec![0; 17]).into_bytes(16).is_err());
+        assert!(ClipboardJob::new("text/plain".to_owned(), Vec::new()).into_bytes(16).is_err());
     }
 }

@@ -188,4 +188,4 @@ For an interactive user this is a slightly less forgiving CLI. For a script, the
 | `status`, `pause`, `resume` | One-shot IPC command (`0x03`, `0x04`, `0x05`) |
 | `daemon`, `paste-from` | `y4p-cli` only validates and returns a `CliAction`; the composition root (`src/main.rs`) performs the actual daemon / Wayland call, so `y4p-cli` depends on neither crate |
 
-The socket lives at `$XDG_RUNTIME_DIR/y4p/y4p.sock`, falling back to `/tmp/y4p.<uid>.sock` only when no session runtime directory exists ([`crates/core/src/lib.rs:L100`](../crates/core/src/lib.rs)).
+The socket lives at `$XDG_RUNTIME_DIR/y4p/y4p.sock`, falling back to `/tmp/y4p.<uid>.sock` only when no session runtime directory exists ([`crates/core/src/lib.rs:L101`](../crates/core/src/lib.rs)).

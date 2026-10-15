@@ -25,7 +25,7 @@ To address these, `y4p` routes raster images through an isolated pipeline before
 ## 2. Where It Sits, and What It Decides
 
 ```text
-  y4p-wayland  --ClipboardJob{mime,data}-->  DbWorker thread
+  y4p-wayland  --ClipboardJob{mime,payload}-->  DbWorker thread
                                                   |
                                                   v
                                    route::route_for_ingest(mime, data)

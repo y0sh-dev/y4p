@@ -17,7 +17,8 @@ mod metrics;
 mod worker;
 
 use crate::storage::{ClipboardDb, ContentLocation};
-use crate::wayland::state::{WaylandState, SourceMetadata, SourcePayload};
+use crate::core::payload::Payload;
+use crate::wayland::state::{WaylandState, SourceMetadata};
 use crate::core::constants::*;
 use crate::core::utils::is_html_mime;
 use crate::core::SocketGuard;
@@ -189,7 +190,7 @@ fn bind_data_device(
 ///
 /// Kernel-level egress: uses `locate_content` instead of always
 /// materialising the payload into memory. Large binaries (images) living in
-/// the on-disk cache are handed to the data source as a `SourcePayload::File`,
+/// the on-disk cache are handed to the data source as a `Payload::File`,
 /// so `wayland/handlers/data_control/source.rs` can transfer them straight
 /// from disk to the requesting client's pipe via `sendfile(2)` — this
 /// process's heap never holds the full payload at all. Small/inline entries
@@ -218,9 +219,9 @@ fn handle_restore_request(
                 let data = read_db.get_content_by_id(id)
                     .map(|(_, d)| d)
                     .unwrap_or_default();
-                SourcePayload::Owned(data)
+                Payload::Memory(data)
             }
-            ContentLocation::CacheFile(path) => SourcePayload::File(path),
+            ContentLocation::CacheFile(path) => Payload::File(path),
         };
 
         let meta = SourceMetadata { mime: mime.clone(), payload };

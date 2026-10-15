@@ -1,4 +1,4 @@
-# PERFORMANCE — v0.7.1 Baseline for the Zero-Copy Cycle
+# PERFORMANCE — Baseline for the Zero-Copy Cycle (v0.7.1, extended in v0.7.2)
 
 This document records the quantitative baseline against which the zero-copy milestones (v0.7.2 - v0.8.0) are judged: what the ingestion path costs today in time, allocations and memory, which bounds hold, and which targets the next milestones aim at. Numbers are measurements, not claims; every figure below was produced by the harness described in section 1 on the machine in section 2.
 
@@ -28,7 +28,7 @@ The harness ([`crates/daemon/benches/baseline.rs`](crates/daemon/benches/baselin
 | Item | Value |
 | :--- | :--- |
 | Date | 2026-10-14 |
-| Code | v0.7.0 ingestion, SQLite, hashing and MIME code unchanged; v0.7.1 bounded queue and reader gate |
+| Code | Sections 3.1-3.4: v0.7.0 ingestion, SQLite, hashing and MIME code with the v0.7.1 bounded queue and reader gate (recorded 2026-10-14). Section 3.5 and the v0.7.2 re-check at its end: v0.7.2 payload abstraction (recorded 2026-10-15, three full runs) |
 | CPU | AMD Ryzen 7 9700X (16 threads), cpufreq governor `powersave` |
 | OS / toolchain | Linux 7.2.9-zen1, rustc 1.97.1 |
 | Profile | `bench` inheriting `release`: `opt-level = "s"`, `lto = true`, `codegen-units = 1` (the shipped binary's settings; `"s"` favours size over speed) |
@@ -103,6 +103,31 @@ Every classification primitive is allocation-free and negligible. `normalize_uri
 - Neither large insert allocates payload-sized memory on the Rust side: the BLOB is bound by reference, and the cache file is written from the borrowed slice.
 - Metadata scans cost 0.3-0.4 us and 2 allocations per row returned (the row's strings); a 100-row list is 37 us.
 
+### 3.5 Payload abstraction (v0.7.2)
+
+`core::payload` ([`crates/core/src/payload.rs`](crates/core/src/payload.rs)) is the shared vocabulary for a payload's bytes: `Payload::{Memory, Stream, File}`, a `PayloadReader` enum that implements `Read`, `route_payload`, and `read_bounded`. Three full runs, spread under 2 % on every row below.
+
+| Case | Median | Allocations |
+| :--- | ---: | :--- |
+| `route_payload`, length hint | 0.5 ns | 0 |
+| `route_payload`, no hint, text-like MIME | 9.3 ns | 0 |
+| `route_payload`, no hint, binary MIME | 7.2 ns | 0 |
+| reader built from a `Vec` + read 4 KiB, **`PayloadReader` enum** | 15.7 ns | **0** |
+| the same through **`Box<dyn Read>`** (what the enum replaces) | 31.7 ns | 1 call, 16 B |
+| `Payload::Memory` `read_bounded`, 4 KiB (hand-over) | 4.9 ns | 0 |
+| `read_bounded`, 64 B, no hint / 4 KiB hint | 92 / 32.6 ns | 3 / **1** calls |
+| `read_bounded`, 300 B, no hint / 4 KiB hint | 137 / 33.0 ns | 5 / **1** calls |
+| `read_bounded`, 4 KiB, no hint / 4 KiB hint | 251 / 48.8 ns | 9 / **1** calls |
+| pipe stream `read_bounded`, 4 KiB (incl. creating the pipe) | 1.03 us | 1 call |
+| pipe stream `read_bounded`, 32 KiB (incl. creating the pipe) | 2.36 us | 1 call |
+
+- **The dispatch is free**: the enum builds and reads with zero allocations and in half the time of the boxed reader; routing costs one comparison (0.5 ns) with a hint and one allocation-free MIME scan (7-9 ns) without.
+- **An in-memory payload is never copied on its way to the worker**: `read_bounded` over `Payload::Memory` validates and returns the same `Vec` (4.9 ns, 0 allocations, and a unit test asserts pointer equality).
+- **Pre-sizing the read buffer is the measurable win.** A Wayland pipe carries no length, so `device.rs` takes the hint from the MIME alone: a text-like type reserves one page (`INLINE_PAYLOAD_THRESHOLD_BYTES`) up front. That replaces the read loop's regrowth (3, 5 and 9 allocations for 64 B, 300 B and 4 KiB) by exactly one, and is 2.8-5.1x faster on the read itself. Non-text types start empty and grow, because they may be large.
+- The pipe rows are the **syscall floor** for a streamed payload (pipe creation, write, close, read to EOF). They are the figure the v0.7.3 `splice(2)` path has to be judged against, not a regression.
+
+**Re-check of sections 3.1-3.4 at v0.7.2** (same machine, three runs): SHA3, MIME, reader gate and SQLite rows are unchanged within the noise floor; allocation counts are identical everywhere; the memory-bound experiment still reports **64 queued, 64 shed, 65.0 MiB**. One measurable cost: the single-thread queue cases are 3-7 % slower (77-79 ns against 72 ns for 64 B, 95 against 92 ns for 4 KiB, 86 against 82 ns for a shed). `ClipboardJob` now holds a `Payload` enum (56 bytes) instead of a bare `Vec` (48 bytes), so each move through the channel is eight bytes larger and the job is constructed through a wrapper; the allocation count (2 calls, 74 B) is unchanged. About 5 ns per clipboard event is far below anything observable and buys a queue that can carry a descriptor or a file.
+
 ---
 
 ## 4. Memory Bounds
@@ -135,8 +160,8 @@ By inspection of the code (not measured):
 
 | Step | Userspace copy of the payload bytes |
 | :--- | :--- |
-| 1. compositor pipe to `Vec<u8>` (`read_to_end`, grows by doubling) | 1, plus reallocation copies while it grows |
-| 2. `ClipboardJob` through the queue | 0 (moved) |
+| 1. compositor pipe to `Vec<u8>` (`read_to_end`) | 1; for text-like MIMEs the buffer is pre-sized to one page (v0.7.2), so a typical payload is read with no reallocation copy (section 3.5); other types still grow by doubling |
+| 2. `ClipboardJob` through the queue, and the worker's `into_bytes` | 0 (moved; `Payload::Memory` is handed over without a copy) |
 | 3. text and unsupported types: hash, then insert | 0 (hashed in place; SQLite and the cache file take a borrowed slice) |
 | 4. raster image: `Vec` to `magick` stdin, `magick` stdout to a new `Vec` | 2 (pipe relays) |
 | 5. egress (paste): cached image via `sendfile(2)` | 0 (kernel to kernel) |
@@ -151,13 +176,14 @@ Proposals derived from the baseline above, to be agreed per milestone. "Baseline
 
 | Metric | Baseline | Target | Milestone |
 | :--- | :--- | :--- | :--- |
-| Allocations per fingerprint | 35 | <= 1 (the result `String`) | v0.7.2 |
-| Fingerprint of a 64 B payload | 2.04 us | <= 1.0 us | v0.7.2 |
+| Allocations per fingerprint | 35 | <= 1 (the result `String`) | v0.7.3 (not in the v0.7.2 brief) |
+| Fingerprint of a 64 B payload | 2.04 us | <= 1.0 us | v0.7.3 (not in the v0.7.2 brief) |
 | Peak payload buffer per in-flight reader | whole payload (up to 256 MiB) | <= 64 KiB chunk for streamed payloads | v0.7.3 |
 | Userspace copies, large non-image payload | 1 | 0 (`splice(2)` into the cache file, hash streamed alongside) | v0.7.3 |
 | Userspace copies, raster image | 3 | <= 1 (descriptor to `magick`) | v0.7.4 |
-| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.2 |
+| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.3 (not in the v0.7.2 brief; the descriptor abstraction now makes the size available before a read) |
 | SHA3 throughput | 158 MiB/s | no regression; overlap with the transfer so that hashing no longer serialises behind it | v0.7.3 |
+| Allocations to read a small text payload from a pipe | 3-9 | 1 | **v0.7.2: met** (section 3.5) |
 | Existing rows above | as measured | no regression beyond the 3 % noise floor (25 % for short uri-list and cross-thread cases) | every milestone |
 
 One consequence to plan around: because SHA3-256 costs about 6.3 ms per MiB against about 0.1-0.5 ms for the writes, removing a memcpy saves little wall-clock time for large payloads by itself. The zero-copy gain is chiefly **memory** (no whole-payload buffer) and **latency hiding** (hash while receiving), not raw copy cost. The SHA3 digest is also what deduplication keys on, so replacing it is a storage-format decision and out of scope for the harness.
@@ -166,6 +192,6 @@ One consequence to plan around: because SHA3-256 costs about 6.3 ms per MiB agai
 
 ## 6. Open Questions Carried Forward
 
-1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only. A byte budget (an atomic counter of queued bytes) fits naturally with the descriptor abstraction of v0.7.2, where the size is known before the payload is read.
+1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only. A byte budget (an atomic counter of queued bytes) now has what it needs from v0.7.2: `Payload::len_hint` reports the size without I/O. It was not part of v0.7.2's brief and is not implemented.
 2. **Hash cost.** At 158 MiB/s with `opt-level = "s"`, hashing dominates large payloads. The levers are hashing overlapped with the transfer (v0.7.3's streaming hash) and a per-package `opt-level = 3` override for the Keccak crates in `[profile.release.package]`, which adds no crate but changes release-profile settings and therefore needs approval; the second has not been measured.
 3. **Disk-backed numbers.** The recorded run is on tmpfs. A run with `Y4P_BENCH_DIR` on the real data disk should be added once, because `fsync` behaviour changes the SQLite rows by orders of magnitude.

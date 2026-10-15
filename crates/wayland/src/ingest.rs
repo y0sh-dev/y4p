@@ -157,13 +157,13 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     fn job(tag: u8) -> ClipboardJob {
-        ClipboardJob { mime: "text/plain".to_owned(), data: vec![tag] }
+        ClipboardJob::new("text/plain".to_owned(), vec![tag])
     }
 
     fn drain(rx: &std::sync::mpsc::Receiver<ClipboardJob>) -> Vec<u8> {
         let mut tags = Vec::new();
         while let Ok(j) = rx.try_recv() {
-            tags.push(j.data[0]);
+            tags.push(j.payload.as_bytes().unwrap()[0]);
         }
         tags
     }
@@ -270,7 +270,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
             let mut tags = Vec::new();
             while let Ok(j) = rx.recv_timeout(Duration::from_millis(500)) {
-                tags.push(j.data[0]);
+                tags.push(j.payload.as_bytes().unwrap()[0]);
                 if tags.len() == 2 {
                     break;
                 }
@@ -289,7 +289,7 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             let mut tags = Vec::new();
             while let Ok(j) = rx.recv() {
-                tags.push(j.data[0]);
+                tags.push(j.payload.as_bytes().unwrap()[0]);
                 std::thread::sleep(Duration::from_millis(1));
             }
             tags
