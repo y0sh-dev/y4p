@@ -13,13 +13,14 @@ SQLite allows exactly one writer at a time. A second connection that tries to wr
 `y4p` avoids the problem structurally rather than defensively: only one thread in the process ever holds a write connection.
 
 ```rust
-// crates/daemon/src/worker.rs:L30-L49
+// crates/daemon/src/worker.rs:L37-L57
 pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
     let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
 
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            let (mime, data, hash) = process_job(job.mime, job.data);
+            let Some((mime, data)) = materialise(job) else { continue };
+            let (mime, data, hash) = process_job(mime, data);
             match db.insert_with_hash(&mime, &data, &hash, max_history) {
                 Ok(_) => { metrics.record_ingress(); /* ... */ }
                 Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
@@ -39,7 +40,7 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
    Wayland Selection event
         |
         v  (per-selection thread, at most 8: bounded read + normalise)
-   ClipboardJob { mime, data }
+   ClipboardJob { mime, payload }
         |
         v
    bounded channel (64)  -->  DbWorker thread  -->  SQLite (single writer, WAL)
@@ -54,10 +55,10 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
 
 ## 2. What the Worker Does Besides Writing (v0.6.7)
 
-Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L71`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
+Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L91`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
 
 ```text
-   ClipboardJob { mime, data }
+   ClipboardJob { mime, payload }  --materialise (no copy for Memory)-->  (mime, data)
         |
         v
    y4p_image::route::route_for_ingest(mime, data)   PNG/BMP/JPEG/WebP -> lossless PNG,
@@ -114,7 +115,7 @@ Why drop the newest rather than evict the oldest: `std` offers no way to remove 
 
 ## 3. WAL Concurrency and the Read-Side Handle
 
-The daemon opens a *second* `ClipboardDb` for reads served inside the daemon process itself (`read_db`, [`lib.rs:L89`](../crates/daemon/src/lib.rs)), rather than sharing the writer's connection. SQLite's WAL mode lets readers proceed concurrently with a writer without blocking either side. Splitting the handle costs nothing, and means a slow read (a restore lookup) can never, even in principle, block clipboard ingestion.
+The daemon opens a *second* `ClipboardDb` for reads served inside the daemon process itself (`read_db`, [`lib.rs:L90`](../crates/daemon/src/lib.rs)), rather than sharing the writer's connection. SQLite's WAL mode lets readers proceed concurrently with a writer without blocking either side. Splitting the handle costs nothing, and means a slow read (a restore lookup) can never, even in principle, block clipboard ingestion.
 
 | Handle | Owner | Used for |
 | :--- | :--- | :--- |
@@ -157,9 +158,9 @@ A long-lived process must not retain what it no longer needs. A payload's buffer
 
 | Step | Owner | Allocation behaviour |
 | :--- | :--- | :--- |
-| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized |
+| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized. A text-like MIME reserves one page up front (one allocation instead of 3-9; [`PERFORMANCE.md`](../PERFORMANCE.md) section 3.5) |
 | 2. Normalise | same thread | `text/uri-list` produces one new `Vec`; everything else is moved, not copied |
-| 3. Hand-off | bounded channel | The `ClipboardJob` is **moved**; the bytes are never cloned. A full queue sheds instead of growing (section 2.1) |
+| 3. Hand-off | bounded channel | The `ClipboardJob` is **moved** and its `Payload::Memory` is handed to the worker without a copy; the bytes are never cloned. A full queue sheds instead of growing (section 2.1) |
 | 4. Route | `DbWorker` | Text and unsupported types: moved straight through. Images: output buffer pre-sized from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB) to avoid repeated doubling; on success the original `Vec` is dropped |
 | 5. Persist | `DbWorker` | `insert_with_hash` borrows `&data`; text is bound as `&str` with no copy |
 | 6. Reclaim | `DbWorker` | `mime`, `data`, `hash` drop at the end of the loop iteration |
