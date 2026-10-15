@@ -11,7 +11,7 @@
 //! cargo test  --workspace --all-targets           # smoke mode: one pass, no timing claims
 //! ```
 //!
-//! What is measured, and why these five groups:
+//! What is measured, and why these seven groups:
 //!
 //! | Group   | Subject                                                     |
 //! | :------ | :---------------------------------------------------------- |
@@ -19,6 +19,8 @@
 //! | mime    | MIME comparison, magic-byte sniffing, `text/uri-list` parsing |
 //! | queue   | bounded-channel hand-off, load shedding, reader gate, memory |
 //! | payload | routing decision, reader dispatch, bounded reads, pipe streams |
+//! | splice  | pipe -> file: heap `Vec` road versus `splice(2)`/`tee(2)` and the fallback |
+//! | ingest  | pipe -> database end to end, in memory versus spooled; memory bound |
 //! | sqlite  | insert, insert + rotation, duplicate hit, metadata scans      |
 //!
 //! Besides time, every row reports allocation calls and bytes per operation
@@ -35,6 +37,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io::{Read, Write as _};
 use std::hint::black_box;
 use std::os::fd::OwnedFd;
@@ -47,8 +50,13 @@ use std::time::{Duration, Instant};
 
 use sha3::{Digest, Sha3_256};
 use y4p_core as core;
-use y4p_core::payload::{read_bounded, route_payload, Payload, PayloadReader, StreamDescriptor};
+use y4p_core::payload::{read_bounded, route_payload, to_hex, Payload, PayloadReader, SpooledFile, StreamDescriptor};
+use y4p_core::splice::{copy_to_file, copy_to_file_buffered, ByteTap, NoTap};
+use y4p_daemon::metrics::DaemonMetrics;
+use y4p_daemon::spool::FileSpooler;
+use y4p_daemon::worker::DbWorker;
 use y4p_storage::ClipboardDb;
+use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
 use y4p_wayland::ingest::{self, Enqueue, ReaderGate};
 use y4p_wayland::state::ClipboardJob;
 
@@ -268,6 +276,14 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
 fn fingerprint(data: &[u8]) -> String {
     let mut hasher = Sha3_256::new();
     hasher.update(data);
+    to_hex(hasher.finalize().as_slice())
+}
+
+/// The encoder the worker used up to v0.7.2 (one `format!` per byte), kept so the
+/// improvement is measured in the same run rather than against a stored number.
+fn fingerprint_formatted(data: &[u8]) -> String {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
     hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }
 
@@ -305,6 +321,11 @@ fn bench_sha3(mode: &Mode, rows: &mut Vec<Row>) {
             hasher.finalize()
         }));
         rows.push(mode.micro("sha3", format!("fingerprint (hex), {label}"), len as u64, || fingerprint(black_box(&data))));
+        if len == 64 {
+            rows.push(mode.micro("sha3", format!("fingerprint (hex, format! per byte, to v0.7.2), {label}"), len as u64, || {
+                fingerprint_formatted(black_box(&data))
+            }));
+        }
     }
 }
 
@@ -399,6 +420,228 @@ fn bench_payload(mode: &Mode, rows: &mut Vec<Row>) {
             Payload::Stream(stream).read_bounded(limit).map(|v| v.len()).unwrap_or(0)
         }));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream-to-file: the v0.7.3 kernel path against the heap road it replaces
+// ---------------------------------------------------------------------------
+
+/// SHA3-256 as a stream observer, exactly what the daemon's spooler uses.
+struct Sha3Tap(Sha3_256);
+
+impl ByteTap for Sha3Tap {
+    fn update(&mut self, chunk: &[u8]) {
+        Digest::update(&mut self.0, chunk);
+    }
+}
+
+/// A pipe carrying `data` and then EOF, as a compositor client would provide.
+/// Anything beyond the pipe buffer needs a writer thread, as in production.
+fn fed_pipe(data: &Arc<Vec<u8>>) -> Option<(File, Option<std::thread::JoinHandle<()>>)> {
+    let (reader, mut writer) = std::io::pipe().ok()?;
+    let reader = File::from(OwnedFd::from(reader));
+    if data.len() <= 32 * 1024 {
+        writer.write_all(data).ok()?;
+        return Some((reader, None));
+    }
+    let data = Arc::clone(data);
+    let handle = std::thread::spawn(move || {
+        let _ = writer.write_all(&data);
+    });
+    Some((reader, Some(handle)))
+}
+
+/// A fresh, private destination file (unlinked again by the caller).
+fn bench_file() -> Option<(File, PathBuf)> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut path = core::get_cache_dir();
+    path.push(format!("bench-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+    Some((file, path))
+}
+
+fn bench_splice(mode: &Mode, rows: &mut Vec<Row>) {
+    let limit = core::constants::MAX_PAYLOAD_BYTES;
+    for len in [32 * 1024usize, 1024 * 1024, 16 * 1024 * 1024] {
+        let data = Arc::new(payload(len, 0xfeed));
+        let label = size_label(len);
+        let finish = |handle: Option<std::thread::JoinHandle<()>>, path: PathBuf, copied: u64| {
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(path);
+            copied
+        };
+
+        rows.push(mode.micro("splice", format!("pipe -> file {label}: heap Vec + sha3 + write (v0.7.2 road)"), len as u64, || {
+            let (Some((src, handle)), Some((mut dst, path))) = (fed_pipe(&data), bench_file()) else { return 0 };
+            let copied = match read_bounded(src, limit, None) {
+                Ok(bytes) => {
+                    let mut hasher = Sha3_256::new();
+                    Digest::update(&mut hasher, &bytes);
+                    black_box(hasher.finalize());
+                    dst.write_all(&bytes).map_or(0, |()| bytes.len() as u64)
+                }
+                Err(_) => 0,
+            };
+            finish(handle, path, copied)
+        }));
+        rows.push(mode.micro("splice", format!("pipe -> file {label}: buffered copy + sha3 (fallback path)"), len as u64, || {
+            let (Some((mut src, handle)), Some((mut dst, path))) = (fed_pipe(&data), bench_file()) else { return 0 };
+            let copied = copy_to_file_buffered(&mut src, &mut dst, limit, &mut Sha3Tap(Sha3_256::new())).map_or(0, |c| c.len);
+            finish(handle, path, copied)
+        }));
+        rows.push(mode.micro("splice", format!("pipe -> file {label}: splice only"), len as u64, || {
+            let (Some((mut src, handle)), Some((mut dst, path))) = (fed_pipe(&data), bench_file()) else { return 0 };
+            let copied = copy_to_file(&mut src, &mut dst, limit, &mut NoTap).map_or(0, |c| c.len);
+            finish(handle, path, copied)
+        }));
+        rows.push(mode.micro("splice", format!("pipe -> file {label}: splice + tee + sha3 (v0.7.3 road)"), len as u64, || {
+            let (Some((mut src, handle)), Some((mut dst, path))) = (fed_pipe(&data), bench_file()) else { return 0 };
+            let tap = &mut Sha3Tap(Sha3_256::new());
+            let copied = copy_to_file(&mut src, &mut dst, limit, tap).map_or(0, |c| c.len);
+            black_box(std::mem::replace(&mut tap.0, Sha3_256::new()).finalize());
+            finish(handle, path, copied)
+        }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ingest: pipe -> queue -> real worker -> real database, and the memory bound
+// ---------------------------------------------------------------------------
+
+/// Persists `len`-byte GIFs end to end, one at a time, and reports what the
+/// heap did while each one was in flight. `spooled` selects the road: the
+/// v0.7.2 one (the ingestion thread reads the pipe into a `Vec`) or the v0.7.3
+/// one (`FileSpooler` splices it to a file, the worker adopts the file).
+fn ingest_once(
+    tx: &std::sync::mpsc::SyncSender<ClipboardJob>,
+    spooler: &FileSpooler,
+    metrics: &DaemonMetrics,
+    data: &mut Arc<Vec<u8>>,
+    counter: &mut u64,
+    spooled: bool,
+) -> Result<(), String> {
+    *counter += 1;
+    // A unique payload per operation, so every one is an insert, never a duplicate.
+    if let Some(bytes) = Arc::get_mut(data) {
+        for (slot, byte) in bytes.iter_mut().skip(6).zip(counter.to_le_bytes()) {
+            *slot = byte;
+        }
+    }
+    let persisted_before = metrics.ingress_count();
+    let (mut src, handle) = fed_pipe(data).ok_or("pipe set-up failed")?;
+    let job = if spooled {
+        let head_len = core::constants::INLINE_PAYLOAD_THRESHOLD_BYTES.min(data.len());
+        let mut head = vec![0u8; head_len];
+        src.read_exact(&mut head).map_err(|e| format!("head read failed: {e}"))?;
+        match spooler.spool(&head, src, core::constants::MAX_PAYLOAD_BYTES) {
+            SpoolOutcome::Spooled(file) => ClipboardJob::from_payload("image/gif".to_owned(), Payload::Spooled(Box::new(file))),
+            _ => return Err("the spooler did not spool the payload".into()),
+        }
+    } else {
+        let bytes = read_bounded(src, core::constants::MAX_PAYLOAD_BYTES, None).map_err(|e| e.to_string())?;
+        ClipboardJob::new("image/gif".to_owned(), bytes)
+    };
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+    tx.send(job).map_err(|_| "the worker is gone".to_owned())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while metrics.ingress_count() <= persisted_before {
+        if Instant::now() > deadline {
+            return Err("timed out waiting for the worker".into());
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    Ok(())
+}
+
+fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
+    let spooler = FileSpooler::open(core::spool_dir_path()).map_err(|e| format!("spool directory: {e}"))?;
+    let metrics = Arc::new(DaemonMetrics::new());
+    let worker = DbWorker::spawn(ClipboardDb::open()?, Arc::clone(&metrics), false, 8);
+    let tx = worker.sender();
+
+    let ops: u64 = if mode.full { 12 } else { 1 };
+    let mut notes = Vec::new();
+    for len in [1024 * 1024usize, 16 * 1024 * 1024] {
+        let mut data = {
+            let mut bytes = payload(len, 0xbeef);
+            bytes.splice(0..6, *b"GIF89a");
+            Arc::new(bytes)
+        };
+        let mut counter = 0u64;
+        for spooled in [false, true] {
+            let road = if spooled { "spooled, splice + adopt (v0.7.3)" } else { "heap Vec (v0.7.2)" };
+            let before = LIVE_BYTES.load(Ordering::Relaxed);
+            PEAK_BYTES.store(before, Ordering::Relaxed);
+            let row = mode.batched(
+                "ingest",
+                format!("pipe -> database, {} GIF, {road}", size_label(len)),
+                ops,
+                len as u64,
+                &mut (),
+                |_| Ok(()),
+                |_| ingest_once(&tx, &spooler, &metrics, &mut data, &mut counter, spooled),
+            )?;
+            let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+            notes.push(format!(
+                "ingest peak heap growth, {} GIF, {road}: {:.2} MiB",
+                size_label(len),
+                peak as f64 / (1024.0 * 1024.0)
+            ));
+            rows.push(row);
+        }
+    }
+    for note in &notes {
+        println!("\n{note}");
+    }
+
+    // Memory bound with spooled payloads: offer twice the queue's capacity of
+    // 1 MiB payloads. The queue holds paths and digests, so what it pins on the
+    // heap is independent of the payloads' size; the surplus is shed (and its
+    // files unlinked).
+    let capacity = core::constants::INGEST_QUEUE_CAPACITY;
+    let (qtx, qrx) = sync_channel::<ClipboardJob>(capacity);
+    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    PEAK_BYTES.store(before, Ordering::Relaxed);
+    let (mut queued, mut shed) = (0usize, 0usize);
+    let mut dir = core::get_cache_dir();
+    dir.push("bench-bound");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for i in 0..capacity * 2 {
+        let path = dir.join(format!("{i}.part"));
+        let file = File::create(&path).map_err(|e| e.to_string())?;
+        file.set_len(1024 * 1024).map_err(|e| e.to_string())?;
+        let spooled = SpooledFile::new(path, 1024 * 1024, [0u8; core::constants::DIGEST_LEN]);
+        let job = ClipboardJob::from_payload("image/gif".to_owned(), Payload::Spooled(Box::new(spooled)));
+        match ingest::enqueue(&qtx, job, Duration::ZERO) {
+            Enqueue::Queued => queued += 1,
+            Enqueue::Shed => shed += 1,
+            Enqueue::Closed => return Err("queue closed unexpectedly".into()),
+        }
+    }
+    let held = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    let files_left = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
+    println!(
+        "\nmemory bound (spooled): offered {} x 1 MiB into a queue of {capacity}: queued {queued}, shed {shed}, peak heap growth {:.3} MiB, spool files left on disk {files_left}",
+        capacity * 2,
+        held as f64 / (1024.0 * 1024.0)
+    );
+    if queued != capacity || shed != capacity || files_left != capacity {
+        return Err(format!("spooled queue bound violated: queued {queued}, shed {shed}, files {files_left}"));
+    }
+    drop(qrx);
+    drop(qtx);
+    let files_after = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    if files_after != 0 {
+        return Err(format!("{files_after} spool files outlived their queue"));
+    }
+    drop(tx);
+    drop(worker);
+    Ok(())
 }
 
 fn bench_queue(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
@@ -726,6 +969,12 @@ fn run_measurements(root: &Path) -> Result<(), String> {
     bench_payload(&mode, &mut rows);
     bench_queue(&mode, &mut rows)?;
     bench_sqlite(&mode, &mut rows)?;
+    // Last on purpose: these groups start threads and move tens of megabytes
+    // through the allocator, which would otherwise perturb the allocator state
+    // the earlier, older rows were recorded in (a 4 KiB enqueue measured 14 %
+    // slower when they ran first).
+    bench_splice(&mode, &mut rows);
+    bench_ingest(&mode, &mut rows)?;
 
     print_header();
     rows.iter().for_each(print_row);
