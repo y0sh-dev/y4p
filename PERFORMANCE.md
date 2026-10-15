@@ -1,4 +1,4 @@
-# PERFORMANCE — Baseline for the Zero-Copy Cycle (v0.7.1, extended in v0.7.2)
+# PERFORMANCE — Baseline for the Zero-Copy Cycle (v0.7.1, extended in v0.7.2 and v0.7.3)
 
 This document records the quantitative baseline against which the zero-copy milestones (v0.7.2 - v0.8.0) are judged: what the ingestion path costs today in time, allocations and memory, which bounds hold, and which targets the next milestones aim at. Numbers are measurements, not claims; every figure below was produced by the harness described in section 1 on the machine in section 2.
 
@@ -7,7 +7,7 @@ This document records the quantitative baseline against which the zero-copy mile
 ## 1. Reproducing the Numbers
 
 ```bash
-cargo bench -p y4p-daemon --bench baseline     # full measurement (well under a minute)
+cargo bench -p y4p-daemon --bench baseline     # full measurement (about 80 seconds since v0.7.3)
 cargo test  --workspace --all-targets          # runs the same harness in smoke mode: one pass, no timing
 ```
 
@@ -28,7 +28,7 @@ The harness ([`crates/daemon/benches/baseline.rs`](crates/daemon/benches/baselin
 | Item | Value |
 | :--- | :--- |
 | Date | 2026-10-14 |
-| Code | Sections 3.1-3.4: v0.7.0 ingestion, SQLite, hashing and MIME code with the v0.7.1 bounded queue and reader gate (recorded 2026-10-14). Section 3.5 and the v0.7.2 re-check at its end: v0.7.2 payload abstraction (recorded 2026-10-15, three full runs) |
+| Code | Sections 3.1-3.4: v0.7.0 ingestion, SQLite, hashing and MIME code with the v0.7.1 bounded queue and reader gate (recorded 2026-10-14). Section 3.5 and the v0.7.2 re-check at its end: v0.7.2 payload abstraction (recorded 2026-10-15, three full runs). Section 3.6 and its re-check: v0.7.3 streaming ingestion (recorded 2026-10-15, three full runs) |
 | CPU | AMD Ryzen 7 9700X (16 threads), cpufreq governor `powersave` |
 | OS / toolchain | Linux 7.2.9-zen1, rustc 1.97.1 |
 | Profile | `bench` inheriting `release`: `opt-level = "s"`, `lto = true`, `codegen-units = 1` (the shipped binary's settings; `"s"` favours size over speed) |
@@ -128,6 +128,46 @@ Every classification primitive is allocation-free and negligible. `normalize_uri
 
 **Re-check of sections 3.1-3.4 at v0.7.2** (same machine, three runs): SHA3, MIME, reader gate and SQLite rows are unchanged within the noise floor; allocation counts are identical everywhere; the memory-bound experiment still reports **64 queued, 64 shed, 65.0 MiB**. One measurable cost: the single-thread queue cases are 3-7 % slower (77-79 ns against 72 ns for 64 B, 95 against 92 ns for 4 KiB, 86 against 82 ns for a shed). `ClipboardJob` now holds a `Payload` enum (56 bytes) instead of a bare `Vec` (48 bytes), so each move through the channel is eight bytes larger and the job is constructed through a wrapper; the allocation count (2 calls, 74 B) is unchanged. About 5 ns per clipboard event is far below anything observable and buys a queue that can carry a descriptor or a file.
 
+### 3.6 Streaming ingestion (v0.7.3)
+
+`core::splice::copy_to_file` moves a pipe into a file with `splice(2)`, optionally `tee(2)`-ing the stream so a SHA3-256 digest is computed on the way; `FileSpooler` and the worker's `store_spooled` build on it ([`docs/01`](docs/01_wayland_streaming_io.md) section 2.4). Three full runs (the `splice` and `ingest` groups run last), spread under 2 % on every row quoted. Each operation creates a pipe, a feeding thread (above 32 KiB), and a fresh destination file, and unlinks it.
+
+**Pipe to file** (`splice` group; the digest is SHA3-256 in every row that has one):
+
+| Payload | Road | Median | Heap bytes / op | Heap calls |
+| :--- | :--- | ---: | ---: | ---: |
+| 1 MiB | `Vec` + SHA3 + write (the v0.7.2 road) | 6.60 ms | 4,194,523 | 24 |
+| 1 MiB | buffered copy + SHA3, 64 KiB stack buffer (the fallback) | 6.51 ms | 251 | 7 |
+| 1 MiB | `splice` only, no digest | **0.19 ms** (5.2 GiB/s) | 251 | 7 |
+| 1 MiB | `splice` + `tee` + SHA3 (the v0.7.3 road) | 6.52 ms | **251** | 7 |
+| 16 MiB | `Vec` + SHA3 + write (the v0.7.2 road) | 109.6 ms | 67,109,083 | 28 |
+| 16 MiB | `splice` only | **4.0 ms** (3.9 GiB/s) | 251 | 7 |
+| 16 MiB | `splice` + `tee` + SHA3 (the v0.7.3 road) | 105.2 ms | **251** | 7 |
+
+(The 251 bytes and 7 calls are the feeding thread and bookkeeping of the benchmark itself, constant in the payload size. The 32 KiB rows are the same story: 131,135 heap bytes for the `Vec` road against 123.)
+
+**Pipe to database, end to end** (`ingest` group; a real `DbWorker`, a real database and cache directory; every payload unique, GIF so the image pipeline does not touch it):
+
+| Payload | Road | Median | Heap bytes / op | Peak heap growth |
+| :--- | :--- | ---: | ---: | ---: |
+| 1 MiB | `Vec` in the ingestion thread (v0.7.2) | 6.89 ms | 4,195,072 | 2.00 MiB |
+| 1 MiB | spooled: `splice` + adopt (v0.7.3) | 6.82 ms | **6,477** | **0.00 MiB** |
+| 16 MiB | `Vec` in the ingestion thread (v0.7.2) | 111.5 ms | 67,110,011 | 32.00 MiB |
+| 16 MiB | spooled: `splice` + adopt (v0.7.3) | **105.7 ms** | **6,477** | **0.00 MiB** |
+
+**Fingerprint encoding** (`sha3` group, 64 B payload): `to_hex` **0.90 us, 1 allocation** against the previous per-byte `format!` **2.03 us, 35 allocations**: the worker's hex encoder was replaced (the digest itself is unchanged).
+
+**Queue memory bound with spooled payloads**: offered 128 x 1 MiB into a queue of 64 with zero patience: **64 queued, 64 shed, peak heap growth 0.010 MiB** (about 160 bytes per queued job), and exactly 64 spool files on disk while queued and 0 once the queue is dropped. The in-memory experiment of section 4.1 still reports **65.0 MiB**.
+
+Reading the numbers:
+
+- **The kernel does the copying 26-34 times faster than SHA3 can hash** (5.2 GiB/s against 154 MiB/s on 1 MiB, 3.9 GiB/s on 16 MiB). With a digest in the loop, wall-clock time is the hash's: `splice` + `tee` + SHA3 is within 1 % of the buffered copy and 1.3-4 % faster than the `Vec` road. This is exactly what section 5 predicted, and it fixes what the milestone buys: **memory, not speed**. The heap cost of a 16 MiB payload falls from 64 MiB allocated (32 MiB peak, the doubling `Vec`) to a constant 251 bytes.
+- **`tee` costs nothing measurable here**: the two SHA3 rows with and without `tee` (kernel path against user-space buffered path) differ by less than 1 % because the stack-buffer copy (about 10 GB/s) is invisible next to 154 MiB/s of hashing. `tee` is kept because it leaves the *destination* write entirely in the kernel and is free when no digest is wanted (`NoTap` creates no scratch pipe): `splice` only is 34x faster than the `Vec` road at 1 MiB.
+- **Hashing moves off the single worker thread.** The digest is computed by the ingestion threads (up to 8, in parallel) while the data streams; the worker no longer hashes a spooled payload at all (it only maps the file and renames it). The end-to-end table measures one payload at a time, so it cannot show this effect; it shows that the extra machinery (file create, rename, mapping) costs less than the allocation it replaces (6.82 against 6.89 ms at 1 MiB).
+- **A small payload pays nothing**: one 4 KiB head read decides, and a stream that ends inside it never creates a file.
+
+**Re-check of sections 3.1-3.5 at v0.7.3** (same machine, three runs): SHA3 digest, MIME, reader gate, payload and SQLite rows are unchanged within the noise floor, and every allocation count is identical. Single-thread queue rows: 77.7 ns (64 B), 96.5-97.0 ns (4 KiB), 86.4-87.2 ns (shed), against 77-79, 95 and 86 at v0.7.2: unchanged (`Payload` is still 32 bytes; a test asserts it, so the boxed `Spooled` variant widens no queue slot). A first ordering of the harness, with the new groups *before* the queue group, measured the 4 KiB enqueue at 108-110 ns: the new groups start threads and push tens of megabytes through the allocator, which changes the allocator state later rows run in. They now run last, and that row is back to 97 ns, which is why the harness comment says so. The cross-thread `producer/consumer` rows vary between 4 and 16 us per message across builds *and* orders (v0.7.2 itself: 7.1-9.0 us at 64 B); they are scheduling-bound, sit outside the noise-floor claim of section 5, and no conclusion is drawn from them.
+
 ---
 
 ## 4. Memory Bounds
@@ -137,6 +177,7 @@ Every classification primitive is allocation-free and negligible. `normalize_uri
 | Experiment | Result |
 | :--- | :--- |
 | Offer 128 x 1 MiB to a queue of capacity 64 with zero patience | **64 queued, 64 shed**; peak heap growth **65.0 MiB** (64 queued + the one payload in flight). The surplus is dropped, not held |
+| The same, with spooled payloads (v0.7.3) | **64 queued, 64 shed**; peak heap growth **0.010 MiB**; 64 spool files while queued, 0 afterwards (shed jobs unlink theirs) |
 
 ### 4.2 Worst case, by construction
 
@@ -152,7 +193,9 @@ The bounds are **counts**, not byte budgets; the worst-case resident payload mem
 
 Theoretical ceiling: (64 + 8 + 1) x 256 MiB. In practice clipboard payloads are kilobytes (text) to a few megabytes (screenshots), where the same bounds mean tens of megabytes. **The count bound is not a byte bound**; section 6 names the follow-up.
 
-File descriptors: at most 8 pipe read ends from ingestion at any time, independent of how fast selections change.
+Since v0.7.3 that ceiling is a *heap* ceiling only for text, small payloads and the in-memory fallback. A large non-text payload is spooled to disk and queued as a path and a digest: the same product (72 x 256 MiB) then bounds **disk** space in the cache directory's `spool/`, and the heap stays flat (section 3.6). Disk is the cheaper resource, but the bound is as loose as the heap one was; a spool byte budget belongs with section 6, item 1.
+
+File descriptors: at most 8 ingestion readers at any time, independent of how fast selections change. A reader that spools holds four (pipe read end, spool file, the two ends of the `tee` scratch pipe), so at most 32; a queued job holds none.
 
 ### 4.3 Payload copies on the current ingest path
 
@@ -160,13 +203,15 @@ By inspection of the code (not measured):
 
 | Step | Userspace copy of the payload bytes |
 | :--- | :--- |
-| 1. compositor pipe to `Vec<u8>` (`read_to_end`) | 1; for text-like MIMEs the buffer is pre-sized to one page (v0.7.2), so a typical payload is read with no reallocation copy (section 3.5); other types still grow by doubling |
-| 2. `ClipboardJob` through the queue, and the worker's `into_bytes` | 0 (moved; `Payload::Memory` is handed over without a copy) |
-| 3. text and unsupported types: hash, then insert | 0 (hashed in place; SQLite and the cache file take a borrowed slice) |
-| 4. raster image: `Vec` to `magick` stdin, `magick` stdout to a new `Vec` | 2 (pipe relays) |
+| 1. compositor pipe to `Vec<u8>` (`read_to_end`): text, payloads under one page, and the fallback | 1; for text-like MIMEs the buffer is pre-sized to one page (v0.7.2), so a typical payload is read with no reallocation copy (section 3.5) |
+| 1'. compositor pipe to spool file: large non-text payloads (v0.7.3) | 0 into the heap: `splice(2)` into the file; the digest reads the `tee`d duplicate through a 64 KiB **stack** buffer (the one copy SHA3 itself needs) |
+| 2. `ClipboardJob` through the queue, and the worker's `into_bytes` | 0 (moved; `Payload::Memory` is handed over without a copy; a `Spooled` job is a path) |
+| 3. text and unsupported types: hash, then insert | 0 (hashed in place; SQLite takes a borrowed slice) |
+| 3'. spooled, not transcoded: persist (v0.7.3) | 0 (digest already known; the file is mapped for the storage layer, and an image is renamed into the cache: same inode) |
+| 4. raster image: `Vec` to `magick` stdin, `magick` stdout to a new `Vec` | 2 (pipe relays), plus 1 to read a spooled one back (v0.7.4) |
 | 5. egress (paste): cached image via `sendfile(2)` | 0 (kernel to kernel) |
 
-Ingestion has one unavoidable userspace copy for every payload and two more for images; egress already has none. That asymmetry is what v0.7.2 - v0.7.4 address.
+Ingestion now has no heap copy for a large payload that bypasses the converter, one for everything else, and two more for rasters; egress has none. Closing the raster gap is v0.7.4.
 
 ---
 
@@ -176,13 +221,13 @@ Proposals derived from the baseline above, to be agreed per milestone. "Baseline
 
 | Metric | Baseline | Target | Milestone |
 | :--- | :--- | :--- | :--- |
-| Allocations per fingerprint | 35 | <= 1 (the result `String`) | v0.7.3 (not in the v0.7.2 brief) |
-| Fingerprint of a 64 B payload | 2.04 us | <= 1.0 us | v0.7.3 (not in the v0.7.2 brief) |
-| Peak payload buffer per in-flight reader | whole payload (up to 256 MiB) | <= 64 KiB chunk for streamed payloads | v0.7.3 |
-| Userspace copies, large non-image payload | 1 | 0 (`splice(2)` into the cache file, hash streamed alongside) | v0.7.3 |
+| Allocations per fingerprint | 35 | <= 1 (the result `String`) | **v0.7.3: met** (1; section 3.6) |
+| Fingerprint of a 64 B payload | 2.04 us | <= 1.0 us | **v0.7.3: met** (0.90 us) |
+| Peak payload buffer per in-flight reader | whole payload (up to 256 MiB) | <= 64 KiB chunk for streamed payloads | **v0.7.3: met** for spooled payloads (64 KiB stack buffer, 0 bytes of heap) |
+| Userspace copies, large payload that bypasses the converter | 1 | 0 (`splice(2)` into the cache file, hash streamed alongside) | **v0.7.3: met** (section 4.3) |
 | Userspace copies, raster image | 3 | <= 1 (descriptor to `magick`) | v0.7.4 |
-| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.3 (not in the v0.7.2 brief; the descriptor abstraction now makes the size available before a read) |
-| SHA3 throughput | 158 MiB/s | no regression; overlap with the transfer so that hashing no longer serialises behind it | v0.7.3 |
+| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.5 - v0.7.8 (hardening; for spooled payloads the budget is disk, see section 4.2) |
+| SHA3 throughput | 158 MiB/s | no regression; overlap with the transfer so that hashing no longer serialises behind it | **v0.7.3: met in the sense that matters**: no regression (154-159 MiB/s), and hashing runs on the ingestion threads in parallel instead of the single worker; a single stream is still hash-bound (section 3.6) |
 | Allocations to read a small text payload from a pipe | 3-9 | 1 | **v0.7.2: met** (section 3.5) |
 | Existing rows above | as measured | no regression beyond the 3 % noise floor (25 % for short uri-list and cross-thread cases) | every milestone |
 
@@ -192,6 +237,6 @@ One consequence to plan around: because SHA3-256 costs about 6.3 ms per MiB agai
 
 ## 6. Open Questions Carried Forward
 
-1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only. A byte budget (an atomic counter of queued bytes) now has what it needs from v0.7.2: `Payload::len_hint` reports the size without I/O. It was not part of v0.7.2's brief and is not implemented.
-2. **Hash cost.** At 158 MiB/s with `opt-level = "s"`, hashing dominates large payloads. The levers are hashing overlapped with the transfer (v0.7.3's streaming hash) and a per-package `opt-level = 3` override for the Keccak crates in `[profile.release.package]`, which adds no crate but changes release-profile settings and therefore needs approval; the second has not been measured.
+1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only, and since v0.7.3 the products in section 4.2 bound disk (the spool directory) rather than heap for large payloads. A byte budget (an atomic counter of queued bytes) has what it needs: `Payload::len_hint` reports the size without I/O, and a `SpooledFile` knows its length. It is not implemented.
+2. **Hash cost.** At 154-159 MiB/s with `opt-level = "s"`, hashing dominates large payloads, and v0.7.3 shows it is the *only* thing that does (the kernel copy is 26-34 times faster). Overlapping it with the transfer is done; the remaining lever is a per-package `opt-level = 3` override for the Keccak crates in `[profile.release.package]`, which adds no crate but changes release-profile settings and therefore needs approval; the second has not been measured.
 3. **Disk-backed numbers.** The recorded run is on tmpfs. A run with `Y4P_BENCH_DIR` on the real data disk should be added once, because `fsync` behaviour changes the SQLite rows by orders of magnitude.
