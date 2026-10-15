@@ -4,10 +4,16 @@
 // crates/daemon/src/worker.rs
 
 use crate::core::constants::*;
+use crate::core::mapped::MappedFile;
+use crate::core::payload::{to_hex, Payload, SpooledFile};
+use crate::image::route::{wants_transcode, SNIFF_HEAD_BYTES};
 use crate::metrics::DaemonMetrics;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
 use sha3::{Digest, Sha3_256};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 /// Owns the single writer connection and its background thread. All
@@ -21,10 +27,14 @@ use std::sync::{mpsc, Arc};
 ///
 /// A job's payload is materialised on this thread, just before `process_job`,
 /// by `ClipboardJob::into_bytes` under the same `MAX_PAYLOAD_BYTES` bound as
-/// ingestion. Ingestion currently always sends an in-memory payload, which that
-/// call hands over without a copy; a descriptor- or file-backed one is read
-/// here, where blocking is expected. A payload that cannot be materialised is
-/// logged and dropped; it never stops the worker.
+/// ingestion. An in-memory payload is handed over without a copy; a descriptor-
+/// or file-backed one is read here, where blocking is expected. A payload that
+/// cannot be materialised is logged and dropped; it never stops the worker.
+///
+/// A *spooled* payload (a large one the ingestion thread already drained to a
+/// file, fingerprinting it on the way) takes a different road, `store_spooled`:
+/// unless the image pipeline wants to rewrite it, its bytes never enter the
+/// heap at all.
 ///
 /// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
 /// conversion included, falls behind, producers wait and then shed rather than
@@ -39,15 +49,19 @@ impl DbWorker {
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let Some((mime, data)) = materialise(job) else { continue };
-                let (mime, data, hash) = process_job(mime, data);
-                match db.insert_with_hash(&mime, &data, &hash, max_history) {
-                    Ok(_) => {
+                let ClipboardJob { mime, payload } = job;
+                let stored = match payload {
+                    Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
+                    payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+                };
+                match stored {
+                    Ok(Some((mime, len))) => {
                         metrics.record_ingress();
                         if verbose {
-                            println!("{}", log_save(&mime, data.len()));
+                            println!("{}", log_save(&mime, len));
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
                 }
             }
@@ -61,6 +75,103 @@ impl DbWorker {
     pub fn sender(&self) -> mpsc::SyncSender<ClipboardJob> {
         self.tx.clone()
     }
+}
+
+/// What was saved: the MIME it was recorded under and its size in bytes.
+type Saved = (String, usize);
+
+/// The in-memory road: materialise, route through the image pipeline, hash,
+/// insert. `Ok(None)` means the payload could not be materialised (logged).
+fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usize) -> Result<Option<Saved>, String> {
+    let Some((mime, data)) = materialise(job) else { return Ok(None) };
+    let (mime, data, hash) = process_job(mime, data);
+    db.insert_with_hash(&mime, &data, &hash, max_history)?;
+    Ok(Some((mime, data.len())))
+}
+
+/// The streaming road, for a payload already on disk with its fingerprint.
+///
+/// 1. If the first bytes say the image pipeline would convert it, it is read
+///    back into memory and takes the in-memory road (`magick` works on bytes
+///    until the descriptor-aware image pipeline of the next milestone).
+/// 2. Otherwise it is stored exactly as it arrived, and the digest computed
+///    while it streamed in is the database key: nothing is hashed again.
+///    The storage layer wants a `&[u8]`, so the spool file is mapped (page
+///    cache, no heap, and untouched pages are never even read). A payload that
+///    storage keeps in a cache file is *adopted*: the spool file is renamed to
+///    its final `<hash>.cache` name before the insert, so storage finds it in
+///    place and writes nothing. Everything else is inserted from the mapping,
+///    and the spool file is then deleted.
+///
+/// A mapping that cannot be made falls back to reading the file; a failed or
+/// skipped insert takes an adopted file back out of the cache again.
+fn store_spooled(db: &mut ClipboardDb, mime: String, spooled: SpooledFile, max_history: usize) -> Result<Option<Saved>, String> {
+    if wants_transcode(&mime, &read_head(spooled.path())) {
+        return store_materialised(db, ClipboardJob::from_payload(mime, Payload::Spooled(Box::new(spooled))), max_history);
+    }
+
+    let hash = spooled.hex_digest();
+    // SAFETY: the spool file is private to this process: created `0600` in a
+    // `0700` directory under a unique name by `spool::FileSpooler`, written only
+    // by that copy (which has finished: the payload was queued only afterwards),
+    // and from here on renamed or unlinked, never written or truncated, by this
+    // thread alone. `MappedFile::map`'s contract is met.
+    let mapped = unsafe { MappedFile::map(spooled.path()) };
+    let mapped = match mapped {
+        Ok(m) if m.len() as u64 == spooled.len() => m,
+        // Unmappable (or not the recorded size): read it, keeping the digest.
+        _ => {
+            let data = Payload::Spooled(Box::new(spooled)).read_bounded(MAX_PAYLOAD_BYTES).map_err(|e| e.to_string())?;
+            db.insert_with_hash(&mime, &data, &hash, max_history)?;
+            return Ok(Some((mime, data.len())));
+        }
+    };
+
+    let adopted = adopt_into_cache(&mime, spooled.path(), &crate::core::cache_file_path(&hash));
+    if adopted.is_some() {
+        let _ = spooled.into_path();
+    }
+    let inserted = db.insert_with_hash(&mime, &mapped, &hash, max_history);
+    // `Ok(-1)` is storage declining the payload (a sensitive MIME): no row
+    // references the file, so an adopted one must not stay behind as debris.
+    if let Some(path) = adopted
+        && !matches!(inserted, Ok(id) if id >= 0)
+    {
+        let _ = fs::remove_file(path);
+    }
+    inserted.map(|_| Some((mime, mapped.len())))
+}
+
+/// Whether `crates/storage` keeps a payload of this MIME in a cache file rather
+/// than in the database row (`SqliteStore::upsert_record`'s `is_image`). The
+/// storage layer is frozen and keeps the rule private; an integration test pins
+/// this copy to what storage actually does.
+pub fn stored_in_cache_file(mime: &str) -> bool {
+    mime.starts_with("image/") || mime.contains("gif")
+}
+
+/// Renames `spool` to `target` when `mime` is a cache-file payload and nothing
+/// is there yet. Returns `target` when the file was adopted, so a failed insert
+/// can take it back out; `None` when it was not (the caller then lets the spool
+/// file be deleted, and storage finds or writes its own cache file).
+///
+/// Never replaces an existing file: that one is the same content under the same
+/// hash and may already back a row.
+fn adopt_into_cache(mime: &str, spool: &Path, target: &Path) -> Option<PathBuf> {
+    if !stored_in_cache_file(mime) || target.exists() {
+        return None;
+    }
+    fs::rename(spool, target).ok().map(|()| target.to_path_buf())
+}
+
+/// The first bytes of a spool file, enough for the image router to classify it.
+/// Empty if the file cannot be read, which classifies as "nothing to convert".
+fn read_head(path: &Path) -> Vec<u8> {
+    let mut head = Vec::with_capacity(SNIFF_HEAD_BYTES);
+    if let Ok(file) = File::open(path) {
+        let _ = file.take(SNIFF_HEAD_BYTES as u64).read_to_end(&mut head);
+    }
+    head
 }
 
 /// Reads a job's payload into memory under the ingestion bound, or logs why it
@@ -98,7 +209,7 @@ fn process_job(mime: String, data: Vec<u8>) -> (String, Vec<u8>, String) {
 fn fingerprint(data: &[u8]) -> String {
     let mut hasher = Sha3_256::new();
     hasher.update(data);
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    to_hex(hasher.finalize().as_slice())
 }
 
 #[cfg(test)]
@@ -152,6 +263,97 @@ mod tests {
         assert!(materialise(ClipboardJob::new("text/plain".to_owned(), Vec::new())).is_none());
         let missing = ClipboardJob::from_payload("image/png".to_owned(), Payload::File("/definitely/not/there".into()));
         assert!(materialise(missing).is_none());
+    }
+
+    // --- spooled road: classification, adoption, head sniffing ---
+
+    fn scratch(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("y4p-worker-spool-{}-{}", std::process::id(), tag));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn only_image_like_mimes_live_in_cache_files() {
+        for mime in ["image/png", "image/gif", "image/svg+xml", "image/webp", "application/x-gif"] {
+            assert!(stored_in_cache_file(mime), "{mime}");
+        }
+        for mime in ["text/plain", "application/pdf", "application/octet-stream", "text/uri-list", ""] {
+            assert!(!stored_in_cache_file(mime), "{mime}");
+        }
+    }
+
+    #[test]
+    fn an_image_spool_file_is_renamed_into_place_not_copied() {
+        let spool = scratch("adopt-src");
+        let target = scratch("adopt-dst");
+        fs::write(&spool, b"gif bytes").unwrap();
+        let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&spool).unwrap());
+
+        assert_eq!(adopt_into_cache("image/gif", &spool, &target), Some(target.clone()));
+
+        assert!(!spool.exists(), "the spool name is gone");
+        assert_eq!(fs::read(&target).unwrap(), b"gif bytes");
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(&target).unwrap()), ino, "same inode: renamed, not copied");
+        fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn adoption_never_replaces_an_existing_cache_file() {
+        let spool = scratch("keep-src");
+        let target = scratch("keep-dst");
+        fs::write(&spool, b"new").unwrap();
+        fs::write(&target, b"existing").unwrap();
+
+        assert_eq!(adopt_into_cache("image/gif", &spool, &target), None);
+
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        assert!(spool.exists(), "an unadopted spool file stays for its owner to delete");
+        fs::remove_file(spool).unwrap();
+        fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn a_payload_storage_keeps_in_the_database_is_not_adopted() {
+        let spool = scratch("inline-src");
+        let target = scratch("inline-dst");
+        fs::write(&spool, b"%PDF").unwrap();
+        assert_eq!(adopt_into_cache("application/pdf", &spool, &target), None);
+        assert!(spool.exists() && !target.exists());
+        fs::remove_file(spool).unwrap();
+    }
+
+    #[test]
+    fn a_failed_rename_is_not_an_adoption() {
+        let spool = scratch("norename-src");
+        fs::write(&spool, b"x").unwrap();
+        let target = Path::new("/definitely/not/a/directory/y4p.cache");
+        assert_eq!(adopt_into_cache("image/gif", &spool, target), None);
+        fs::remove_file(spool).unwrap();
+    }
+
+    #[test]
+    fn the_sniffed_head_is_bounded_and_a_missing_file_is_empty() {
+        let path = scratch("head");
+        fs::write(&path, vec![9u8; 10_000]).unwrap();
+        assert_eq!(read_head(&path).len(), SNIFF_HEAD_BYTES);
+        fs::write(&path, b"short").unwrap();
+        assert_eq!(read_head(&path), b"short");
+        fs::remove_file(&path).unwrap();
+        assert!(read_head(&path).is_empty());
+    }
+
+    #[test]
+    fn the_hex_fingerprint_matches_the_formatted_reference_for_every_byte_value() {
+        // The previous implementation formatted each byte with `{:02x}`; the
+        // single-allocation encoder must produce the same text.
+        let data: Vec<u8> = (0..=255u8).collect();
+        let mut hasher = Sha3_256::new();
+        hasher.update(&data);
+        let reference = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        assert_eq!(fingerprint(&data), reference);
+        assert_eq!(fingerprint(b"").len(), 64);
     }
 
     // --- process_job (image routing -> hash) ---

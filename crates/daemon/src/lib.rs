@@ -13,8 +13,9 @@ use y4p_storage as storage;
 use y4p_wayland as wayland;
 
 mod ipc;
-mod metrics;
-mod worker;
+pub mod metrics;
+pub mod spool;
+pub mod worker;
 
 use crate::storage::{ClipboardDb, ContentLocation};
 use crate::core::payload::Payload;
@@ -95,6 +96,13 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         }
     };
     let mut state = WaylandState::new_daemon(writer.sender(), verbose, config);
+    // Large payloads are drained to disk by the kernel instead of into the heap.
+    // Without a usable spool directory the daemon still works: every payload is
+    // then read into memory, as before.
+    match spool::FileSpooler::open(crate::core::spool_dir_path()) {
+        Ok(spooler) => state = state.with_spooler(Arc::new(spooler)),
+        Err(e) => eprintln!("{}spool directory unavailable, large payloads will be buffered in memory: {}", LOG_WARN, e),
+    }
 
     if event_queue.roundtrip(&mut state).is_err() {
         eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);
