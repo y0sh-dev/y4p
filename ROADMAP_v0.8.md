@@ -40,7 +40,7 @@ While `y4p` already achieves true kernel-level zero-copy on the egress path (pas
 
 Visual progress checklist across the zero-copy development cycle:
 
-- [ ] **v0.7.1: Hygiene, Queue Backpressure & Benchmark Baseline**
+- [x] **v0.7.1: Hygiene, Queue Backpressure & Benchmark Baseline**
   - **Hygiene**:
     - Fix `crates/cli/src/help.rs` (`awk '{print $1}'` shell escaping in examples).
     - Remove unwired / dead code paths carried over from prior iterations (`open_read_only`).
