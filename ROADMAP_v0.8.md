@@ -21,8 +21,8 @@ While `y4p` already achieves true kernel-level zero-copy on the egress path (pas
 
 ## 3. Architecture Invariants & Design Principles
 
-1. **Storage Invariant**:
-   `crates/storage/` remains untouched (0 lines changed) unless an unavoidable schema migration or storage layout change is formally proven and approved by the human supervisor.
+1. **Storage Invariant & Evolutionary Exception**:
+   `crates/storage/` remained strictly untouched (0 lines changed) across `v0.7.1` through `v0.7.3`. In `v0.7.4 Part 2`, this invariant is formally lifted upon agreement with the human supervisor to execute extreme zero-copy storage optimization (direct file/descriptor adoption), eliminating userspace memory mapping whilst rigorously preserving data safety and schema invariants.
 2. **Zero Panic Guarantee**:
    `clippy::unwrap_used`, `clippy::expect_used`, and `clippy::panic` remain denied across all production workspace members via workspace lints.
 3. **Strict Crate Boundaries & Inward Flow**:
@@ -59,15 +59,21 @@ Visual progress checklist across the zero-copy development cycle:
   - Define clear routing boundaries between small inline payloads (in-memory fast path, e.g. < 4 KiB text) and large streamed payloads (descriptor / file-backed streaming path).
   - Prepare interface contracts across `y4p-wayland`, `y4p-daemon`, and `y4p-image`.
 
-- [ ] **v0.7.3: Zero-Copy Ingestion (`splice(2)` & Stream I/O)**
+- [x] **v0.7.3: Zero-Copy Ingestion (`splice(2)` & Stream I/O)**
   - Implement direct pipe streaming from `y4p-wayland` into `y4p-daemon` worker.
   - Leverage Linux `splice(2)` to stream data directly into temporary cache files without intermediate userspace `Vec<u8>` heap allocation.
   - Integrate streaming SHA3-256 fingerprint calculation alongside kernel streaming (via `tee(2)` or streaming block-hashing).
 
-- [ ] **v0.7.4: Zero-Copy Image & Scratch Pipeline Integration**
-  - Connect descriptor / streaming payloads with `y4p-image` sandbox (`ScratchDir`).
-  - Optimise image preprocessing invocation (`magick`) with direct pipe streaming where possible.
-  - Complete bidirectional streaming symmetry with the existing `sendfile(2)` egress mechanism.
+- [ ] **v0.7.4: Zero-Copy Image, Scratch Pipeline & Extreme Storage Optimization**
+  - **Part 1 (PR 1) — Zero-Copy Image & Scratch Pipeline Integration**:
+    - Connect descriptor / spooled payloads with `y4p-image` sandbox (`ScratchDir`).
+    - Optimise image preprocessing invocation (`magick`) with direct pipe streaming where possible.
+    - Complete bidirectional streaming symmetry with the existing `sendfile(2)` egress mechanism.
+  - **Part 2 (PR 2) — Extreme Storage Optimization (Zero-Copy & File-Backed Adoption)**:
+    - Lift legacy `&[u8]` slice constraints in `crates/storage` to support direct file-backed / descriptor adoption (`insert_file_with_hash`).
+    - Eliminate `MappedFile` (`mmap`/`munmap` unsafe blocks) and external mirrored cache layout rules.
+    - Investigate SQLite incremental blob streaming (`sqlite3_blob_open`) for high-throughput zero-heap persistence.
+    - Maintain strict schema compatibility, zero corruptions, and unpinned rotation invariants.
 
 - [ ] **v0.7.5 — v0.7.8: Benchmarking, Profiling & Fault Tolerance**
   - Quantitative comparison against v0.7.0 baseline in `PERFORMANCE.md` (allocations, throughput, CPU time).
