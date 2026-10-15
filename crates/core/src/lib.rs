@@ -6,6 +6,7 @@
 pub mod constants;
 pub mod utils;
 pub mod config;
+pub mod payload;
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
