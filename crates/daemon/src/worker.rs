@@ -19,6 +19,13 @@ use std::sync::{mpsc, Arc};
 /// never blocks on `magick`. Jobs are therefore also persisted strictly in
 /// arrival order.
 ///
+/// A job's payload is materialised on this thread, just before `process_job`,
+/// by `ClipboardJob::into_bytes` under the same `MAX_PAYLOAD_BYTES` bound as
+/// ingestion. Ingestion currently always sends an in-memory payload, which that
+/// call hands over without a copy; a descriptor- or file-backed one is read
+/// here, where blocking is expected. A payload that cannot be materialised is
+/// logged and dropped; it never stops the worker.
+///
 /// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
 /// conversion included, falls behind, producers wait and then shed rather than
 /// letting payloads accumulate (see `y4p_wayland::ingest`).
@@ -32,7 +39,8 @@ impl DbWorker {
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let (mime, data, hash) = process_job(job.mime, job.data);
+                let Some((mime, data)) = materialise(job) else { continue };
+                let (mime, data, hash) = process_job(mime, data);
                 match db.insert_with_hash(&mime, &data, &hash, max_history) {
                     Ok(_) => {
                         metrics.record_ingress();
@@ -52,6 +60,18 @@ impl DbWorker {
     /// can be queued without touching the worker thread directly.
     pub fn sender(&self) -> mpsc::SyncSender<ClipboardJob> {
         self.tx.clone()
+    }
+}
+
+/// Reads a job's payload into memory under the ingestion bound, or logs why it
+/// cannot and yields `None` so the worker moves on to the next job.
+fn materialise(job: ClipboardJob) -> Option<(String, Vec<u8>)> {
+    match job.into_bytes(MAX_PAYLOAD_BYTES) {
+        Ok(materialised) => Some(materialised),
+        Err(e) => {
+            eprintln!("{}worker discarded a payload: {}", LOG_ERROR, e);
+            None
+        }
     }
 }
 
@@ -85,6 +105,54 @@ fn fingerprint(data: &[u8]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // --- materialise (payload -> bytes) ---
+
+    use crate::core::payload::{Payload, StreamDescriptor};
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+
+    fn stream_job(mime: &str, bytes: &[u8], hint: Option<u64>) -> ClipboardJob {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(bytes).unwrap();
+        drop(writer);
+        ClipboardJob::from_payload(mime.to_owned(), Payload::Stream(StreamDescriptor::new(OwnedFd::from(reader), hint)))
+    }
+
+    #[test]
+    fn an_in_memory_job_is_handed_over_without_a_copy() {
+        let data = b"hello clipboard".to_vec();
+        let ptr = data.as_ptr();
+        let (mime, out) = materialise(ClipboardJob::new("text/plain".to_owned(), data)).unwrap();
+        assert_eq!(mime, "text/plain");
+        assert_eq!(out.as_ptr(), ptr, "the worker must not copy an in-memory payload");
+    }
+
+    #[test]
+    fn a_streamed_job_is_read_in_full_then_processed_like_any_other() {
+        let (mime, data) = materialise(stream_job("text/plain", b"streamed text", Some(13))).unwrap();
+        let (mime2, data2, hash) = process_job(mime, data);
+        assert_eq!((mime2.as_str(), data2.as_slice()), ("text/plain", b"streamed text".as_slice()));
+        assert_eq!(hash, fingerprint(b"streamed text"));
+    }
+
+    #[test]
+    fn a_file_backed_job_is_read_from_disk() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("y4p-worker-test-{}", std::process::id()));
+        std::fs::write(&path, b"on disk").unwrap();
+        let job = ClipboardJob::from_payload("text/plain".to_owned(), Payload::File(path.clone()));
+        assert_eq!(materialise(job).unwrap().1, b"on disk");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_job_that_cannot_be_read_is_dropped_so_the_worker_carries_on() {
+        assert!(materialise(stream_job("text/plain", b"", None)).is_none(), "an empty stream is not a payload");
+        assert!(materialise(ClipboardJob::new("text/plain".to_owned(), Vec::new())).is_none());
+        let missing = ClipboardJob::from_payload("image/png".to_owned(), Payload::File("/definitely/not/there".into()));
+        assert!(materialise(missing).is_none());
+    }
 
     // --- process_job (image routing -> hash) ---
     //
