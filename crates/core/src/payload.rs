@@ -7,11 +7,13 @@
 //! ingress (`y4p-wayland` -> `y4p-daemon`) and egress (`y4p-daemon` ->
 //! `y4p-wayland`).
 //!
-//! - [`Payload`]: the three places bytes can be -- a heap buffer, a streaming
-//!   descriptor ([`StreamDescriptor`]) or a file on disk.
-//! - [`PayloadReader`]: an `enum` implementing [`Read`] over those three, so a
-//!   consumer reads any payload without a `Box<dyn Read>` allocation and can
-//!   still ask for the underlying descriptor (for `sendfile(2)`/`splice(2)`).
+//! - [`Payload`]: the places bytes can be -- a heap buffer, a streaming
+//!   descriptor ([`StreamDescriptor`]), a file on disk, or a [`SpooledFile`]
+//!   (a payload already drained into a file this value owns and deletes).
+//! - [`PayloadReader`]: an `enum` implementing [`Read`] over the file- and
+//!   memory-backed variants, so a consumer reads any payload without a
+//!   `Box<dyn Read>` allocation and can still ask for the underlying
+//!   descriptor (for `sendfile(2)`/`splice(2)`).
 //! - [`route_payload`]: the heuristic that separates the in-memory fast path
 //!   from the descriptor path.
 //! - [`read_bounded`]: the single "read at most N bytes, never truncate"
@@ -24,9 +26,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::constants::{INLINE_PAYLOAD_THRESHOLD_BYTES, PAYLOAD_PREALLOC_CAP_BYTES};
+use crate::constants::{DIGEST_LEN, INLINE_PAYLOAD_THRESHOLD_BYTES, PAYLOAD_PREALLOC_CAP_BYTES};
 use crate::utils::is_text_like_mime;
 
 // --- StreamDescriptor ---
@@ -102,8 +104,16 @@ pub enum Payload {
     Memory(Vec<u8>),
     /// Still in flight on a descriptor; nothing has been read yet.
     Stream(StreamDescriptor),
-    /// On disk (the content cache). Opened lazily, by whoever reads it.
+    /// On disk (the content cache). Opened lazily, by whoever reads it. The
+    /// file is borrowed: dropping the payload never touches it.
     File(PathBuf),
+    /// A payload already drained from its pipe into a spool file (see
+    /// [`SpooledFile`]), complete and fingerprinted. Unlike `File`, the file is
+    /// *owned*: it is deleted when the payload is dropped, so a job that is
+    /// shed from a full queue or abandoned by a failing worker leaves nothing
+    /// behind. Boxed to keep `Payload` (and so every queue slot) the size of
+    /// the other variants.
+    Spooled(Box<SpooledFile>),
 }
 
 impl Payload {
@@ -119,6 +129,7 @@ impl Payload {
             Self::Memory(data) => Some(data.len() as u64),
             Self::Stream(stream) => stream.len_hint(),
             Self::File(_) => None,
+            Self::Spooled(spooled) => Some(spooled.len()),
         }
     }
 
@@ -126,18 +137,21 @@ impl Payload {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Memory(data) => Some(data),
-            Self::Stream(_) | Self::File(_) => None,
+            Self::Stream(_) | Self::File(_) | Self::Spooled(_) => None,
         }
     }
 
     /// An independent handle to the same bytes, for a source that is served
     /// more than once: the buffer is copied, the path is cloned, and a stream
     /// is `dup(2)`ed (see [`StreamDescriptor::try_clone`] for what that shares).
+    /// A spooled payload owns its file's lifetime, so it cannot be duplicated
+    /// (`ErrorKind::Unsupported`); read it, or hand its path on explicitly.
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(match self {
             Self::Memory(data) => Self::Memory(data.clone()),
             Self::Stream(stream) => Self::Stream(stream.try_clone()?),
             Self::File(path) => Self::File(path.clone()),
+            Self::Spooled(_) => return Err(io::Error::from(io::ErrorKind::Unsupported)),
         })
     }
 
@@ -151,6 +165,12 @@ impl Payload {
                 let file = File::open(&path)?;
                 let len = file.metadata().ok().map(|m| m.len());
                 PayloadReader::File { file, len }
+            }
+            // The open descriptor outlives the unlink that dropping `spooled`
+            // performs, so the reader stays valid and nothing is left on disk.
+            Self::Spooled(spooled) => {
+                let file = File::open(spooled.path())?;
+                PayloadReader::File { file, len: Some(spooled.len()) }
             }
         })
     }
@@ -183,8 +203,91 @@ impl Payload {
                 }
                 read_bounded(file, limit, len)
             }
+            Self::Spooled(spooled) => {
+                if spooled.len() > limit {
+                    return Err(PayloadError::TooLarge { limit });
+                }
+                let file = File::open(spooled.path())?;
+                read_bounded(file, limit, Some(spooled.len()))
+            }
         }
     }
+}
+
+// --- SpooledFile ---
+
+/// A complete payload on disk in the spool directory, with its fingerprint,
+/// owned by this value: dropping it unlinks the file.
+///
+/// It is produced by the ingestion thread after it has drained a compositor
+/// pipe with `splice(2)` (see `core::splice`) and consumed by the daemon's
+/// worker, which either adopts the file into the content cache with a
+/// `rename(2)` ([`SpooledFile::into_path`] disarms the unlink) or lets it drop.
+/// Neither the queue nor the worker therefore ever holds the payload's bytes on
+/// the heap, and a payload that is shed, rejected or dropped on error cannot
+/// leak a file.
+#[derive(Debug)]
+pub struct SpooledFile {
+    path: PathBuf,
+    len: u64,
+    digest: [u8; DIGEST_LEN],
+    owned: bool,
+}
+
+impl SpooledFile {
+    /// Takes ownership of the file at `path`, which must already hold exactly
+    /// `len` bytes whose SHA3-256 is `digest`.
+    pub fn new(path: PathBuf, len: u64, digest: [u8; DIGEST_LEN]) -> Self {
+        Self { path, len, digest, owned: true }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn digest(&self) -> &[u8; DIGEST_LEN] {
+        &self.digest
+    }
+
+    /// The fingerprint as the lowercase hexadecimal string the database keys on.
+    pub fn hex_digest(&self) -> String {
+        to_hex(&self.digest)
+    }
+
+    /// Gives up ownership: the file is no longer deleted on drop, and the
+    /// caller is responsible for it (typically by renaming it into the cache).
+    pub fn into_path(mut self) -> PathBuf {
+        self.owned = false;
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for SpooledFile {
+    fn drop(&mut self) {
+        if self.owned {
+            // Best effort: the file may already be gone (a cache wipe, a sweep).
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Lowercase hexadecimal encoding of `bytes`, in a single allocation.
+pub fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    out
 }
 
 // --- PayloadReader ---
@@ -606,5 +709,82 @@ mod tests {
     #[test]
     fn the_threshold_is_one_page() {
         assert_eq!(INLINE_PAYLOAD_THRESHOLD_BYTES, 4096);
+    }
+
+    // --- SpooledFile / Payload::Spooled ---
+
+    fn spooled(tag: &str, bytes: &[u8]) -> SpooledFile {
+        SpooledFile::new(temp_file(tag, bytes), bytes.len() as u64, [0xab; DIGEST_LEN])
+    }
+
+    #[test]
+    fn dropping_a_spooled_file_unlinks_it() {
+        let spool = spooled("drop", b"spooled");
+        let path = spool.path().to_path_buf();
+        assert!(path.exists());
+        drop(spool);
+        assert!(!path.exists(), "a dropped (shed or abandoned) spool file must not linger");
+    }
+
+    #[test]
+    fn into_path_hands_the_file_over_and_disarms_the_unlink() {
+        let spool = spooled("adopt", b"adopt me");
+        let path = spool.into_path();
+        assert!(path.exists(), "an adopted file must survive the guard");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_spooled_payload_reports_its_length_and_has_no_bytes_in_memory() {
+        let payload = Payload::Spooled(Box::new(spooled("len", b"12345")));
+        assert_eq!(payload.len_hint(), Some(5));
+        assert!(payload.as_bytes().is_none());
+        assert_eq!(payload.try_clone().unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_spooled_payload_is_materialised_within_the_bound_and_its_file_is_gone_after() {
+        let spool = spooled("read", b"from the spool");
+        let path = spool.path().to_path_buf();
+        let data = Payload::Spooled(Box::new(spool)).read_bounded(LIMIT).unwrap();
+        assert_eq!(data, b"from the spool");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_spooled_payload_over_the_limit_is_refused_from_its_recorded_length() {
+        let payload = Payload::Spooled(Box::new(spooled("big", &[7u8; 64])));
+        assert!(matches!(payload.read_bounded(63), Err(PayloadError::TooLarge { limit: 63 })));
+    }
+
+    #[test]
+    fn a_reader_over_a_spooled_payload_outlives_the_unlink() {
+        let spool = spooled("reader", b"still readable");
+        let path = spool.path().to_path_buf();
+        let mut reader = Payload::Spooled(Box::new(spool)).into_reader().unwrap();
+        assert!(!path.exists(), "the payload was consumed, so its file is unlinked");
+        assert_eq!(reader.len_hint(), Some(14));
+        let mut out = String::new();
+        reader.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "still readable");
+    }
+
+    #[test]
+    fn a_spooled_payload_keeps_the_size_of_the_other_variants() {
+        assert_eq!(std::mem::size_of::<Payload>(), 32, "the boxed variant must not widen every queue slot");
+    }
+
+    #[test]
+    fn the_hex_digest_is_lowercase_and_full_width() {
+        let mut digest = [0u8; DIGEST_LEN];
+        digest[0] = 0x0f;
+        digest[1] = 0xa0;
+        digest[31] = 0xff;
+        let spool = SpooledFile::new(PathBuf::from("/nonexistent/y4p"), 1, digest);
+        let hex = spool.hex_digest();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.starts_with("0fa0") && hex.ends_with("ff"));
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x00, 0x7f, 0x80]), "007f80");
     }
 }
