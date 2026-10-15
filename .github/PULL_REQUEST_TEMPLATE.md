@@ -13,5 +13,5 @@
 ---
 ### AI Usage
 <!-- Remove this section if no AI was used for coding/logic -->
-- **Model:** Claude 3.5 Sonnet / Gemini
+- **Model:** Claude Sonnet / Gemini Flash
 - **Purpose:**
