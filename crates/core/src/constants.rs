@@ -53,11 +53,36 @@ pub const INLINE_PAYLOAD_THRESHOLD_BYTES: usize = 4096;
 // up front; real data beyond it still arrives, through ordinary growth.
 pub const PAYLOAD_PREALLOC_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+// --- Kernel Streaming (splice/tee) ---
+// Bytes moved per `splice(2)`/`tee(2)` round, and the size of the fixed stack
+// buffer the user-space fallback and the fingerprint tap read through. It is
+// the default capacity of a Linux pipe (16 pages), so one round empties a full
+// pipe; a larger value could not move more per call.
+pub const SPLICE_CHUNK_BYTES: usize = 64 * 1024;
+// Directory (inside the cache directory, hence on the same filesystem as the
+// final `<hash>.cache` files) where a payload is spooled while it streams in.
+// Keeping it on one filesystem is what lets the finished file be adopted into
+// the cache with an atomic `rename(2)` instead of a copy.
+pub const SPOOL_DIR_NAME: &str = "spool";
+// Extension of a spool file. A leftover with this extension is, by definition,
+// debris of a previous run and is swept at daemon start.
+pub const SPOOL_FILE_EXTENSION: &str = "part";
+// Extension of a cached binary payload, `<hash>.<extension>`. Defined by
+// `crates/storage` (`FileCache::path`), which is frozen: `core::cache_file_path`
+// mirrors it and a daemon test pins the two together.
+pub const CACHE_FILE_EXTENSION: &str = "cache";
+// Width of the payload fingerprint (SHA3-256) in bytes.
+pub const DIGEST_LEN: usize = 32;
+
 // --- Ingestion Backpressure & Concurrency Bounds ---
 // Capacity of the bounded channel between the Wayland ingestion threads and
 // the database worker. A count, not a byte budget: the worst-case resident
 // payload memory is (INGEST_QUEUE_CAPACITY + INGEST_MAX_CONCURRENT_READERS)
-// * MAX_PAYLOAD_BYTES, reached only if every slot holds a maximal payload.
+// * MAX_PAYLOAD_BYTES, reached only if every slot holds a maximal *in-memory*
+// payload (text, or anything while no spool directory is usable). A payload
+// that streams in past INLINE_PAYLOAD_THRESHOLD_BYTES is spooled to disk and
+// queued as a path and a digest: it costs a spool file, not heap, so the same
+// bound then applies to disk space, and the heap stays flat.
 pub const INGEST_QUEUE_CAPACITY: usize = 64;
 // Simultaneous ingestion readers (one thread, one pipe read end and one
 // payload buffer each). Checked *before* the pipe is allocated, so a burst of
