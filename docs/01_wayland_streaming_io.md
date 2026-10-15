@@ -11,7 +11,7 @@ Crates involved: `y4p-wayland` (protocol handlers, pipe plumbing) and `y4p-daemo
 The daemon has two independent sources of work: Wayland events (a new offer arrived) and IPC commands (someone ran `y4p copy-to 3`). It does not spawn a thread per source. Both descriptors are watched by one `poll(2)` call on the same thread:
 
 ```rust
-// crates/daemon/src/lib.rs:L128-L135 — the daemon's main loop
+// crates/daemon/src/lib.rs:L136-L143 — the daemon's main loop
 let mut poll_fds = [
     libc::pollfd { fd: conn.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
     libc::pollfd { fd: listener.as_fd().as_raw_fd(),  events: libc::POLLIN, revents: 0 },
@@ -38,7 +38,7 @@ if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 | Property | Consequence |
 | :--- | :--- |
 | Kernel wakes the process only on real activity | 0 % CPU between clipboard events; no helper threads parked on `recv()` |
-| 500 ms timeout is a watchdog, not a busy-loop | `is_exiting()` and the seat-rebind self-heal (`bind_data_device`, [lib.rs:L170](../crates/daemon/src/lib.rs)) are re-evaluated even with zero I/O |
+| 500 ms timeout is a watchdog, not a busy-loop | `is_exiting()` and the seat-rebind self-heal (`bind_data_device`, [lib.rs:L178](../crates/daemon/src/lib.rs)) are re-evaluated even with zero I/O |
 | Wayland and IPC handling share one thread | No lock between "event" and "command"; they can never run concurrently |
 | Everything that *needs* concurrency is pushed off-thread | Reads of offered payloads, image conversion, hashing and SQLite writes never stall the loop |
 
@@ -48,7 +48,7 @@ if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 
 ## 2. Ingestion: Bounded Read, Normalise, Forward
 
-Turning a compositor pipe into a stored record is a sequence of distinct decisions. `y4p-wayland` owns the first four; the rest belong to the daemon's worker (see section 6 for the full contract).
+Turning a compositor pipe into a stored record is a sequence of distinct decisions. `y4p-wayland` owns the first four; the rest belong to the daemon's worker (see section 6 for the full contract). Since v0.7.3 the *read* step has two roads (section 2.4): the in-memory one described in 2.1, and, for large non-text payloads, a kernel-level stream into a spool file.
 
 ```text
  Selection event
@@ -61,13 +61,16 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
  [select]    select_mime(mimes, target_mime, drop_rtf)
       |
       v
- [read]      offer.receive(mime, write_fd)  ->  read_pipe_payload(read_file, &mime, MAX_PAYLOAD_BYTES)
+ [read]      offer.receive(mime, write_fd)  ->  drain_pipe(read_file, &mime, MAX_PAYLOAD_BYTES, spooler)
+                 text, small, or no spooler : read_pipe_payload     -> Drained::Memory(Vec)
+                 large non-text             : head + splice(2) spool -> Drained::Spooled(SpooledFile)
       |
       v
- [normalise] normalise_payload(mime, payload)
+ [normalise] normalise_payload(mime, payload)            (Memory: uri-list, magic bytes)
+             relabel_by_magic(mime, head)                (Spooled: magic bytes of the head only)
       |
       v
- [forward]   ingest::enqueue(job_tx, ClipboardJob::new(mime, data), 2 s)   (daemon mode; bounded, may shed)
+ [forward]   ingest::enqueue(job_tx, ClipboardJob, 2 s)  (daemon mode; bounded, may shed)
              state.rx_buf = payload                        (Action Mode: `y4p paste-from`)
 ```
 
@@ -122,8 +125,8 @@ The result is a plain `(mime, data)` pair. Normalisation is lossless and sits **
 | Type | Role |
 | :--- | :--- |
 | `StreamDescriptor` | An owned, readable descriptor (pipe, socket, memfd) with an advisory `len_hint`. Std's `File` owns the fd, so it is closed exactly once on every path and `Read`/`dup(2)` need no `unsafe` |
-| `Payload` | `Memory(Vec<u8>)`, `Stream(StreamDescriptor)` or `File(PathBuf)`. `len_hint()` needs no I/O; `try_clone()` duplicates a source that is served more than once; `read_bounded(limit)` materialises it |
-| `PayloadReader` | `Read` over the three by `enum` dispatch: no `Box<dyn Read>`, no allocation. `fd()` / `raw_fd()` return `None` for an in-memory reader, never panic |
+| `Payload` | `Memory(Vec<u8>)`, `Stream(StreamDescriptor)`, `File(PathBuf)` or `Spooled(Box<SpooledFile>)`. `len_hint()` needs no I/O; `try_clone()` duplicates a source that is served more than once (not a `Spooled` one: it owns its file); `read_bounded(limit)` materialises it |
+| `PayloadReader` | `Read` over the file- and memory-backed variants by `enum` dispatch: no `Box<dyn Read>`, no allocation. `fd()` / `raw_fd()` return `None` for an in-memory reader, never panic |
 | `route_payload(mime, len_hint)` | `Inline` or `Stream`, described below |
 
 Routing rule, cheapest evidence first:
@@ -133,7 +136,57 @@ Routing rule, cheapest evidence first:
 
 > **Invariant — a hint is advisory, never trusted.** It pre-sizes a buffer and feeds the routing guess, but every reader still stops at its own limit and at EOF. A peer that under- or over-states a length can neither truncate a payload nor make the daemon over-read; a wrong guess only picks the slower of two correct paths.
 
-`Payload::Memory` is handed over, not copied: `read_bounded` validates it and returns the same `Vec` (a unit test asserts pointer equality). Ingestion still sends only `Memory` (it must normalise the bytes first, and the pipe has to be drained while its permit is held); the `Stream` and `File` variants are the seam for the streamed path of v0.7.3, and the worker already materialises them under the same `MAX_PAYLOAD_BYTES` bound.
+`Payload::Memory` is handed over, not copied: `read_bounded` validates it and returns the same `Vec` (a unit test asserts pointer equality). Ingestion sends `Memory` for text and small payloads and `Spooled` (a fourth variant, section 2.4) for large non-text ones; `Stream` and `File` remain the vocabulary of egress and of any future producer, and the worker materialises them under the same `MAX_PAYLOAD_BYTES` bound.
+
+### 2.4 Streaming ingestion: head, `splice(2)`, `tee(2)` and the spool (v0.7.3)
+
+A screenshot or a GIF does not need to be a heap buffer: the daemon only has to *store* it, and the kernel can move a pipe's pages into a file without the bytes entering this process. The mechanism, end to end:
+
+```text
+ pipe (compositor client)                                   daemon worker
+   |                                                              ^
+   |  1. head: read_to_end(take(4096)) into one pre-sized Vec     |
+   |       ends inside the head?  -> Memory(head)  (small: done)  |
+   v                                                              |
+ [PayloadSpooler::spool(head, pipe, limit)]   (trait in y4p-wayland, implemented by y4p-daemon)
+   |  2. create spool/<pid>-<n>.part  (0600, O_EXCL, in a 0700 dir)
+   |  3. write(head); sha3.update(head)
+   |  4. core::splice::copy_to_file(pipe, file, limit - head, sha3):
+   |        per 64 KiB round   tee(pipe -> scratch)      copy refs, nothing consumed
+   |                           splice(pipe -> file)      the same bytes, kernel to page cache
+   |                           read(scratch -> stack)    only to feed sha3
+   v
+ SpooledFile { path, len, digest }  --ClipboardJob--> bounded queue --> worker
+                                                                         |
+   wants_transcode(mime, head512)? --yes--> read back, magick, hash, insert   (v0.7.2 road)
+                                   --no --> map file, rename into the cache, insert from the map
+```
+
+**Why the Wayland crate does not hash or touch the cache.** `PayloadSpooler` ([`crates/wayland/src/spool.rs`](../crates/wayland/src/spool.rs)) is the whole interface: "drain this pipe into a file, return where it is and what it hashes to". The implementation, `FileSpooler` ([`crates/daemon/src/spool.rs`](../crates/daemon/src/spool.rs)), owns the directory, the file names and SHA3-256; `y4p-wayland` still depends on neither `y4p-storage`, `y4p-image` nor `sha3`. Without a spooler (Action Mode, tests) the ingestion thread behaves exactly as in v0.7.2.
+
+**Why a head is read first.** A Wayland pipe has no length, so the heuristic of 2.3 cannot see a size. The ingestion thread reads one inline threshold (4096 bytes) into a single pre-sized buffer: if the stream ends inside it the payload is small and travels as `Memory` (no file, no extra syscall beyond that read, one allocation); only a stream that fills the head is spooled. Text-like MIMEs never take this road: they are normalised and indexed as bytes anyway. The head is written to the spool file first and fed to the digest, so the file holds the whole stream and the limit (`MAX_PAYLOAD_BYTES`) counts the head too.
+
+**The two copy paths** (`core::splice::copy_to_file`, [`crates/core/src/splice.rs`](../crates/core/src/splice.rs)):
+
+| Path | When | What moves the bytes | User-space copy of the payload |
+| :--- | :--- | :--- | :--- |
+| Kernel | the source is a FIFO (checked with `fstat`) | `tee(2)` + `splice(2)` into the file; the digest reads the `tee`d duplicate through a 64 KiB stack buffer | none that is stored; one read-out for the hash |
+| Buffered | any other source, or the kernel refuses (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`: a socket, an `O_APPEND` file, a filesystem without splice) | `read` into a fixed 64 KiB stack buffer, hash, `write` | one, through the stack, never the heap |
+
+The switch happens only *between* rounds or before a round has consumed anything: `tee` does not consume its source, so when the `splice` after it is refused the duplicate is discarded and the buffered path resumes at the same position. The digest therefore sees every byte exactly once and in order on every path (tested by forcing exactly that refusal with an `O_APPEND` destination). `ByteTap::OBSERVES` is an associated constant, so with `NoTap` the scratch pipe and the `tee` are not even created.
+
+> **Invariant — bounded, never truncated.** One byte beyond `limit` is let through as a probe, as in `read_bounded`: an exact fit succeeds, an overflow is `TooLarge` and the partial file is deleted. Whatever fails, `FileSpooler` unlinks the file it created, and a completed `SpooledFile` unlinks itself on drop: a payload that is shed from a full queue, rejected by the worker or abandoned by an error leaves nothing on disk. Only `SpooledFile::into_path` (adoption) disarms that.
+
+**What the worker does with it** (`store_spooled`, [`crates/daemon/src/worker.rs`](../crates/daemon/src/worker.rs)):
+
+1. The first 512 bytes decide, through `y4p_image::route::wants_transcode` (the classification half of `route_with`, so the two cannot disagree). A raster image the converter would rewrite is read back into memory and takes the v0.7.2 road: `magick` still works on bytes until v0.7.4.
+2. Anything else is stored as it arrived, keyed by the digest computed while it streamed in: it is **not hashed again**. `crates/storage` (frozen) takes a `&[u8]`, so the spool file is mapped read-only (`core::mapped::MappedFile`: page cache, no heap, untouched pages never read).
+3. A payload storage keeps in a cache file (`image/*`, `*gif*`) is **adopted**: the spool file is renamed to `<cache>/<hash>.cache` before the insert, so storage finds it in place and writes nothing (an integration test compares inodes). Never over an existing file. If the insert fails or storage declines (a sensitive MIME), the adopted file is removed again. Every other payload is inserted from the mapping and the spool file is deleted.
+4. If the file cannot be mapped (no `mmap` on that filesystem) or is not the recorded size, it is read instead, with the digest kept.
+
+The only coupling to the frozen storage layer is its layout rule (`<hash>.cache`, and "images live in cache files"). `core::cache_file_path` and `worker::stored_in_cache_file` mirror it, and an integration test (`crates/daemon/tests/spooled_persist.rs`) inserts through the real storage layer and fails if either copy drifts.
+
+**Resource accounting.** A reader that spools holds a pipe read end, the spool file and the two ends of the scratch pipe: four descriptors, at most `INGEST_MAX_CONCURRENT_READERS` (8) readers, so 32. The queue carries paths, not descriptors: no descriptor waits in it. The heap cost of a queued spooled job is the box and the path (about 160 bytes, measured), whatever the payload's size; the cost moves to disk, bounded by the same counts: (64 + 8) x 256 MiB in the worst case (a byte budget is the open question in `PERFORMANCE.md` section 6). A cache wipe removes the spool directory with the rest of the cache; the spooler re-creates it on the next payload, and a directory that cannot be created hands the pipe back for an in-memory read, so spooling is an optimisation that can fail without losing a clipboard entry. Leftover `.part` files of a dead process are swept when the daemon starts; a live process's files, and any other file, are never touched.
 
 ---
 
@@ -144,14 +197,14 @@ Routing rule, cheapest evidence first:
 `y4p` closes the loop with a plain counter. Before handing data to the compositor, restore increments it:
 
 ```rust
-// crates/daemon/src/lib.rs:L215 — handle_restore_request
+// crates/daemon/src/lib.rs:L223 — handle_restore_request
 state.provider_locks += 1;
 ```
 
 and the ingestion handler checks it first, before doing any work:
 
 ```rust
-// crates/wayland/src/handlers/data_control/device.rs:L29
+// crates/wayland/src/handlers/data_control/device.rs:L30
 if state.provider_locks > 0 {
     state.provider_locks -= 1;
     return;
@@ -215,7 +268,7 @@ For every payload kind the only transformation is markup stripping: if the store
 
 ## 5. Action Mode (`y4p paste-from`)
 
-`paste_from_os` ([`crates/wayland/src/lib.rs:L29`](../crates/wayland/src/lib.rs)) uses the same `WaylandState` with `job_tx = None` and a `target_mime`. It runs a poll-based loop with a 200 ms sub-timeout under a 1 s absolute watchdog, and performs the same bounded read and normalisation synchronously into `state.rx_buf`.
+`paste_from_os` ([`crates/wayland/src/lib.rs:L30`](../crates/wayland/src/lib.rs)) uses the same `WaylandState` with `job_tx = None` and a `target_mime`. It runs a poll-based loop with a 200 ms sub-timeout under a 1 s absolute watchdog, and performs the same bounded read and normalisation synchronously into `state.rx_buf`.
 
 > **Invariant — one boundary guard, two consumers.** `paste-from` returns exactly the bytes the daemon would have forwarded to the worker (before image routing, which is a persistence concern).
 
@@ -225,7 +278,8 @@ For every payload kind the only transformation is markup stripping: if the store
 
 | Hand-off | From -> To | Type | Guarantee |
 | :--- | :--- | :--- | :--- |
-| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::SyncSender<ClipboardJob>` (capacity `INGEST_QUEUE_CAPACITY`), `ClipboardJob { mime, payload: Payload }` | the payload is non-empty and at most `MAX_PAYLOAD_BYTES` once materialised (`ClipboardJob::into_bytes`, a no-copy hand-over for `Memory`), already normalised; no hash, no conversion |
+| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::SyncSender<ClipboardJob>` (capacity `INGEST_QUEUE_CAPACITY`), `ClipboardJob { mime, payload: Payload }` | the payload is non-empty and at most `MAX_PAYLOAD_BYTES` (`Memory`: once materialised, `ClipboardJob::into_bytes`, a no-copy hand-over; `Spooled`: a complete file with its SHA3-256, owned and unlinked on drop), already normalised or relabelled; no conversion |
+| Spool | `y4p-wayland` -> `y4p-daemon` | `PayloadSpooler::spool(head, pipe, limit) -> SpoolOutcome` | `Spooled` (complete, fingerprinted), `Rejected` (nothing left on disk) or `Unavailable(pipe)` (untouched beyond the head, read it into memory) |
 | Persistence | `y4p-daemon` -> `y4p-storage` | `insert_with_hash(mime, data, hash, max_history)` | `hash` is SHA3-256 over the final bytes (see [03](03_concurrency_and_memory.md)) |
 | Egress | `y4p-storage` -> `y4p-daemon` -> `y4p-wayland` | `ContentLocation` -> `core::payload::Payload` (`SourceMetadata.payload`) | Large payloads are passed as a path, never materialised |
 

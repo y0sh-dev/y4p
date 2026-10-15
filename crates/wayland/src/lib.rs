@@ -10,6 +10,7 @@ use y4p_core as core;
 pub mod state;
 pub mod handlers;
 pub mod ingest;
+pub mod spool;
 
 use wayland_client::{Connection, EventQueue};
 pub use self::state::WaylandState;

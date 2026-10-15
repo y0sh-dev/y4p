@@ -7,12 +7,14 @@ pub mod constants;
 pub mod utils;
 pub mod config;
 pub mod payload;
+pub mod splice;
+pub mod mapped;
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::constants::{DB_DIR_NAME, DB_FILE_NAME, SOCKET_FILE_NAME, ENV_MAX_HISTORY};
+use crate::constants::{CACHE_FILE_EXTENSION, DB_DIR_NAME, DB_FILE_NAME, ENV_MAX_HISTORY, SOCKET_FILE_NAME, SPOOL_DIR_NAME};
 
 pub static SIG_EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -78,6 +80,27 @@ pub fn get_cache_dir() -> PathBuf {
         builder.recursive(true).mode(0o700);
         let _ = builder.create(&path);
     }
+    path
+}
+
+/// Path of the cached binary payload for `hash`: `<cache dir>/<hash>.cache`.
+///
+/// This is the layout `crates/storage` (`FileCache::path`) uses. That crate is
+/// frozen and keeps the rule private, so the daemon, which adopts a spooled file
+/// into the cache by `rename(2)`, mirrors it here; a daemon test pins this
+/// function to the storage layer's own answer.
+pub fn cache_file_path(hash: &str) -> PathBuf {
+    let mut path = get_cache_dir();
+    path.push(format!("{}.{}", hash, CACHE_FILE_EXTENSION));
+    path
+}
+
+/// Directory where payloads are spooled while they stream in: a subdirectory of
+/// the cache directory (so a finished file can be renamed into the cache), not
+/// created here. See `constants::SPOOL_DIR_NAME`.
+pub fn spool_dir_path() -> PathBuf {
+    let mut path = get_cache_dir();
+    path.push(SPOOL_DIR_NAME);
     path
 }
 

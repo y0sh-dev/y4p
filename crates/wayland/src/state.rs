@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use crate::core::constants::INGEST_MAX_CONCURRENT_READERS;
 use crate::core::payload::{Payload, PayloadError};
 use crate::ingest::{IngestStats, ReaderGate};
+use crate::spool::PayloadSpooler;
 
 pub struct OfferData {
     pub mimes: Arc<Mutex<Vec<String>>>,
@@ -34,12 +35,13 @@ pub struct SourceMetadata {
 /// worker. Deliberately carries no fingerprint: image transcoding rewrites the
 /// bytes, so the digest is only meaningful once the worker has the final ones.
 ///
-/// The payload is a `core::payload::Payload`, not a bare `Vec<u8>`: today the
-/// ingestion thread always hands over `Payload::Memory` (it must normalise the
-/// bytes first), but the queue and the worker already accept a descriptor- or
-/// file-backed payload, so a streamed ingest path can be added without
-/// touching either. Moving a `Memory` payload through the queue moves a pointer,
-/// never the bytes.
+/// The payload is a `core::payload::Payload`, not a bare `Vec<u8>`. The ingestion
+/// thread hands over `Payload::Memory` for anything that fits the inline
+/// threshold (and always for text, which it must normalise), and
+/// `Payload::Spooled` for a larger one it has already drained to a spool file
+/// (see `crate::spool`): the queue then carries a path and a digest, not the
+/// bytes, so what a full queue pins is bounded by the number of slots, not by
+/// the size of the payloads. Moving either through the queue moves a pointer.
 pub struct ClipboardJob {
     pub mime: String,
     pub payload: Payload,
@@ -82,6 +84,9 @@ pub struct WaylandState {
     pub reader_gate: Arc<ReaderGate>,
     /// What overload has cost so far; read by the daemon for `y4p status`.
     pub ingest_stats: Arc<IngestStats>,
+    /// Where a large payload is drained to disk instead of into the heap
+    /// (see `crate::spool`). `None`: every payload is read into memory.
+    pub spooler: Option<Arc<dyn PayloadSpooler>>,
     pub verbose: bool,
     // Action-mode-only: the specific MIME `y4p paste-from <mime>` was asked
     // for. `None` in daemon mode, where no single MIME is being awaited —
@@ -114,6 +119,7 @@ impl WaylandState {
             job_tx: Some(job_tx),
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
+            spooler: None,
             verbose,
             target_mime: None,
             rx_buf: Vec::new(),
@@ -123,6 +129,14 @@ impl WaylandState {
             paused: false,
             config,
         }
+    }
+
+    /// Enables the streaming ingestion path (daemon mode only): payloads that
+    /// outgrow the inline threshold are drained by `spooler` instead of being
+    /// read into a `Vec`.
+    pub fn with_spooler(mut self, spooler: Arc<dyn PayloadSpooler>) -> Self {
+        self.spooler = Some(spooler);
+        self
     }
 
     pub fn new_action(target_mime: String, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
@@ -135,6 +149,7 @@ impl WaylandState {
             job_tx: None,
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
+            spooler: None,
             verbose,
             target_mime: Some(target_mime),
             rx_buf: Vec::new(),

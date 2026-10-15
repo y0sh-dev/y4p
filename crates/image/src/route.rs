@@ -36,7 +36,7 @@ use crate::transcode::{self, InputFormat, OutputFormat, Transcode};
 
 /// Bytes inspected when classifying a payload. Binary image signatures fit
 /// in 12; the rest is slack for leading whitespace before an SVG prolog.
-const SNIFF_HEAD_BYTES: usize = 512;
+pub const SNIFF_HEAD_BYTES: usize = 512;
 
 /// What an ingested image of format `input` is converted to, or `None` to
 /// store it untouched.
@@ -71,6 +71,31 @@ fn classify(mime: &str, payload: &[u8]) -> Option<InputFormat> {
         Some(detected) => InputFormat::from_mime(detected),
         None => InputFormat::from_mime(mime),
     }
+}
+
+/// Whether [`route_with`] would hand a payload with this MIME and these leading
+/// bytes to the converter, decided from the first bytes alone.
+///
+/// A payload that was streamed to disk instead of into memory (see
+/// `y4p-daemon`'s `spool` module) is only worth reading back into memory when
+/// this is `true`; otherwise it is stored exactly as it arrived and its bytes
+/// never need to enter the heap. `head` must hold at least the first
+/// `SNIFF_HEAD_BYTES` bytes of the payload (or all of it, when shorter), which
+/// also covers the 21 bytes the animated-WebP check inspects.
+///
+/// This is the *classification* half of `route_with`, factored so the two
+/// cannot disagree about what a converter would touch. Whether a conversion then
+/// actually runs still depends on the breaker and the throttle (an open circuit
+/// returns the original), which is why a `true` here means "might convert".
+pub fn wants_transcode(mime: &str, head: &[u8]) -> bool {
+    if head.is_empty() {
+        return false;
+    }
+    let Some(input) = classify(mime, head) else { return false };
+    if input == InputFormat::Webp && is_animated_webp(head) {
+        return false;
+    }
+    ingest_target(input).is_some()
 }
 
 /// A converter must return a plausible file of the promised type; anything
@@ -372,6 +397,43 @@ mod tests {
         let (routed, called) = route_recording("image/avif", avif.clone(), Ok(fake_png()));
         assert!(called.is_none());
         assert_eq!(routed, ("image/avif".to_owned(), avif));
+    }
+
+    #[test]
+    fn wants_transcode_agrees_with_route_with_on_every_kind_of_payload() {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(b"frames");
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("image/png", fake_png()),
+            ("image/jpeg", jpeg),
+            ("image/webp", fake_webp()),
+            ("image/webp", fake_animated_webp()),
+            ("image/gif", gif),
+            ("image/svg+xml", svg.clone()),
+            ("image/png", svg),
+            ("image/bmp", b"BM not detectable by signature".to_vec()),
+            ("application/octet-stream", vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            ("application/pdf", b"%PDF-1.7 body".to_vec()),
+            ("text/plain", b"plain".to_vec()),
+        ];
+        for (mime, payload) in cases {
+            let predicted = wants_transcode(mime, &payload);
+            let (_, called) = route_recording(mime, payload, Ok(fake_png()));
+            assert_eq!(predicted, called.is_some(), "{mime}: prediction must match whether the converter ran");
+        }
+    }
+
+    #[test]
+    fn wants_transcode_needs_only_the_leading_bytes_and_never_panics_on_short_ones() {
+        let mut png = fake_png();
+        png.extend(std::iter::repeat_n(0u8, 10_000));
+        assert!(wants_transcode("application/octet-stream", &png[..SNIFF_HEAD_BYTES]));
+        assert!(!wants_transcode("image/png", &[]), "no bytes, nothing to convert");
+        for len in 0..24 {
+            let _ = wants_transcode("image/webp", &fake_animated_webp()[..len.min(24)]);
+        }
     }
 
     #[test]

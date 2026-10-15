@@ -20,6 +20,12 @@ pub struct DaemonMetrics {
     last_event_at_ms: AtomicI64,
 }
 
+impl Default for DaemonMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DaemonMetrics {
     pub fn new() -> Self {
         Self {
@@ -33,6 +39,12 @@ impl DaemonMetrics {
     pub fn record_ingress(&self) {
         self.ingress_count.fetch_add(1, Ordering::Relaxed);
         self.last_event_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Payloads persisted so far. Allocation-free, so a benchmark can wait on
+    /// it without disturbing its own allocation counters.
+    pub fn ingress_count(&self) -> u64 {
+        self.ingress_count.load(Ordering::Relaxed)
     }
 
     pub fn record_egress(&self) {
@@ -70,6 +82,15 @@ mod tests {
         assert!(line.ends_with("shed_readers=3 shed_queue=7\n"), "{line}");
         assert!(line.contains("paused=true"));
         assert_eq!(line.lines().count(), 1, "status stays a single line");
+    }
+
+    #[test]
+    fn the_ingress_count_follows_the_recorded_payloads() {
+        let metrics = DaemonMetrics::new();
+        assert_eq!(metrics.ingress_count(), 0);
+        metrics.record_ingress();
+        metrics.record_ingress();
+        assert_eq!(metrics.ingress_count(), 2);
     }
 
     #[test]

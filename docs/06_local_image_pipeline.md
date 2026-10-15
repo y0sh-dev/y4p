@@ -258,6 +258,8 @@ In every row the fingerprint is computed over what is stored, so deduplication s
 
 The chunked `Read`/`Write` relay is the working implementation. `pipeline.rs` already carries a `splice(2)` primitive (`try_splice` / `splice_all`) with a capability-aware fallback, deliberately not wired into the converter path yet; the `Read`/`Write` boundary is the seam where it can replace the chunked copy without changing any caller.
 
+Since v0.7.3 the *ingestion* side has its own bounded, fingerprinting counterpart in `y4p-core` (`core::splice::copy_to_file`, with `tee(2)`; [01](01_wayland_streaming_io.md) section 2.4), and the worker asks this crate one question about a spooled payload, `route::wants_transcode(mime, head)`: would the converter touch it? Only a "yes" reads the file back into memory, because `magick` is still fed from a `Vec`. Connecting the converter to a descriptor directly, and letting `pipeline.rs` share `core::splice`'s primitive instead of its own, is the v0.7.4 task.
+
 The v0.6.x cycle (The Great Modularization) physically decoupled `y4p-core`, `y4p-storage`, `y4p-image`, `y4p-wayland`, `y4p-daemon` and `y4p-cli`, and in v0.6.7 moved conversion and hashing out of the Wayland sensor into the daemon worker.
 
 **Deferred beyond v0.7.0:** Zero-Copy Stage 2 (Buffer Lifecycle Unification: aligning buffer lifetimes and descriptor passing across crate boundaries), including a descriptor-to-descriptor path from the compositor pipe to the converter. It is out of scope for the v0.7.0 release.

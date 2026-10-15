@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::state::{WaylandState, OfferData, ClipboardJob};
 use crate::ingest::{self, Enqueue, IngestStats, ReaderPermit};
+use crate::spool::{PayloadSpooler, SpoolOutcome};
 use crate::core::constants::*;
-use crate::core::payload::{self, PayloadRoute};
+use crate::core::payload::{self, Payload, PayloadRoute, SpooledFile};
 use super::{make_pipe, is_sensitive};
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
@@ -85,12 +86,13 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             if let Some(ref tx) = state.job_tx {
                 let job_tx_clone = tx.clone();
                 let stats = Arc::clone(&state.ingest_stats);
+                let spooler = state.spooler.clone();
                 let enqueue_wait = Duration::from_millis(INGEST_ENQUEUE_WAIT_MS);
                 // `Builder::spawn` reports a refused thread instead of
                 // panicking like `thread::spawn`; the closure (and with it the
                 // pipe and the permit) is then dropped, which frees everything.
                 let spawned = std::thread::Builder::new().name("y4p-ingest".to_owned()).spawn(move || {
-                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, permit, enqueue_wait);
+                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, permit, enqueue_wait, spooler.as_deref());
                 });
                 if spawned.is_err() {
                     let total = state.ingest_stats.record_shed_reader();
@@ -146,17 +148,25 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
 }
 
 /// Reads a MIME payload from an already-`offer.receive()`d pipe, normalises
-/// it (see `normalise_payload`) and forwards the raw `(mime, data)` pair to
-/// the daemon's worker.
+/// it (see `normalise_payload`) and forwards it to the daemon's worker.
 ///
 /// Factored out of the Selection handler so it can be called from the
 /// dedicated per-selection thread the handler spawns. This layer only drains
 /// the pipe and normalises: image transcoding and fingerprinting are the
-/// worker's concern, so this thread never spawns `magick` or hashes anything.
+/// worker's concern (or the `spooler`'s, which computes the digest while the
+/// bytes stream past), so this thread never spawns `magick` or hashes anything
+/// itself.
+///
+/// What is handed over depends on the payload (see `drain_pipe`): a small one,
+/// and any text, as an in-memory `Payload::Memory`; a larger non-text one as a
+/// `Payload::Spooled` file the pipe was drained into without a heap copy. Either
+/// way the pipe is emptied here, promptly and under `_permit`, so the sending
+/// application is never left blocked behind the worker queue.
 ///
 /// `_permit` is held until the payload is queued or shed, so a full queue
 /// keeps its readers' gate slots occupied: that is the backpressure which
 /// makes new selections get refused instead of piling up payloads in memory.
+/// A shed job is dropped here, which also unlinks its spool file.
 fn ingest_and_send(
     read_file: std::fs::File,
     mime_to_get: String,
@@ -164,13 +174,83 @@ fn ingest_and_send(
     stats: &IngestStats,
     _permit: Option<ReaderPermit>,
     enqueue_wait: Duration,
+    spooler: Option<&dyn PayloadSpooler>,
 ) {
-    let Some(payload) = read_pipe_payload(read_file, &mime_to_get, MAX_PAYLOAD_BYTES) else { return; };
-    let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
+    let job = match drain_pipe(read_file, &mime_to_get, MAX_PAYLOAD_BYTES, spooler) {
+        Some(Drained::Memory(payload)) => {
+            let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
+            ClipboardJob::new(mime, data)
+        }
+        Some(Drained::Spooled { file, head }) => {
+            let mime = relabel_by_magic(mime_to_get, &head);
+            ClipboardJob::from_payload(mime, Payload::Spooled(Box::new(file)))
+        }
+        None => return,
+    };
 
-    if ingest::enqueue(job_tx, ClipboardJob::new(mime, data), enqueue_wait) == Enqueue::Shed {
+    if ingest::enqueue(job_tx, job, enqueue_wait) == Enqueue::Shed {
         let total = stats.record_shed_queue();
         ingest::report_shed("worker queue full", total);
+    }
+}
+
+/// What an ingestion thread took out of a compositor pipe.
+enum Drained {
+    /// The whole payload, in memory.
+    Memory(Vec<u8>),
+    /// The whole payload, on disk. `head` is its first bytes (at most
+    /// `INLINE_PAYLOAD_THRESHOLD_BYTES`), kept for content sniffing.
+    Spooled { file: SpooledFile, head: Vec<u8> },
+}
+
+/// Drains `reader` completely, choosing the cheapest bounded way.
+///
+/// - Text-like MIMEs, and every payload when there is no `spooler`, are read
+///   into memory (`read_pipe_payload`): text must be normalised and indexed as
+///   bytes anyway, and it is small.
+/// - Anything else is read one inline threshold's worth first, into one
+///   pre-sized buffer. If the stream ends inside it the payload is small and is
+///   returned as memory, so the common small image never touches the disk. If
+///   more is coming, the rest is handed to the `spooler`, which copies it to a
+///   file in the kernel (`splice(2)`) while fingerprinting it.
+/// - A spooler that cannot start gives the pipe back, and the payload is read
+///   into memory after all: spooling is an optimisation, never a requirement.
+fn drain_pipe(
+    mut reader: std::fs::File,
+    mime: &str,
+    limit: u64,
+    spooler: Option<&dyn PayloadSpooler>,
+) -> Option<Drained> {
+    let Some(spooler) = spooler.filter(|_| payload::route_payload(mime, None) == PayloadRoute::Stream) else {
+        return read_pipe_payload(reader, mime, limit).map(Drained::Memory);
+    };
+
+    let mut head = Vec::with_capacity(INLINE_PAYLOAD_THRESHOLD_BYTES);
+    if (&mut reader).take(INLINE_PAYLOAD_THRESHOLD_BYTES as u64).read_to_end(&mut head).is_err() {
+        return None;
+    }
+    if head.len() < INLINE_PAYLOAD_THRESHOLD_BYTES {
+        return (!head.is_empty()).then_some(Drained::Memory(head));
+    }
+
+    match spooler.spool(&head, reader, limit) {
+        SpoolOutcome::Spooled(file) => Some(Drained::Spooled { file, head }),
+        SpoolOutcome::Rejected => None,
+        SpoolOutcome::Unavailable(rest) => {
+            // The head is already out of the pipe: read the remainder behind it.
+            let chained = std::io::Cursor::new(head).chain(rest);
+            payload::read_bounded(chained, limit, None).ok().map(Drained::Memory)
+        }
+    }
+}
+
+/// The MIME to record for a spooled payload: the one announced, unless its
+/// leading bytes identify an image, in which case the bytes win (the same rule
+/// `normalise_payload` applies to an in-memory payload).
+fn relabel_by_magic(announced: String, head: &[u8]) -> String {
+    match crate::core::utils::detect_image_mime(head) {
+        Some(detected) => detected.to_owned(),
+        None => announced,
     }
 }
 
@@ -264,7 +344,7 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO, None);
 
         let queued = rx.try_recv().unwrap();
         assert_eq!((queued.mime.as_str(), queued.payload.as_bytes()), ("text/plain", Some(b"hello".as_slice())));
@@ -281,7 +361,7 @@ mod tests {
 
         let wait = Duration::from_millis(30);
         let started = Instant::now();
-        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, permit, wait);
+        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, permit, wait, None);
 
         assert!(started.elapsed() >= wait, "backpressure: the reader must wait before shedding");
         assert_eq!(stats.shed_queue(), 1);
@@ -301,7 +381,7 @@ mod tests {
             let stats = Arc::clone(&stats);
             let pipe = filled_pipe(b"newer");
             std::thread::spawn(move || {
-                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10));
+                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10), None);
             })
         };
 
@@ -322,7 +402,7 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
+        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO, None);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(stats.shed_queue(), 0, "an empty read is not overload");
@@ -336,10 +416,207 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10));
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10), None);
 
         assert_eq!(stats.shed_queue(), 0, "shutdown is not shedding");
         assert_eq!(gate.active(), 0);
+    }
+
+    // --- spooled ingestion: head read, spooler hand-off, fallbacks ---
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        Spool,
+        Reject,
+        Unavailable,
+    }
+
+    /// Stands in for the daemon's spooler: writes the head and the rest of the
+    /// pipe to a real file, and records what it was asked to do.
+    struct FakeSpooler {
+        behaviour: Behaviour,
+        calls: Mutex<Vec<(usize, u64)>>,
+        /// Private to this instance, so a test can count what is left in it
+        /// without seeing files of tests running beside it.
+        dir: PathBuf,
+    }
+
+    impl FakeSpooler {
+        fn new(behaviour: Behaviour) -> Self {
+            let dir = unique_path("dir");
+            std::fs::create_dir(&dir).unwrap();
+            Self { behaviour, calls: Mutex::new(Vec::new()), dir }
+        }
+
+        fn calls(&self) -> Vec<(usize, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn leftovers(&self) -> usize {
+            std::fs::read_dir(&self.dir).unwrap().count()
+        }
+    }
+
+    impl Drop for FakeSpooler {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn unique_path(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!("y4p-device-spool-{}-{}-{}", tag, std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        p
+    }
+
+    impl PayloadSpooler for FakeSpooler {
+        fn spool(&self, head: &[u8], mut src: std::fs::File, limit: u64) -> SpoolOutcome {
+            self.calls.lock().unwrap().push((head.len(), limit));
+            match self.behaviour {
+                Behaviour::Reject => SpoolOutcome::Rejected,
+                Behaviour::Unavailable => SpoolOutcome::Unavailable(src),
+                Behaviour::Spool => {
+                    let path = self.dir.join("payload");
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    file.write_all(head).unwrap();
+                    let rest = std::io::copy(&mut src, &mut file).unwrap();
+                    SpoolOutcome::Spooled(SpooledFile::new(path, head.len() as u64 + rest, [7; DIGEST_LEN]))
+                }
+            }
+        }
+    }
+
+    /// A pipe fed by a thread, so payloads larger than the pipe buffer work.
+    fn fed_pipe(bytes: Vec<u8>) -> (std::fs::File, std::thread::JoinHandle<()>) {
+        let (read_file, write_fd) = make_pipe().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut writer = std::fs::File::from(write_fd);
+            let _ = writer.write_all(&bytes);
+        });
+        (read_file, handle)
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 249) as u8).collect()
+    }
+
+    fn only_job(rx: &std::sync::mpsc::Receiver<ClipboardJob>) -> ClipboardJob {
+        let job = rx.try_recv().unwrap();
+        assert!(rx.try_recv().is_err(), "exactly one job expected");
+        job
+    }
+
+    #[test]
+    fn text_never_goes_through_the_spooler() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let (read_file, feeder) = fed_pipe(pattern(300_000));
+        ingest_and_send(read_file, "text/plain".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+        assert!(spooler.calls().is_empty());
+        let job = only_job(&rx);
+        assert_eq!(job.payload.as_bytes().map(<[u8]>::len), Some(300_000), "text is normalised in memory");
+    }
+
+    #[test]
+    fn a_small_non_text_payload_stays_on_the_in_memory_fast_path() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let data = pattern(INLINE_PAYLOAD_THRESHOLD_BYTES - 1);
+        ingest_and_send(filled_pipe(&data), "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        assert!(spooler.calls().is_empty(), "a payload that ends inside the head is never spooled");
+        let job = only_job(&rx);
+        assert_eq!(job.payload.as_bytes(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn a_payload_that_fills_the_head_is_spooled_whole() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let data = pattern(1 << 20);
+        let (read_file, feeder) = fed_pipe(data.clone());
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+
+        assert_eq!(spooler.calls(), vec![(INLINE_PAYLOAD_THRESHOLD_BYTES, MAX_PAYLOAD_BYTES)]);
+        let job = only_job(&rx);
+        assert_eq!(job.mime, "application/octet-stream");
+        assert_eq!(job.len_hint(), Some(data.len() as u64));
+        assert!(job.payload.as_bytes().is_none(), "the bytes must not be on the heap");
+        assert_eq!(job.into_bytes(MAX_PAYLOAD_BYTES).unwrap().1, data, "head and tail must join without a gap");
+    }
+
+    #[test]
+    fn a_spooled_payload_is_relabelled_when_its_bytes_are_an_image() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let mut data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        data.extend(pattern(100_000));
+        let (read_file, feeder) = fed_pipe(data);
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+        assert_eq!(only_job(&rx).mime, "image/png", "the bytes outrank the announced label");
+    }
+
+    #[test]
+    fn an_unavailable_spooler_falls_back_to_reading_everything_into_memory() {
+        let spooler = FakeSpooler::new(Behaviour::Unavailable);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let data = pattern(200_000);
+        let (read_file, feeder) = fed_pipe(data.clone());
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+        assert_eq!(spooler.calls().len(), 1);
+        assert_eq!(only_job(&rx).payload.as_bytes(), Some(data.as_slice()), "no byte lost between head and remainder");
+    }
+
+    #[test]
+    fn a_rejected_stream_produces_no_job_and_frees_the_gate() {
+        let spooler = FakeSpooler::new(Behaviour::Reject);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let (gate, permit) = gate_with_one_permit();
+        let stats = IngestStats::default();
+        let (read_file, feeder) = fed_pipe(pattern(100_000));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, permit, Duration::ZERO, Some(&spooler));
+        let _ = feeder.join();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.shed_queue(), 0);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn a_spooled_job_shed_from_a_full_queue_leaves_no_file_behind() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        tx.send(ClipboardJob::new("text/plain".to_owned(), vec![1])).unwrap();
+        let stats = IngestStats::default();
+        let (gate, permit) = gate_with_one_permit();
+        let (read_file, feeder) = fed_pipe(pattern(100_000));
+
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, permit, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+
+        assert_eq!(stats.shed_queue(), 1);
+        assert_eq!(gate.active(), 0, "the permit is released even though the payload was shed");
+        assert_eq!(rx.try_iter().count(), 1, "only the job that was already queued remains");
+        assert_eq!(spooler.leftovers(), 0, "the shed job's spool file must have been unlinked");
+    }
+
+    #[test]
+    fn a_spooled_job_for_a_gone_worker_leaves_no_file_behind() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        drop(rx);
+        let stats = IngestStats::default();
+        let (read_file, feeder) = fed_pipe(pattern(100_000));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, None, Duration::from_secs(10), Some(&spooler));
+        feeder.join().unwrap();
+        assert_eq!(stats.shed_queue(), 0);
+        assert_eq!(spooler.leftovers(), 0);
     }
 
     #[test]
