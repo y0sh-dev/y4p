@@ -16,12 +16,15 @@ This project embraces the use of Generative AI (LLMs) for complex problem-solvin
 
 To keep branch names and commit history focused on *intent* (`feat/`, `fix/`, `docs/`), **do not include AI usage declarations in branch names or commit messages.**
 
-Declare AI usage **exclusively in the Pull Request description**, using the "AI Usage" section of the [pull request template](PULL_REQUEST_TEMPLATE.md). Keep it minimal and strictly to the point:
+Declare AI usage **exclusively in the Pull Request description**, using the "AI Usage" section of the [pull request template](PULL_REQUEST_TEMPLATE.md). Keep it minimal, flexible, and strictly to the point:
 
 | Field | Content | Example |
 | :--- | :--- | :--- |
-| **Model** | The model(s) used | Claude 3.5 Sonnet, Gemini |
+| **Model** | Model family/tier (exact version numbers are optional) | `Claude Sonnet / Gemini Flash`, `GPT-4o` |
 | **Purpose** | What the model was used for | Refactoring the daemon event loop; generating boilerplate |
+
+> [!NOTE]
+> **Simplified Model Reporting**: Specify the primary model family or tier (e.g. *Claude Sonnet*, *Gemini Flash*, *Claude Haiku*, *Gemini Pro*) rather than tracking exact point-release version numbers. AI attribution is intended to maintain development transparency without becoming a bureaucratic burden.
 
 ---
 
