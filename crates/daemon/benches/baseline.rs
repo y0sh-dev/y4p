@@ -11,17 +11,18 @@
 //! cargo test  --workspace --all-targets           # smoke mode: one pass, no timing claims
 //! ```
 //!
-//! What is measured, and why these seven groups:
+//! What is measured, and why these eight groups:
 //!
-//! | Group   | Subject                                                     |
-//! | :------ | :---------------------------------------------------------- |
-//! | sha3    | digest and hex fingerprint over 64 B / 4 KiB / 64 KiB / 1 MiB |
-//! | mime    | MIME comparison, magic-byte sniffing, `text/uri-list` parsing |
-//! | queue   | bounded-channel hand-off, load shedding, reader gate, memory |
-//! | payload | routing decision, reader dispatch, bounded reads, pipe streams |
-//! | splice  | pipe -> file: heap `Vec` road versus `splice(2)`/`tee(2)` and the fallback |
-//! | ingest  | pipe -> database end to end, in memory versus spooled; memory bound |
-//! | sqlite  | insert, insert + rotation, duplicate hit, metadata scans      |
+//! | Group     | Subject                                                     |
+//! | :-------- | :---------------------------------------------------------- |
+//! | sha3      | digest and hex fingerprint over 64 B / 4 KiB / 64 KiB / 1 MiB |
+//! | mime      | MIME comparison, magic-byte sniffing, `text/uri-list` parsing |
+//! | queue     | bounded-channel hand-off, load shedding, reader gate, memory |
+//! | payload   | routing decision, reader dispatch, bounded reads, pipe streams |
+//! | splice    | pipe -> file: heap `Vec` road versus `splice(2)`/`tee(2)` and the fallback |
+//! | ingest    | pipe -> database end to end, in memory versus spooled; memory bound |
+//! | transcode | raster image: spool file -> converted bytes, heap road versus descriptor to descriptor |
+//! | sqlite    | insert, insert + rotation, duplicate hit, metadata scans      |
 //!
 //! Besides time, every row reports allocation calls and bytes per operation
 //! (a counting global allocator wraps `System`), the quantity the zero-copy
@@ -53,8 +54,9 @@ use y4p_core as core;
 use y4p_core::payload::{read_bounded, route_payload, to_hex, Payload, PayloadReader, SpooledFile, StreamDescriptor};
 use y4p_core::splice::{copy_to_file, copy_to_file_buffered, ByteTap, NoTap};
 use y4p_daemon::metrics::DaemonMetrics;
-use y4p_daemon::spool::FileSpooler;
+use y4p_daemon::spool::{transcode_spooled, FileSpooler};
 use y4p_daemon::worker::DbWorker;
+use y4p_image::transcode::{self, InputFormat, OutputFormat, Transcode};
 use y4p_storage::ClipboardDb;
 use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
 use y4p_wayland::ingest::{self, Enqueue, ReaderGate};
@@ -644,6 +646,80 @@ fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Transcode: a spooled raster image through `magick`, heap road versus descriptors
+// ---------------------------------------------------------------------------
+
+/// A spooled raster image, converted two ways: the v0.7.3 road reads the whole
+/// file into a `Vec`, feeds `magick` through the chunk-buffered relay, collects
+/// its output in a second `Vec` and hashes that; the v0.7.4 road hands the file
+/// to `magick` as its stdin and splices its stdout into a new file, hashing on
+/// the way (`transcode_spooled`). Both start from the same spool file and end
+/// with the converted bytes' SHA3-256; only the second also leaves them on disk
+/// ready for adoption, so the first is not charged for a write it would still owe.
+///
+/// Incompressible noise on purpose: the PNG is as large as the pixels, so the
+/// byte volume is what the label says and `magick` has real work to do.
+fn bench_transcode(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
+    if !y4p_image::magick::is_available() {
+        println!("\ntranscode group skipped: `magick` is not available on this system");
+        return Ok(());
+    }
+    let dir = core::spool_dir_path();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("spool directory: {e}"))?;
+    let job = Transcode { input: InputFormat::Png, output: OutputFormat::Png };
+    let limit = core::constants::MAX_PAYLOAD_BYTES;
+
+    // Smoke mode (`cargo test`) converts the small image only.
+    let sides: &[u32] = if mode.full { &[512, 2048] } else { &[512] };
+    let mut notes = Vec::new();
+    for &side in sides {
+        let geometry = format!("{side}x{side}");
+        let mut png = Vec::new();
+        y4p_image::magick::run(&["-size", &geometry, "xc:", "+noise", "Random", "-depth", "8", "png:-"], std::io::empty(), &mut png)
+            .map_err(|e| format!("cannot generate the fixture image: {e}"))?;
+        let path = dir.join(format!("{}-{side}.part", std::process::id()));
+        std::fs::write(&path, &png).map_err(|e| e.to_string())?;
+        let digest = <[u8; core::constants::DIGEST_LEN]>::try_from(Sha3_256::digest(&png).as_slice()).map_err(|e| e.to_string())?;
+        let source = SpooledFile::new(path.clone(), png.len() as u64, digest);
+        let label = size_label(png.len());
+        let len = png.len() as u64;
+        drop(png);
+
+        let memory_road = || -> Option<[u8; core::constants::DIGEST_LEN]> {
+            let bytes = std::fs::read(&path).ok()?;
+            let mut out = Vec::with_capacity(bytes.len());
+            transcode::transcode(job, std::io::Cursor::new(&bytes), &mut out).ok()?;
+            <[u8; core::constants::DIGEST_LEN]>::try_from(Sha3_256::digest(&out).as_slice()).ok()
+        };
+        let descriptor_road = || transcode_spooled(&source, job, limit).ok().map(|converted| *converted.digest());
+
+        // Same input, same arguments: the two roads must produce the same digest,
+        // or deduplication would key one image two ways.
+        let (a, b) = (memory_road(), descriptor_road());
+        if a.is_none() || a != b {
+            return Err(format!("the two transcode roads disagree on the {label} image: {a:?} vs {b:?}"));
+        }
+
+        for (road, run) in [
+            ("read into Vec + buffered relay + sha3 (v0.7.3 road)", &memory_road as &dyn Fn() -> Option<[u8; core::constants::DIGEST_LEN]>),
+            ("spool file -> spool file, stdin handed over, stdout spliced + tee + sha3 (v0.7.4 road)", &descriptor_road),
+        ] {
+            let before = LIVE_BYTES.load(Ordering::Relaxed);
+            PEAK_BYTES.store(before, Ordering::Relaxed);
+            black_box(run());
+            let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+            notes.push(format!("transcode peak heap growth, {label} PNG, {road}: {:.2} MiB", peak as f64 / (1024.0 * 1024.0)));
+            rows.push(mode.micro("transcode", format!("raster {label} PNG -> PNG: {road}"), len, run));
+        }
+        drop(source);
+    }
+    for note in &notes {
+        println!("\n{note}");
+    }
+    Ok(())
+}
+
 fn bench_queue(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
     let capacity = core::constants::INGEST_QUEUE_CAPACITY;
 
@@ -975,6 +1051,7 @@ fn run_measurements(root: &Path) -> Result<(), String> {
     // slower when they ran first).
     bench_splice(&mode, &mut rows);
     bench_ingest(&mode, &mut rows)?;
+    bench_transcode(&mode, &mut rows)?;
 
     print_header();
     rows.iter().for_each(print_row);

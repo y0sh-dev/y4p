@@ -5,15 +5,18 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use crate::core::constants::{PIPELINE_CHUNK_BYTES, PIPELINE_STDERR_CAP_BYTES};
+use crate::core::payload::PayloadError;
+use crate::core::splice::{self, ByteTap};
 
 /// Why a filter run failed. Every variant is recoverable: nothing in this
 /// module panics, so a bad image or a dying child can never take a resident
@@ -182,10 +185,13 @@ fn drain_capped<R: Read>(mut from: R, cap: usize) -> Vec<u8> {
 
 /// One `splice(2)` step: moves up to `len` bytes from `src` to `dst` inside
 /// the kernel, by handing over pipe pages instead of copying them through
-/// user space. This is the primitive for the future descriptor-to-descriptor
-/// path (compositor pipe -> `magick` stdin, `magick` stdout -> file); the
-/// chunked `Read`/`Write` relays remain the working implementation until
-/// then.
+/// user space. The descriptor-to-descriptor road ([`run_filter_file_in_env`])
+/// does not use it: it hands the input descriptor to the child directly and
+/// drains the child's stdout with `core::splice::copy_to_file`, which adds the
+/// `tee(2)` fingerprinting and the buffered fallback. This lower-level pair
+/// (`try_splice`, `splice_all`) is kept for callers that want a bare splice
+/// between two pipes or a pipe and a file with no tap; folding it into
+/// `core::splice` is a refactoring for a later minor.
 ///
 /// The result separates three situations the caller must treat differently:
 ///
@@ -380,9 +386,9 @@ fn join_worker<T>(handle: thread::ScopedJoinHandle<'_, T>) -> Result<T, Pipeline
 /// 3. the calling thread relays the child's stdout into `output`.
 ///
 /// Each pipe therefore always has a live peer, whatever order the child
-/// reads and writes in. The `Read`/`Write` boundary is also the seam where a
-/// future zero-copy implementation (`splice(2)` between raw descriptors) can
-/// replace the chunked copy without changing any caller.
+/// reads and writes in. The chunk buffers are the price of the `Read`/`Write`
+/// boundary; when both ends are descriptors, [`run_filter_file_in_env`] runs the
+/// same child with no buffer and no feeder thread.
 ///
 /// # Failure semantics
 ///
@@ -396,7 +402,7 @@ where
     R: Read + Send,
     W: Write,
 {
-    run_filter_inner(program, args, None, input, output, None)
+    run_filter_to_writer(program, args, None, input, output, None)
 }
 
 /// [`run_filter`] with a wall-clock budget. If the child (or anything it
@@ -418,7 +424,7 @@ where
     R: Read + Send,
     W: Write,
 {
-    run_filter_inner(program, args, None, input, output, Some(timeout))
+    run_filter_to_writer(program, args, None, input, output, Some(timeout))
 }
 
 /// [`run_filter`] / [`run_filter_timeout`] in a controlled environment: the
@@ -437,10 +443,22 @@ where
     R: Read + Send,
     W: Write,
 {
-    run_filter_inner(program, args, Some(env), input, output, timeout)
+    run_filter_to_writer(program, args, Some(env), input, output, timeout)
 }
 
-fn run_filter_inner<R, W>(
+/// Where a filter's stdin comes from.
+enum Stdin<R> {
+    /// A caller stream, copied into the child's stdin pipe by a feeder thread.
+    Stream(R),
+    /// A descriptor the child inherits *as* its stdin: no feeder thread, no
+    /// copy, no buffer. The parent's handle is consumed and released as soon
+    /// as the child is spawned, so the child is the only one left holding it.
+    Descriptor(File),
+}
+
+/// [`run_filter_in_env`]'s engine for a caller-supplied sink: the child's
+/// stdout is relayed through a chunk buffer into `output`.
+fn run_filter_to_writer<R, W>(
     program: &str,
     args: &[&str],
     env: Option<&ChildEnv>,
@@ -452,26 +470,120 @@ where
     R: Read + Send,
     W: Write,
 {
+    run_filter_inner(program, args, env, Stdin::Stream(input), |stdout| relay(stdout, output), timeout)
+        .map(|(bytes_in, bytes_out)| Transfer { bytes_in, bytes_out })
+}
+
+/// Where a descriptor-to-descriptor run puts the child's output: a file, under
+/// a byte limit, with every byte shown to a [`ByteTap`] (the fingerprint)
+/// while it passes.
+pub struct FileSink<'a, T: ByteTap> {
+    pub file: &'a mut File,
+    pub limit: u64,
+    pub tap: &'a mut T,
+}
+
+/// Runs `program args...` descriptor to descriptor: `input` becomes the child's
+/// stdin as it is, and the child's stdout is moved into `sink.file` by
+/// `splice(2)` (with `tee(2)` feeding the tap), so no payload byte is buffered
+/// on this process's heap in either direction. Compare [`run_filter_in_env`],
+/// which relays both directions through chunk buffers and a feeder thread.
+///
+/// - **Input.** `input` is read by the child from its current offset (a
+///   freshly opened file starts at 0). Because the child holds the same open
+///   file description, the offset it leaves behind is not meaningful to the
+///   caller; reopen the file to read it again. `Transfer::bytes_in` is the size
+///   of the file when the run started: a child that stopped early read less.
+/// - **Output.** [`splice::copy_to_file`] does the copy, and falls back to a
+///   stack-buffer copy when the kernel cannot splice between the two
+///   descriptors (`O_APPEND` destination, exotic filesystem), with identical
+///   limits and tap semantics. An empty output is not an error here, for the
+///   same reason an empty relay is not: the child's exit status explains it
+///   (a rejected image exits non-zero), and a "successful" run with no output
+///   is for the caller to judge.
+/// - **Failures.** Everything else is as for [`run_filter_in_env`]: the
+///   deadline kills the whole process group, the sandboxed environment is
+///   whatever `env` says, and on `Err` the file may hold partial bytes and must
+///   be discarded. An output over `sink.limit` kills the child and is
+///   reported as [`PipelineError::Sink`], as is a failed write to the file; an
+///   I/O error reading the child's pipe cannot be told apart from those, so it
+///   is reported the same way.
+pub fn run_filter_file_in_env<T: ByteTap>(
+    program: &str,
+    args: &[&str],
+    env: &ChildEnv,
+    input: File,
+    sink: FileSink<'_, T>,
+    timeout: Option<Duration>,
+) -> Result<Transfer, PipelineError> {
+    let FileSink { file, limit, tap } = sink;
+    run_filter_inner::<io::Empty, _, _>(
+        program,
+        args,
+        Some(env),
+        Stdin::Descriptor(input),
+        |stdout| match splice::copy_to_file(stdout, file, limit, tap) {
+            Ok(copied) => Ok(copied.len),
+            Err(PayloadError::Empty) => Ok(0),
+            Err(PayloadError::TooLarge { limit }) => {
+                Err(RelayFailure::Sink(io::Error::other(format!("output exceeds the {limit}-byte limit"))))
+            }
+            Err(PayloadError::Io(e)) => Err(RelayFailure::Sink(e)),
+        },
+        timeout,
+    )
+    .map(|(bytes_in, bytes_out)| Transfer { bytes_in, bytes_out })
+}
+
+/// The one implementation behind every `run_filter*`: spawns the child, feeds
+/// its stdin (by thread, or by handing a descriptor over), lets `drain` consume
+/// its stdout on the calling thread, and returns `(bytes_in, drained)`.
+fn run_filter_inner<R, T, D>(
+    program: &str,
+    args: &[&str],
+    env: Option<&ChildEnv>,
+    input: Stdin<R>,
+    drain: D,
+    timeout: Option<Duration>,
+) -> Result<(u64, T), PipelineError>
+where
+    R: Read + Send,
+    D: FnOnce(&mut ChildStdout) -> Result<T, RelayFailure>,
+{
+    let (stdin, stream, descriptor_len) = match input {
+        Stdin::Stream(source) => (Stdio::piped(), Some(source), 0),
+        Stdin::Descriptor(file) => {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            (Stdio::from(file), None, len)
+        }
+    };
     let mut command = Command::new(program);
     command.args(args);
     if let Some(env) = env {
         env.apply(&mut command);
     }
-    let mut child = command
+    let spawned = command
         // Own process group, so a kill can reach the whole process tree.
         .process_group(0)
-        .stdin(Stdio::piped())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(PipelineError::Spawn)?;
+        .spawn();
+    // `Command` keeps the descriptor it was given until it is dropped; release
+    // it now rather than at the end of the run, so the child alone holds it.
+    drop(command);
+    let mut child = spawned.map_err(PipelineError::Spawn)?;
 
-    let (Some(stdin), Some(mut stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
+    let child_stdin = child.stdin.take();
+    let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         reap(&mut child);
         return Err(PipelineError::Child(io::Error::other("child pipe handle missing")));
     };
+    // A stream needs the child's stdin pipe; a descriptor must not have made one.
+    if stream.is_some() != child_stdin.is_some() {
+        reap(&mut child);
+        return Err(PipelineError::Child(io::Error::other("child pipe handle missing")));
+    }
 
     // Declared before the scope so the watchdog thread may borrow them.
     let pid = child.id();
@@ -480,14 +592,16 @@ where
     thread::scope(|scope| {
         // `Builder::spawn_scoped` instead of `Scope::spawn`: the latter
         // panics when the OS refuses a thread, which this module must not do.
-        let feeder = match thread::Builder::new()
-            .name("y4p-pipe-stdin".into())
-            .spawn_scoped(scope, move || feed(input, stdin))
-        {
-            Ok(handle) => handle,
-            Err(e) => {
-                reap(&mut child);
-                return Err(PipelineError::Child(e));
+        let feeder = match stream.zip(child_stdin) {
+            None => None,
+            Some((source, stdin)) => {
+                match thread::Builder::new().name("y4p-pipe-stdin".into()).spawn_scoped(scope, move || feed(source, stdin)) {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        reap(&mut child);
+                        return Err(PipelineError::Child(e));
+                    }
+                }
             }
         };
         let drainer = match thread::Builder::new()
@@ -520,7 +634,7 @@ where
             }
         };
 
-        let relayed = relay(&mut stdout, output);
+        let relayed = drain(&mut stdout);
         if relayed.is_err() {
             kill_process_group(pid);
         }
@@ -534,7 +648,7 @@ where
             false
         };
         let status = child.wait();
-        let fed = join_worker(feeder);
+        let fed = feeder.map(join_worker).transpose();
         let captured = join_worker(drainer);
         if let Some(handle) = watcher {
             let _ = join_worker(handle);
@@ -544,22 +658,23 @@ where
             return Err(PipelineError::Timeout(timeout.unwrap_or_default()));
         }
 
-        let bytes_out = match relayed {
-            Ok(n) => n,
+        let drained = match relayed {
+            Ok(drained) => drained,
             Err(RelayFailure::Sink(e)) => return Err(PipelineError::Sink(e)),
             Err(RelayFailure::Child(e)) => return Err(PipelineError::Child(e)),
         };
         let bytes_in = match fed? {
-            Ok(n) => n,
-            Err(FeedFailure::Source(e)) => return Err(PipelineError::Source(e)),
-            Err(FeedFailure::Child(e)) => return Err(PipelineError::Child(e)),
+            None => descriptor_len,
+            Some(Ok(n)) => n,
+            Some(Err(FeedFailure::Source(e))) => return Err(PipelineError::Source(e)),
+            Some(Err(FeedFailure::Child(e))) => return Err(PipelineError::Child(e)),
         };
         let status = status.map_err(PipelineError::Child)?;
         if !status.success() {
             let stderr = String::from_utf8_lossy(&captured?).trim().to_owned();
             return Err(PipelineError::Failed { code: status.code(), stderr });
         }
-        Ok(Transfer { bytes_in, bytes_out })
+        Ok((bytes_in, drained))
     })
 }
 
@@ -1170,5 +1285,175 @@ mod tests {
             let error = failure.expect("the dead reader was never reported");
             assert_eq!(error.kind(), ErrorKind::BrokenPipe);
         });
+    }
+
+    // --- descriptor to descriptor: a file as stdin, stdout spliced into a file ---
+
+    /// A tap that keeps what it saw, to compare against what reached the file.
+    #[derive(Default)]
+    struct Collect(Vec<u8>);
+
+    impl ByteTap for Collect {
+        fn update(&mut self, chunk: &[u8]) {
+            self.0.extend_from_slice(chunk);
+        }
+    }
+
+    /// A read-only handle on a scratch file holding `bytes`, at offset 0.
+    fn input_file(scratch: &ScratchFile, bytes: &[u8]) -> File {
+        std::fs::write(&scratch.0, bytes).unwrap();
+        File::open(&scratch.0).unwrap()
+    }
+
+    fn path_only_env() -> ChildEnv {
+        ChildEnv::new().set("PATH", std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    /// Runs `program args` with `input` as stdin and a fresh scratch file as the
+    /// sink; returns the run's result, what reached the file and what the tap saw.
+    fn run_to_file(
+        program: &'static str,
+        args: &'static [&'static str],
+        input: File,
+        limit: u64,
+        timeout: Option<Duration>,
+    ) -> (Result<Transfer, PipelineError>, Vec<u8>, Vec<u8>) {
+        let out = ScratchFile::new("sink");
+        let mut file = out.open_rw();
+        let mut tap = Collect::default();
+        let result = run_filter_file_in_env(
+            program,
+            args,
+            &path_only_env(),
+            input,
+            FileSink { file: &mut file, limit, tap: &mut tap },
+            timeout,
+        );
+        (result, out.contents(), tap.0)
+    }
+
+    #[test]
+    fn a_file_is_the_childs_stdin_and_its_stdout_is_spliced_into_the_output_file() {
+        // Several pipe capacities, and not a multiple of any chunk size.
+        let payload = patterned(3 * 1024 * 1024 + 5);
+        let source = ScratchFile::new("in-cat");
+        let input = input_file(&source, &payload);
+        let expected = payload;
+        let (result, written, seen) = within_deadline(move || run_to_file("cat", &[], input, 64 << 20, None));
+        let transfer = result.unwrap();
+        assert_eq!(transfer, Transfer { bytes_in: expected.len() as u64, bytes_out: expected.len() as u64 });
+        assert!(written == expected, "the file differs from the input");
+        assert!(seen == expected, "the tap must see exactly the bytes that were stored, once, in order");
+    }
+
+    #[test]
+    fn the_child_reads_from_the_descriptors_current_offset() {
+        let source = ScratchFile::new("in-offset");
+        let mut input = input_file(&source, b"0123456789");
+        io::Seek::seek(&mut input, io::SeekFrom::Start(4)).unwrap();
+        let (result, written, seen) = run_to_file("cat", &[], input, 1 << 20, None);
+        let transfer = result.unwrap();
+        assert_eq!(written, b"456789");
+        assert_eq!(seen, b"456789");
+        // `bytes_in` is the size of the file, as documented, not what was read.
+        assert_eq!((transfer.bytes_in, transfer.bytes_out), (10, 6));
+    }
+
+    #[test]
+    fn a_pipe_descriptor_works_as_the_childs_stdin_too() {
+        let payload = patterned(1_000_003);
+        let expected = payload.clone();
+        let (reader, mut writer) = io::pipe().unwrap();
+        let feeder = thread::spawn(move || {
+            let _ = writer.write_all(&payload);
+        });
+        let input = File::from(std::os::fd::OwnedFd::from(reader));
+        let (result, written, seen) = within_deadline(move || run_to_file("cat", &[], input, 64 << 20, None));
+        feeder.join().unwrap();
+        result.unwrap();
+        assert!(written == expected && seen == expected);
+    }
+
+    #[test]
+    fn output_over_the_limit_kills_the_child_and_is_a_sink_error() {
+        let source = ScratchFile::new("in-limit");
+        let input = input_file(&source, b"ignored");
+        // `yes` never stops on its own: only the limit can end this run.
+        let (result, written, _) = within_deadline(move || run_to_file("yes", &[], input, 100_000, None));
+        match result {
+            Err(PipelineError::Sink(e)) => assert!(e.to_string().contains("100000"), "{e}"),
+            other => panic!("expected a sink error, got {other:?}"),
+        }
+        assert!(written.len() as u64 <= 100_001, "the file holds at most the limit plus the probe byte, not {}", written.len());
+    }
+
+    #[test]
+    fn an_empty_output_is_for_the_caller_to_judge_not_an_error_here() {
+        let source = ScratchFile::new("in-empty");
+        let input = input_file(&source, b"anything");
+        let (result, written, seen) = run_to_file("true", &[], input, 1 << 20, None);
+        assert_eq!(result.unwrap().bytes_out, 0);
+        assert!(written.is_empty() && seen.is_empty());
+    }
+
+    #[test]
+    fn a_failing_child_is_reported_as_failed_with_its_stderr_not_as_an_empty_sink() {
+        // The child writes nothing to stdout: the copy sees an empty stream,
+        // which must not shadow the exit status that explains it.
+        let source = ScratchFile::new("in-fail");
+        let input = input_file(&source, b"anything");
+        let (result, written, _) = run_to_file("sh", &["-c", "echo rejected >&2; exit 3"], input, 1 << 20, None);
+        match result {
+            Err(PipelineError::Failed { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert_eq!(stderr, "rejected");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn a_hanging_child_is_killed_at_the_deadline_on_the_descriptor_road_too() {
+        let source = ScratchFile::new("in-hang");
+        let input = input_file(&source, b"anything");
+        let started = std::time::Instant::now();
+        let (result, _, _) = within_deadline(move || run_to_file("sleep", &["30"], input, 1 << 20, Some(Duration::from_millis(200))));
+        assert!(matches!(result, Err(PipelineError::Timeout(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the kill must not wait out the child");
+    }
+
+    #[test]
+    fn an_append_only_output_falls_back_to_the_buffered_copy_with_the_same_bytes() {
+        // `splice(2)` refuses an `O_APPEND` destination: the copy must carry on
+        // in user space without losing, repeating or reordering a byte.
+        let payload = patterned(700_001);
+        let source = ScratchFile::new("in-append");
+        let input = input_file(&source, &payload);
+        let out = ScratchFile::new("sink-append");
+        let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true).open(&out.0).unwrap();
+        let mut tap = Collect::default();
+        let expected = payload;
+        let (result, tap) = within_deadline(move || {
+            let result = run_filter_file_in_env(
+                "cat",
+                &[],
+                &path_only_env(),
+                input,
+                FileSink { file: &mut file, limit: 64 << 20, tap: &mut tap },
+                None,
+            );
+            (result, tap.0)
+        });
+        result.unwrap();
+        assert!(out.contents() == expected && tap == expected);
+    }
+
+    #[test]
+    fn a_missing_program_on_the_descriptor_road_is_classified_as_unavailable() {
+        let source = ScratchFile::new("in-missing");
+        let input = input_file(&source, b"x");
+        let (result, _, _) = run_to_file("y4p-definitely-not-a-real-binary", &[], input, 1 << 20, None);
+        assert!(result.unwrap_err().is_unavailable());
     }
 }

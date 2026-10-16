@@ -21,6 +21,10 @@
 //!   unlinks itself unless the worker adopts it;
 //! - debris of a crashed run (a `.part` file whose process is gone) is swept
 //!   when the spooler opens.
+//!
+//! The same file lifecycle serves the second half of the pipeline:
+//! [`transcode_spooled`] turns one spool file into another through the image
+//! converter, hashing the output as it is written.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
@@ -33,6 +37,8 @@ use sha3::{Digest, Sha3_256};
 use crate::core::constants::{DIGEST_LEN, SPOOL_FILE_EXTENSION};
 use crate::core::payload::{PayloadError, SpooledFile};
 use crate::core::splice::{self, ByteTap};
+use crate::image::pipeline::PipelineError;
+use crate::image::transcode::{transcode_file, Transcode};
 use crate::wayland::spool::{PayloadSpooler, SpoolOutcome};
 
 /// SHA3-256 as a [`ByteTap`]: the fingerprint is finished the moment the last
@@ -136,6 +142,53 @@ impl PayloadSpooler for FileSpooler {
         let (Some(digest), Some(path)) = (tap.finish(), guard.disarm()) else { return SpoolOutcome::Rejected };
         SpoolOutcome::Spooled(SpooledFile::new(path, head_len + rest, digest))
     }
+}
+
+/// Converts the spooled payload `source` into a new spool file, descriptor to
+/// descriptor, and returns that file with the digest of what was written.
+///
+/// `source` is handed to the converter as its stdin and the converter's stdout
+/// is spliced into the new file while a [`Sha3Tap`] fingerprints it, so neither
+/// the original nor the converted bytes ever enter this process's heap (see
+/// `y4p_image::transcode::transcode_file` for the mechanics and the fallbacks).
+/// `limit` bounds the converted file, as `MAX_PAYLOAD_BYTES` bounds ingestion.
+///
+/// The result is what an ingested payload of that content would have been: a
+/// private `0600` file in the spool directory that deletes itself on drop and
+/// whose digest keys the database. `source` is left exactly as it was, so a
+/// failed conversion (any `Err`; the half-written file is unlinked here) leaves
+/// the caller free to store the original. Deleting `source` after a successful
+/// one is the caller's decision.
+///
+/// The new file is named after its source (`<pid>-<n>-t.part`): unique because
+/// the source name is, and still parsed to the owning pid by [`sweep_stale`], so
+/// a crash between the two files leaves nothing a later start cannot sweep.
+/// Failures to open either file are `Source`/`Sink` errors, which the image
+/// router treats as the host's problem rather than the converter's.
+pub fn transcode_spooled(source: &SpooledFile, job: Transcode, limit: u64) -> Result<SpooledFile, PipelineError> {
+    let input = File::open(source.path()).map_err(PipelineError::Source)?;
+    let (mut output, path) = create_derived(source.path()).map_err(PipelineError::Sink)?;
+    let guard = Unlink(Some(path));
+
+    let mut tap = Sha3Tap::new();
+    let transfer = transcode_file(job, input, &mut output, limit, &mut tap)?;
+
+    let (Some(digest), Some(path)) = (tap.finish(), guard.disarm()) else {
+        return Err(PipelineError::Sink(io::Error::other("the converted payload's digest was unavailable")));
+    };
+    Ok(SpooledFile::new(path, transfer.bytes_out, digest))
+}
+
+/// Creates, `0600` and exclusively, the file derived from the spool file at
+/// `source`: same directory, `<stem>-t.part`. Opened for reading as well as
+/// writing: the converter checks the first bytes it wrote.
+fn create_derived(source: &Path) -> io::Result<(File, PathBuf)> {
+    let (Some(dir), Some(stem)) = (source.parent(), source.file_stem().and_then(|s| s.to_str())) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a spool file path"));
+    };
+    let path = dir.join(format!("{}-t.{}", stem, SPOOL_FILE_EXTENSION));
+    let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+    Ok((file, path))
 }
 
 /// Removes `.part` files in `dir` that no live process owns: names that do not
@@ -340,6 +393,163 @@ mod tests {
         assert!(mine.exists(), "a file under our own pid may belong to a spooler already running here");
         assert!(sibling.exists(), "a live process's file must be left alone");
         assert!(cached.exists(), "only .part files are ever swept");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --- transcode_spooled: spool file -> spool file through the converter ---
+
+    use crate::image::transcode::{InputFormat, OutputFormat};
+
+    const PNG_TO_PNG: Transcode = Transcode { input: InputFormat::Png, output: OutputFormat::Png };
+
+    fn magick_available() -> bool {
+        if crate::image::magick::is_available() {
+            true
+        } else {
+            eprintln!("skipping: `magick` is not available on this system");
+            false
+        }
+    }
+
+    fn generated_png() -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::image::magick::run(
+            &["-size", "128x128", "plasma:fractal", "-depth", "8", "-set", "comment", "SECRETCOMMENT", "png:-"],
+            io::empty(),
+            &mut out,
+        )
+        .unwrap();
+        out
+    }
+
+    /// Writes `bytes` as a finished spool file named like the spooler would.
+    fn spooled_file(dir: &Path, name: &str, bytes: &[u8]) -> SpooledFile {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        let digest = <[u8; DIGEST_LEN]>::try_from(Sha3_256::digest(bytes).as_slice()).unwrap();
+        SpooledFile::new(path, bytes.len() as u64, digest)
+    }
+
+    #[test]
+    fn a_spooled_png_is_converted_into_a_second_spool_file_with_its_own_digest() {
+        if !magick_available() { return; }
+        let dir = temp_dir("convert");
+        let png = generated_png();
+        let source = spooled_file(&dir, &format!("{}-1.part", std::process::id()), &png);
+
+        let converted = transcode_spooled(&source, PNG_TO_PNG, 64 << 20).unwrap();
+
+        let stored = fs::read(converted.path()).unwrap();
+        assert_ne!(converted.path(), source.path());
+        assert_eq!(converted.path().parent(), source.path().parent(), "the new file lives beside its source");
+        assert!(converted.path().to_string_lossy().ends_with("-1-t.part"), "{:?}", converted.path());
+        assert_eq!(converted.len(), stored.len() as u64);
+        assert_eq!(converted.hex_digest(), reference_digest(&stored), "the digest must describe the converted bytes, not the original");
+        assert_ne!(converted.hex_digest(), source.hex_digest());
+        assert!(!stored.windows(13).any(|w| w == b"SECRETCOMMENT"), "metadata must be stripped");
+        assert_eq!(fs::read(source.path()).unwrap(), png, "the source is left exactly as it was");
+
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(converted.path()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(files_in(&dir), 2);
+        drop((converted, source));
+        assert_eq!(files_in(&dir), 0, "both files delete themselves on drop");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_converted_file_is_byte_identical_to_what_the_in_memory_converter_makes() {
+        // The digest keys deduplication: the two roads must not disagree.
+        if !magick_available() { return; }
+        let dir = temp_dir("agree");
+        let png = generated_png();
+        let source = spooled_file(&dir, &format!("{}-2.part", std::process::id()), &png);
+        let mut expected = Vec::new();
+        crate::image::transcode::transcode(PNG_TO_PNG, io::Cursor::new(png), &mut expected).unwrap();
+
+        let converted = transcode_spooled(&source, PNG_TO_PNG, 64 << 20).unwrap();
+
+        assert!(fs::read(converted.path()).unwrap() == expected);
+        assert_eq!(converted.hex_digest(), reference_digest(&expected));
+        drop((converted, source));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_conversion_leaves_the_source_alone_and_no_second_file() {
+        if !magick_available() { return; }
+        let dir = temp_dir("fail");
+        let mut corrupt = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        corrupt.extend(data(50_000));
+        let source = spooled_file(&dir, &format!("{}-3.part", std::process::id()), &corrupt);
+
+        let result = transcode_spooled(&source, PNG_TO_PNG, 64 << 20);
+
+        assert!(matches!(result, Err(PipelineError::Failed { .. })), "{result:?}");
+        assert_eq!(files_in(&dir), 1, "only the source remains: the half-written file is unlinked");
+        assert_eq!(fs::read(source.path()).unwrap(), corrupt);
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_converted_file_over_the_limit_is_refused_and_unlinked() {
+        if !magick_available() { return; }
+        let dir = temp_dir("limit");
+        let source = spooled_file(&dir, &format!("{}-4.part", std::process::id()), &generated_png());
+
+        let result = transcode_spooled(&source, PNG_TO_PNG, 100);
+
+        assert!(matches!(result, Err(PipelineError::Sink(_))), "{result:?}");
+        assert_eq!(files_in(&dir), 1);
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_collision_is_an_error_that_never_touches_the_existing_file() {
+        let dir = temp_dir("collide");
+        let source = spooled_file(&dir, &format!("{}-5.part", std::process::id()), b"source");
+        let squatter = dir.join(format!("{}-5-t.part", std::process::id()));
+        fs::write(&squatter, b"someone else's").unwrap();
+
+        let result = transcode_spooled(&source, PNG_TO_PNG, 1 << 20);
+
+        match result {
+            Err(PipelineError::Sink(e)) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+            other => panic!("expected a sink error, got {other:?}"),
+        }
+        assert_eq!(fs::read(&squatter).unwrap(), b"someone else's", "O_EXCL: an existing file is never opened, let alone removed");
+        drop(source);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_source_is_a_source_error_and_creates_nothing() {
+        let dir = temp_dir("nosource");
+        let source = spooled_file(&dir, &format!("{}-6.part", std::process::id()), b"source");
+        fs::remove_file(source.path()).unwrap();
+        let result = transcode_spooled(&source, PNG_TO_PNG, 1 << 20);
+        assert!(matches!(result, Err(PipelineError::Source(_))), "{result:?}");
+        assert_eq!(files_in(&dir), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_treats_converted_files_like_any_other_spool_file() {
+        // `<pid>-<n>-t.part` must still parse to its owner: a crash between the
+        // two files has to be recoverable.
+        let dir = temp_dir("sweep-derived");
+        fs::create_dir_all(&dir).unwrap();
+        let dead = dir.join("2147483646-1-t.part");
+        let sibling = dir.join("1-5-t.part");
+        for p in [&dead, &sibling] {
+            fs::write(p, b"x").unwrap();
+        }
+        let _spooler = FileSpooler::open(dir.clone()).unwrap();
+        assert!(!dead.exists());
+        assert!(sibling.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 }

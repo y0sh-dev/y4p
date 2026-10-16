@@ -78,7 +78,11 @@ fn entries(dir: &Path) -> Vec<String> {
 }
 
 fn row_for(db: &ClipboardDb, mime: &str) -> Option<i64> {
-    db.fetch_metadata(100).into_iter().find(|row| row.2 == mime).map(|row| row.0)
+    rows_for(db, mime).into_iter().next()
+}
+
+fn rows_for(db: &ClipboardDb, mime: &str) -> Vec<i64> {
+    db.fetch_metadata(100).into_iter().filter(|row| row.2 == mime).map(|row| row.0).collect()
 }
 
 #[test]
@@ -147,12 +151,47 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     assert!(!y4p_core::cache_file_path(&secret_hash).exists(), "a declined payload must not remain as a cache file");
     assert_eq!(entries(&spool_dir), Vec::<String>::new());
 
-    // --- 5. A raster image the converter wants: takes the in-memory road ---
-    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    png.extend(pattern(200_000, 5));
-    tx.send(spooled_job(&spooler, "image/png", &png)).unwrap();
-    wait_for("the PNG row", || row_for(&read_db, "image/png").is_some());
-    assert_eq!(entries(&spool_dir), Vec::<String>::new(), "a materialised spool file is deleted too");
+    // --- 5. A raster image the converter wants: converted file to file ---
+    // `magick` reads the spool file and writes a second one, hashed as it goes;
+    // the second file replaces the first and is adopted into the cache.
+    if y4p_image::magick::is_available() {
+        let mut png = Vec::new();
+        y4p_image::magick::run(
+            &["-size", "256x256", "plasma:fractal", "-depth", "8", "-set", "comment", "SECRETCOMMENT", "png:-"],
+            io::empty(),
+            &mut png,
+        )
+        .unwrap();
+        assert!(png.len() > HEAD && png.windows(13).any(|w| w == b"SECRETCOMMENT"), "the fixture must be spooled and carry metadata");
+        // What the in-memory road makes of the same image: the file road must agree
+        // to the byte, or the same copy would key two different rows.
+        let (_, converted) = y4p_image::route::route_for_ingest("image/png".to_owned(), png.clone());
+        assert_ne!(converted, png, "the fixture must actually be rewritten");
+        let converted_hash = digest_of(&converted);
+
+        tx.send(spooled_job(&spooler, "image/png", &png)).unwrap();
+        wait_for("the converted PNG row", || row_for(&read_db, "image/png").is_some());
+
+        let id = row_for(&read_db, "image/png").unwrap();
+        let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
+        assert_eq!(path, y4p_core::cache_file_path(&converted_hash), "the row is keyed by the digest of the converted bytes");
+        assert_eq!(fs::read(&path).unwrap(), converted, "the cache file is the converter's output, byte for byte");
+        assert!(!y4p_core::cache_file_path(&digest_of(&png)).exists(), "the original must not be cached as well");
+        assert_eq!(entries(&spool_dir), Vec::<String>::new(), "both the original and the converted spool file are gone");
+    }
+
+    // --- 5b. An image that does not decode: the original is stored untouched ---
+    let mut corrupt = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    corrupt.extend(pattern(200_000, 5));
+    let corrupt_hash = digest_of(&corrupt);
+    let known_png_rows = rows_for(&read_db, "image/png");
+    tx.send(spooled_job(&spooler, "image/png", &corrupt)).unwrap();
+    wait_for("the undecodable PNG row", || rows_for(&read_db, "image/png").len() > known_png_rows.len());
+    let id = rows_for(&read_db, "image/png").into_iter().find(|id| !known_png_rows.contains(id)).unwrap();
+    let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
+    assert_eq!(path, y4p_core::cache_file_path(&corrupt_hash), "falling back keys the row by the original's digest");
+    assert_eq!(fs::read(&path).unwrap(), corrupt, "no data may be lost when the conversion fails");
+    assert_eq!(entries(&spool_dir), Vec::<String>::new(), "a failed conversion leaves no half-written file");
 
     // --- 6. The cache-file rule copied into the worker matches the storage layer's ---
     let mut writer_db = ClipboardDb::open().unwrap();

@@ -3,13 +3,15 @@
 
 // crates/image/src/magick.rs
 
+use std::fs::File;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::core::constants::MAGICK_PROGRAM;
-use crate::pipeline::{self, PipelineError, Transfer};
+use crate::core::splice::ByteTap;
+use crate::pipeline::{self, FileSink, PipelineError, Transfer};
 use crate::sandbox::{self, ScratchDir};
 
 /// True when `program -version` can be spawned and exits successfully.
@@ -78,6 +80,24 @@ where
     W: Write,
 {
     run_isolated(MAGICK_PROGRAM, sandbox::create_scratch_dir(), args, input, output, Some(timeout))
+}
+
+/// [`run_with_timeout`] descriptor to descriptor: `input` is handed to `magick`
+/// as its stdin and its output is moved into the sink's file by `splice(2)`,
+/// fingerprinted on the way (see [`pipeline::run_filter_file_in_env`] for the
+/// contract). The same isolation applies: a private scratch directory and the
+/// minimal environment, and nothing is started if no scratch directory can be
+/// made ([`PipelineError::Isolation`]). On `Err` the sink's file may hold
+/// partial bytes and must be discarded.
+pub fn run_file_with_timeout<T: ByteTap>(
+    args: &[&str],
+    input: File,
+    sink: FileSink<'_, T>,
+    timeout: Duration,
+) -> Result<Transfer, PipelineError> {
+    let scratch = sandbox::create_scratch_dir().map_err(PipelineError::Isolation)?;
+    let env = sandbox::child_env(Some(scratch.path()));
+    pipeline::run_filter_file_in_env(MAGICK_PROGRAM, args, &env, input, sink, Some(timeout))
 }
 
 /// Runs `program` inside `scratch`, which is removed once the child is gone
