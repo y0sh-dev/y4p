@@ -158,8 +158,13 @@ A screenshot or a GIF does not need to be a heap buffer: the daemon only has to 
    v
  SpooledFile { path, len, digest }  --ClipboardJob--> bounded queue --> worker
                                                                          |
-   wants_transcode(mime, head512)? --yes--> read back, magick, hash, insert   (v0.7.2 road)
-                                   --no --> map file, rename into the cache, insert from the map
+   route_file_for_ingest(mime, head512): would the converter rewrite it?
+        --yes, and breaker + throttle allow--> magick: spool file as stdin, stdout spliced into a
+        |                                      second spool file, sha3 over it (v0.7.4); the first is deleted
+        --no, or skipped, or failed----------> the original spool file, untouched
+                                    |
+                                    v
+                       map file, rename into the cache, insert from the map
 ```
 
 **Why the Wayland crate does not hash or touch the cache.** `PayloadSpooler` ([`crates/wayland/src/spool.rs`](../crates/wayland/src/spool.rs)) is the whole interface: "drain this pipe into a file, return where it is and what it hashes to". The implementation, `FileSpooler` ([`crates/daemon/src/spool.rs`](../crates/daemon/src/spool.rs)), owns the directory, the file names and SHA3-256; `y4p-wayland` still depends on neither `y4p-storage`, `y4p-image` nor `sha3`. Without a spooler (Action Mode, tests) the ingestion thread behaves exactly as in v0.7.2.
@@ -179,14 +184,14 @@ The switch happens only *between* rounds or before a round has consumed anything
 
 **What the worker does with it** (`store_spooled`, [`crates/daemon/src/worker.rs`](../crates/daemon/src/worker.rs)):
 
-1. The first 512 bytes decide, through `y4p_image::route::wants_transcode` (the classification half of `route_with`, so the two cannot disagree). A raster image the converter would rewrite is read back into memory and takes the v0.7.2 road: `magick` still works on bytes until v0.7.4.
-2. Anything else is stored as it arrived, keyed by the digest computed while it streamed in: it is **not hashed again**. `crates/storage` (frozen) takes a `&[u8]`, so the spool file is mapped read-only (`core::mapped::MappedFile`: page cache, no heap, untouched pages never read).
+1. The first 512 bytes go to `y4p_image::route::route_file_for_ingest`, which decides with the same classification as the in-memory road (one private function, `plan`, serves both, so they cannot disagree) and runs under the same circuit breaker and process throttle. A raster image the converter would rewrite is converted **file to file** (v0.7.4 Part 1, [06](06_local_image_pipeline.md) section 6.4): `magick` reads the spool file as its stdin and its stdout is spliced into a new spool file next to it (`<pid>-<n>-t.part`) while SHA3-256 runs over the output. The new file, with the digest of *its* bytes and the converter's MIME, replaces the original, which is unlinked. If the conversion is skipped (open circuit, no free slot, no `magick`) or fails (undecodable image, timeout, output over the limit), the original file carries on untouched and the half-written one is unlinked. Nothing in this step is read into the heap.
+2. The file that results, converted or not, is stored as it is, keyed by the digest computed while it streamed in: it is **not hashed again**. `crates/storage` (frozen) takes a `&[u8]`, so the spool file is mapped read-only (`core::mapped::MappedFile`: page cache, no heap, untouched pages never read).
 3. A payload storage keeps in a cache file (`image/*`, `*gif*`) is **adopted**: the spool file is renamed to `<cache>/<hash>.cache` before the insert, so storage finds it in place and writes nothing (an integration test compares inodes). Never over an existing file. If the insert fails or storage declines (a sensitive MIME), the adopted file is removed again. Every other payload is inserted from the mapping and the spool file is deleted.
 4. If the file cannot be mapped (no `mmap` on that filesystem) or is not the recorded size, it is read instead, with the digest kept.
 
 The only coupling to the frozen storage layer is its layout rule (`<hash>.cache`, and "images live in cache files"). `core::cache_file_path` and `worker::stored_in_cache_file` mirror it, and an integration test (`crates/daemon/tests/spooled_persist.rs`) inserts through the real storage layer and fails if either copy drifts.
 
-**Resource accounting.** A reader that spools holds a pipe read end, the spool file and the two ends of the scratch pipe: four descriptors, at most `INGEST_MAX_CONCURRENT_READERS` (8) readers, so 32. The queue carries paths, not descriptors: no descriptor waits in it. The heap cost of a queued spooled job is the box and the path (about 160 bytes, measured), whatever the payload's size; the cost moves to disk, bounded by the same counts: (64 + 8) x 256 MiB in the worst case (a byte budget is the open question in `PERFORMANCE.md` section 6). A cache wipe removes the spool directory with the rest of the cache; the spooler re-creates it on the next payload, and a directory that cannot be created hands the pipe back for an in-memory read, so spooling is an optimisation that can fail without losing a clipboard entry. Leftover `.part` files of a dead process are swept when the daemon starts; a live process's files, and any other file, are never touched.
+**Resource accounting.** A reader that spools holds a pipe read end, the spool file and the two ends of the scratch pipe: four descriptors, at most `INGEST_MAX_CONCURRENT_READERS` (8) readers, so 32. The queue carries paths, not descriptors: no descriptor waits in it. The heap cost of a queued spooled job is the box and the path (about 160 bytes, measured), whatever the payload's size; the cost moves to disk, bounded by the same counts: (64 + 8) x 256 MiB in the worst case, plus one more file while the worker converts an image (the converted output; the original is unlinked as soon as it is in place), so (64 + 8 + 1) x 256 MiB (a byte budget is the open question in `PERFORMANCE.md` section 6). A cache wipe removes the spool directory with the rest of the cache; the spooler re-creates it on the next payload, and a directory that cannot be created hands the pipe back for an in-memory read, so spooling is an optimisation that can fail without losing a clipboard entry. Leftover `.part` files of a dead process are swept when the daemon starts; a live process's files, and any other file, are never touched.
 
 ---
 

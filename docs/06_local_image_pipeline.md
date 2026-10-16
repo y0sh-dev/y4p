@@ -45,13 +45,15 @@ To address these, `y4p` routes raster images through an isolated pipeline before
                                    SHA3-256 over the final bytes -> insert_with_hash
 ```
 
+The diagram is the in-memory road. A payload that was spooled to a file (v0.7.3) takes the same decision through `route::route_file_for_ingest(mime, head, convert)` and the same breaker and throttle, but the "bytes" are a spool file and the conversion runs descriptor to descriptor (section 6.4); the result is `(mime, file)` with the digest already computed.
+
 | Module | Role |
 | :--- | :--- |
-| `route.rs` | Classification and the conversion/bypass decision (`route_for_ingest`, testable core `route_with`) |
-| `transcode.rs` | Closed-enum argument construction for `magick`; resource limits; the compile-time timeout assertion |
+| `route.rs` | Classification and the conversion/bypass decision (`route_for_ingest` and `route_file_for_ingest`; testable cores `route_with` and `route_file_with`, sharing `plan` and `attempt_guarded`) |
+| `transcode.rs` | Closed-enum argument construction for `magick`; resource limits; the compile-time timeout assertion; `transcode` (buffered) and `transcode_file` (descriptor to descriptor) |
 | `magick.rs` | Availability probe (cached once per process) and isolated runs |
 | `sandbox.rs` | Private scratch directory (`ScratchDir`) and the environment whitelist (`child_env`) |
-| `pipeline.rs` | Streaming relay to a child, process-group watchdog, `PipelineError` |
+| `pipeline.rs` | Streaming relay to a child (buffered, or descriptor to descriptor), process-group watchdog, `PipelineError` |
 | `throttle.rs` | Counting semaphore bounding concurrent converter processes |
 | `breaker.rs` | Three-state circuit breaker over converter faults |
 
@@ -98,7 +100,7 @@ When the leading bytes identify an image, that identification is final: an SVG a
 
 ## 4. Argument Construction
 
-Every argument handed to `magick` is derived from closed enums and compile-time constants, never from clipboard-controlled text, so no option, `coder:` prefix or filename can be smuggled in. The vector is built in the one safe order ([`crates/image/src/transcode.rs:L212`](../crates/image/src/transcode.rs)):
+Every argument handed to `magick` is derived from closed enums and compile-time constants, never from clipboard-controlled text, so no option, `coder:` prefix or filename can be smuggled in. The vector is built in the one safe order ([`crates/image/src/transcode.rs:L227`](../crates/image/src/transcode.rs)):
 
 | # | Tokens | Why this position |
 | :--- | :--- | :--- |
@@ -106,7 +108,9 @@ Every argument handed to `magick` is derived from closed enums and compile-time 
 | 2 | pinned decoder `fmt:-[0]` | See section 3 |
 | 3 | `-auto-orient` | Orientation lives in EXIF; stripping first would turn a rotated photo sideways. The rotation is baked into the pixels, then the tag is dropped |
 | 4 | `-strip` | Removes every profile and comment: EXIF incl. GPS, XMP, IPTC, ICC, text chunks. **Not a switch: every transcode strips** |
-| 5 | encoder settings, output `png:-` | ingestion always uses `-define png:compression-level=1` (a borrowed `'static` token: no allocation). The WebP variants (`webp:lossless=true` with quality 100, or `webp:lossless=false` with the clamped quality) are not selected by ingestion |
+| 5 | encoder settings, output `png:-` | ingestion always uses `-define png:compression-level=1` and `-define png:exclude-chunk=tIME` (borrowed `'static` tokens: no allocation; the second is explained below). The WebP variants (`webp:lossless=true` with quality 100, or `webp:lossless=false` with the clamped quality) are not selected by ingestion |
+
+> **Invariant — the conversion is a pure function of its input (v0.7.4).** Left to itself, ImageMagick's PNG encoder writes a `tIME` chunk holding the *current time*, to the second, even after `-strip`. The same image converted a second apart then had different bytes and a different SHA3-256, so the dedupe (which keys on that digest) missed it, on the in-memory road as well. `png:exclude-chunk=tIME` removes the chunk: measured on a 12 MiB image, three conversions 1.1 s apart gave three different hashes without it and one with it, and the decoded pixel hash did not change. Three tests pin it (the argument, the absence of the chunk, and the same image converted either side of a second boundary). The chunk recorded when the *conversion* ran, not anything the user copied, so nothing worth keeping is lost; images stored before v0.7.4 keep their old digest.
 
 `Quality` (WebP only) clamps to 1..=100 on construction, so no input can make `magick` reject the option. In lossless WebP mode ImageMagick maps any quality below 100 onto libwebp's near-lossless pre-processing, which *does* alter pixels (measured: 59 of 16 384 pixels differ at quality 75), so the lossless variant is pinned to 100.
 
@@ -177,7 +181,7 @@ The child starts as the leader of its own process group (`process_group(0)`). On
 `IMAGE_LIMIT_TIME_SECS` is a string (it is handed to `magick` as an argument), so the assertion parses it in a `const fn` and fails the build on anything but a whole number of seconds below the outer budget:
 
 ```rust
-// crates/image/src/transcode.rs:L164
+// crates/image/src/transcode.rs:L169
 const _: () = assert!(
     parse_secs(IMAGE_LIMIT_TIME_SECS) >= 1 && parse_secs(IMAGE_LIMIT_TIME_SECS) < IMAGE_TRANSCODE_TIMEOUT_SECS,
     "IMAGE_LIMIT_TIME_SECS must be a whole number of seconds below IMAGE_TRANSCODE_TIMEOUT_SECS",
@@ -191,6 +195,26 @@ const _: () = assert!(
 `run_filter_in_env` relays through three cooperating threads: one feeds the child's stdin in 64 KiB chunks, one drains stderr to EOF while keeping only the first 8 KiB (a chatty child can never block on a full stderr pipe), and the calling thread relays stdout into the output buffer. Each pipe always has a live peer, whatever order the child reads and writes in. A `BrokenPipe` on the feed is not an error (the child stopped reading); the exit status is the authoritative verdict. On any `Err` the output buffer may be partial and is discarded.
 
 The output `Vec` is reserved up front from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB), as a fair estimate for PNG and BMP sources; a JPEG or WebP source grows several times as lossless PNG, and outgrowing the hint is harmless (the buffer then grows as usual).
+
+### 6.4 Descriptor to descriptor (v0.7.4 Part 1)
+
+A payload that was spooled to a file (v0.7.3, [01](01_wayland_streaming_io.md) section 2.4) does not have to be read into memory to be converted. `transcode::transcode_file(job, input, output, limit, tap)` runs the same `magick` with the same arguments, limits, environment, scratch directory, process group and watchdog, but with no `Vec` and no chunk buffer on either side ([`crates/image/src/pipeline.rs`](../crates/image/src/pipeline.rs), `run_filter_file_in_env`; one engine, `run_filter_inner`, serves both this road and the buffered one):
+
+| Side | Buffered road (`run_filter_in_env`) | Descriptor road (`run_filter_file_in_env`) |
+| :--- | :--- | :--- |
+| stdin | a feeder thread copies the input through a 64 KiB `Vec` into the child's pipe | the spool file *is* the child's stdin (`Stdio::from(File)`): no thread, no copy, nothing in this process reads it. The daemon opens it read-only, so the child cannot alter the spool file, and the parent's handle is released as soon as the child is spawned |
+| stdout | the calling thread relays 64 KiB chunks into a `Write` sink (a `Vec`) | `core::splice::copy_to_file`: `splice(2)` from the child's pipe into the new file, `tee(2)` showing the same bytes to a `ByteTap` (the SHA3-256 fingerprint). The child never holds a descriptor to the output file |
+| a refusing kernel | n/a | the copy falls back to a stack buffer between rounds (tested with an `O_APPEND` destination), with the same limit and the same single, ordered view of every byte for the tap |
+| output bound | the sink's capacity (the caller's `Vec`) | `limit` (`MAX_PAYLOAD_BYTES`), with the `+1` probe byte: an overflow kills the child and is a `Sink` error, never a truncated image |
+| empty output | not an error | not an error at this layer either: the exit status explains it, so a rejected image still ends as `Failed` with the converter's stderr, not as an "empty sink" |
+
+Unlike the buffered road, `transcode_file` also checks what it produced: the first bytes of the output must carry the PNG signature, else the run ends as `Failed { code: Some(0) }`. The caller holds no buffer to inspect and would otherwise have to re-read the file; being a `Failed`, it counts as a converter fault against the breaker exactly as the in-memory road's "invalid output" does.
+
+**Routing keeps its guarantees.** `route::route_file_with` is `route_with` for a file: the classification (`plan`) and the guarded attempt (`attempt_guarded`: breaker permit, then throttle slot, then the attempt, then the resolution of the permit) are the *same functions* the in-memory road calls, not copies, and the real entry point, `route_file_for_ingest`, uses the same process-wide breaker and throttle. So the two roads together never run more than `IMAGE_CONCURRENCY_LIMIT` converters, a fault on one opens the circuit for both, and a busy or absent converter is neutral for both (tests: a fault on either road counts against the one breaker; saturation and host-side errors never do; every failure ends in "keep the original"). The daemon wraps it in `worker::convert_if_wanted` over `spool::transcode_spooled`, which creates the new file (`<pid>-<n>-t.part`, `0600`, `O_EXCL`, named after its source so it is unique and still sweepable by the owner's pid) under an unlink guard, so a failed conversion leaves no half-written file and never touches the original.
+
+**Why the input is handed over rather than spliced.** Giving the child the descriptor costs the parent no syscall and no byte of traffic, which is strictly less than `splice(2)` into a stdin pipe; and `magick` takes as long on a file as on a pipe (215-217 ms against 215-216 ms on a 12 MiB PNG, [`PERFORMANCE.md`](../PERFORMANCE.md) section 3.7), so nothing is lost by the choice. The compositor's pipe is *not* handed to `magick`: it is drained into the spool file first, by an ingestion thread that holds a reader permit, precisely so that a slow converter or a full queue can never stall the client application behind it ([01](01_wayland_streaming_io.md) section 2.4).
+
+**What it buys** (`PERFORMANCE.md` section 3.7, 12 MiB PNG): heap per conversion 50.5 MB to 5.8 KB, peak heap growth 36.1 MiB to 0, wall clock 300-305 ms to 215-217 ms (the converter's own floor: the SHA3 pass now overlaps the encode instead of following it). **What it does not cover:** a raster image under the 4 KiB spool threshold is a `Memory` payload and keeps the buffered road, where the buffers are a few KiB.
 
 ---
 
@@ -248,17 +272,19 @@ A missing `magick` is reported once per process (`MSG_IMAGE_TOOL_MISSING`) and i
 | Corrupt or over-limit image | original | yes, then discarded |
 | Conversion exceeds 15 s | original | yes, group killed |
 | Converted output invalid | original | yes, then discarded |
+| File road: converted output over `MAX_PAYLOAD_BYTES` | original; the partial file is deleted | yes, group killed |
+| File road: the new spool file cannot be created, or the original cannot be opened | original | no (not counted against the breaker) |
 | Success | converted PNG; hash covers the converted bytes | yes |
 
-In every row the fingerprint is computed over what is stored, so deduplication stays consistent whether or not conversion happened. A deterministic conversion also means the same image copied twice yields the same fingerprint.
+In every row the fingerprint is computed over what is stored, so deduplication stays consistent whether or not conversion happened. The conversion is a pure function of its input (no timestamp, section 4), so the same image copied twice yields the same fingerprint, a second apart or a day apart. On the file road "original" means the original *spool file*, stored untouched.
 
 ---
 
 ## 9. Zero-Copy Trajectory
 
-The chunked `Read`/`Write` relay is the working implementation. `pipeline.rs` already carries a `splice(2)` primitive (`try_splice` / `splice_all`) with a capability-aware fallback, deliberately not wired into the converter path yet; the `Read`/`Write` boundary is the seam where it can replace the chunked copy without changing any caller.
+The chunked `Read`/`Write` relay remains the implementation for payloads that are in memory (text never reaches it; a raster image under the spool threshold does). For a spooled payload the converter runs descriptor to descriptor since v0.7.4 Part 1 (section 6.4): the spool file is `magick`'s stdin and its stdout is spliced into a new file through `core::splice::copy_to_file`, the same bounded, fingerprinting primitive ingestion uses ([01](01_wayland_streaming_io.md) section 2.4). `route::wants_transcode(mime, head)` still answers "would the converter touch it?" from the first bytes, now through the same `plan` function the router itself uses.
 
-Since v0.7.3 the *ingestion* side has its own bounded, fingerprinting counterpart in `y4p-core` (`core::splice::copy_to_file`, with `tee(2)`; [01](01_wayland_streaming_io.md) section 2.4), and the worker asks this crate one question about a spooled payload, `route::wants_transcode(mime, head)`: would the converter touch it? Only a "yes" reads the file back into memory, because `magick` is still fed from a `Vec`. Connecting the converter to a descriptor directly, and letting `pipeline.rs` share `core::splice`'s primitive instead of its own, is the v0.7.4 task.
+`pipeline.rs` still carries its own bare `splice(2)` pair (`try_splice` / `splice_all`), which nothing in production calls any more; folding it into `core::splice` is a refactoring, not a feature, and is left for a later minor ([`PERFORMANCE.md`](../PERFORMANCE.md) section 6, item 5).
 
 The v0.6.x cycle (The Great Modularization) physically decoupled `y4p-core`, `y4p-storage`, `y4p-image`, `y4p-wayland`, `y4p-daemon` and `y4p-cli`, and in v0.6.7 moved conversion and hashing out of the Wayland sensor into the daemon worker.
 
