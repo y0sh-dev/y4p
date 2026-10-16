@@ -6,8 +6,9 @@
 use crate::core::constants::*;
 use crate::core::mapped::MappedFile;
 use crate::core::payload::{to_hex, Payload, SpooledFile};
-use crate::image::route::{wants_transcode, SNIFF_HEAD_BYTES};
+use crate::image::route::{route_file_for_ingest, FileRoute, SNIFF_HEAD_BYTES};
 use crate::metrics::DaemonMetrics;
+use crate::spool;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
 use sha3::{Digest, Sha3_256};
@@ -33,8 +34,9 @@ use std::sync::{mpsc, Arc};
 ///
 /// A *spooled* payload (a large one the ingestion thread already drained to a
 /// file, fingerprinting it on the way) takes a different road, `store_spooled`:
-/// unless the image pipeline wants to rewrite it, its bytes never enter the
-/// heap at all.
+/// its bytes never enter the heap at all. Not even a raster image the image
+/// pipeline rewrites: `magick` reads the spool file directly and writes a new
+/// one, fingerprinted as it goes.
 ///
 /// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
 /// conversion included, falls behind, producers wait and then shed rather than
@@ -91,24 +93,24 @@ fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usiz
 
 /// The streaming road, for a payload already on disk with its fingerprint.
 ///
-/// 1. If the first bytes say the image pipeline would convert it, it is read
-///    back into memory and takes the in-memory road (`magick` works on bytes
-///    until the descriptor-aware image pipeline of the next milestone).
-/// 2. Otherwise it is stored exactly as it arrived, and the digest computed
-///    while it streamed in is the database key: nothing is hashed again.
-///    The storage layer wants a `&[u8]`, so the spool file is mapped (page
-///    cache, no heap, and untouched pages are never even read). A payload that
-///    storage keeps in a cache file is *adopted*: the spool file is renamed to
-///    its final `<hash>.cache` name before the insert, so storage finds it in
-///    place and writes nothing. Everything else is inserted from the mapping,
-///    and the spool file is then deleted.
+/// 1. The image pipeline gets its say first ([`convert_if_wanted`]): a raster
+///    image it would rewrite is converted file to file, and the converted
+///    spool file (with the digest of *its* bytes) replaces the original, which
+///    is deleted. Anything else, and any conversion that is skipped or fails,
+///    carries on with the original untouched.
+/// 2. The payload is then stored exactly as that file holds it, and the digest
+///    computed while it streamed in is the database key: nothing is hashed
+///    again. The storage layer wants a `&[u8]`, so the spool file is mapped
+///    (page cache, no heap, and untouched pages are never even read). A
+///    payload that storage keeps in a cache file is *adopted*: the spool file
+///    is renamed to its final `<hash>.cache` name before the insert, so
+///    storage finds it in place and writes nothing. Everything else is
+///    inserted from the mapping, and the spool file is then deleted.
 ///
 /// A mapping that cannot be made falls back to reading the file; a failed or
 /// skipped insert takes an adopted file back out of the cache again.
 fn store_spooled(db: &mut ClipboardDb, mime: String, spooled: SpooledFile, max_history: usize) -> Result<Option<Saved>, String> {
-    if wants_transcode(&mime, &read_head(spooled.path())) {
-        return store_materialised(db, ClipboardJob::from_payload(mime, Payload::Spooled(Box::new(spooled))), max_history);
-    }
+    let (mime, spooled) = convert_if_wanted(mime, spooled);
 
     let hash = spooled.hex_digest();
     // SAFETY: the spool file is private to this process: created `0600` in a
@@ -140,6 +142,28 @@ fn store_spooled(db: &mut ClipboardDb, mime: String, spooled: SpooledFile, max_h
         let _ = fs::remove_file(path);
     }
     inserted.map(|_| Some((mime, mapped.len())))
+}
+
+/// Runs a spooled payload through the image pipeline without reading it into
+/// memory: the file-backed twin of `process_job`'s routing step.
+///
+/// The decision is made from the first bytes alone. If a conversion is due and
+/// the breaker and the throttle allow it, `magick` reads the spool file as its
+/// stdin and writes a new spool file, hashed on the way (`spool::transcode_spooled`);
+/// the payload then *is* that new file, under the converter's MIME, and the
+/// original is unlinked here. In every other case (nothing to convert, circuit
+/// open, no free slot, `magick` missing, a decode failure, a timeout) the pair
+/// comes back unchanged and the original file is stored as it arrived: the same
+/// "never lose data, never make things worse" contract as the in-memory road,
+/// with the same breaker, throttle and limits (`y4p_image::route`).
+fn convert_if_wanted(mime: String, spooled: SpooledFile) -> (String, SpooledFile) {
+    let head = read_head(spooled.path());
+    let routed = route_file_for_ingest(&mime, &head, |job| spool::transcode_spooled(&spooled, job, MAX_PAYLOAD_BYTES));
+    match routed {
+        // `spooled` is dropped on return, which unlinks the superseded original.
+        FileRoute::Converted { mime: converted, output } => (converted.to_owned(), output),
+        FileRoute::Original => (mime, spooled),
+    }
 }
 
 /// Whether `crates/storage` keeps a payload of this MIME in a cache file rather
@@ -342,6 +366,114 @@ mod tests {
         assert_eq!(read_head(&path), b"short");
         fs::remove_file(&path).unwrap();
         assert!(read_head(&path).is_empty());
+    }
+
+    // --- convert_if_wanted: the image pipeline over a spool file ---
+    //
+    // These go through the process-wide breaker and throttle like the
+    // `process_job` tests below. At most two tests here fail a conversion on
+    // purpose, and the breaker needs three failures in a row, so none of them can
+    // open the circuit under another test.
+
+    fn spool_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("y4p-worker-convert-{}-{}", std::process::id(), tag));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn spooled_at(dir: &Path, name: &str, bytes: &[u8]) -> SpooledFile {
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        let digest = <[u8; DIGEST_LEN]>::try_from(Sha3_256::digest(bytes).as_slice()).unwrap();
+        SpooledFile::new(path, bytes.len() as u64, digest)
+    }
+
+    fn entries_in(dir: &Path) -> usize {
+        fs::read_dir(dir).unwrap().count()
+    }
+
+    #[test]
+    fn a_spooled_png_is_converted_in_place_of_the_original_which_is_deleted() {
+        if !magick_available() { return; }
+        let dir = spool_dir("png");
+        let png = generated(&["-size", "64x64", "plasma:fractal", "-depth", "8", "-set", "comment", "SECRETCOMMENT", "png:-"]);
+        let original = spooled_at(&dir, &format!("{}-1.part", std::process::id()), &png);
+        let original_path = original.path().to_path_buf();
+
+        let (mime, converted) = convert_if_wanted("image/png".to_owned(), original);
+
+        assert_eq!(mime, "image/png");
+        assert_ne!(converted.path(), original_path);
+        assert!(!original_path.exists(), "the superseded original must be unlinked");
+        let stored = fs::read(converted.path()).unwrap();
+        assert_ne!(stored, png);
+        assert!(!stored.windows(13).any(|w| w == b"SECRETCOMMENT"));
+        assert_eq!(converted.hex_digest(), fingerprint(&stored), "the key must describe the stored bytes");
+        // The in-memory road must agree to the byte, so a payload keys the same row on either.
+        let (memory_mime, memory_bytes, memory_hash) = process_job("image/png".to_owned(), png);
+        assert_eq!((mime.as_str(), stored.as_slice()), (memory_mime.as_str(), memory_bytes.as_slice()));
+        assert_eq!(converted.hex_digest(), memory_hash);
+        assert_eq!(entries_in(&dir), 1, "exactly the converted file remains");
+        drop(converted);
+        assert_eq!(entries_in(&dir), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_converted_jpeg_is_stored_under_the_png_mime() {
+        if !magick_available() { return; }
+        let dir = spool_dir("jpeg");
+        let jpeg = generated(&["-size", "64x64", "plasma:fractal", "jpg:-"]);
+        let (mime, converted) = convert_if_wanted("image/jpeg".to_owned(), spooled_at(&dir, &format!("{}-2.part", std::process::id()), &jpeg));
+        assert_eq!(mime, "image/png");
+        assert_eq!(&fs::read(converted.path()).unwrap()[..4], b"\x89PNG");
+        drop(converted);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn what_the_pipeline_does_not_rewrite_is_returned_untouched() {
+        let dir = spool_dir("bypass");
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend((0..5000u32).map(|i| (i % 251) as u8));
+        let cases: [(&str, &[u8]); 3] = [
+            ("image/gif", &gif),
+            ("text/plain", b"plain text that happens to be spooled"),
+            ("application/octet-stream", b"\x00\x01\x02\x03 not an image at all"),
+        ];
+        for (n, (mime, bytes)) in cases.into_iter().enumerate() {
+            let original = spooled_at(&dir, &format!("{}-{}.part", std::process::id(), 10 + n), bytes);
+            let path = original.path().to_path_buf();
+            let (out_mime, out) = convert_if_wanted(mime.to_owned(), original);
+            assert_eq!(out_mime, mime);
+            assert_eq!(out.path(), path, "{mime}: the very same file");
+            assert_eq!(fs::read(out.path()).unwrap(), bytes);
+            drop(out);
+        }
+        assert_eq!(entries_in(&dir), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_that_does_not_decode_keeps_its_original_file_and_leaves_nothing_else() {
+        if !magick_available() { return; }
+        let dir = spool_dir("corrupt");
+        let mut corrupt = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        corrupt.extend_from_slice(&[0xA5; 4096]);
+        let original = spooled_at(&dir, &format!("{}-20.part", std::process::id()), &corrupt);
+        let path = original.path().to_path_buf();
+
+        let (mime, out) = convert_if_wanted("image/png".to_owned(), original);
+
+        assert_eq!(mime, "image/png");
+        assert_eq!(out.path(), path, "the original is stored as it arrived");
+        assert_eq!(fs::read(out.path()).unwrap(), corrupt);
+        assert_eq!(out.hex_digest(), fingerprint(&corrupt), "and keeps its own digest");
+        assert_eq!(entries_in(&dir), 1, "no half-written converted file");
+        drop(out);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
