@@ -53,12 +53,18 @@ impl FileCache {
     /// existing cache file is the same content and is left alone
     /// ([`Adoption::Present`]); it is never overwritten.
     ///
+    /// Under the single-daemon writer invariant, concurrent writes are excluded.
+    /// Furthermore, because cache keys are content-addressed (SHA3-256), any
+    /// potential race on the same hash is idempotent.
+    ///
     /// `source` should be on the cache's filesystem (the spool directory is
-    /// inside the cache directory for exactly this reason). If the rename is
-    /// refused anyway (`EXDEV`, a permission quirk), the bytes are copied with
-    /// `copy_file_range(2)` via `fs::copy` and `source` is then unlinked; a
-    /// partial copy is removed, so an `Err` never leaves a truncated entry
-    /// behind. On `Placed` the source name is therefore always gone.
+    /// inside the cache directory for exactly this reason). If `rename` is
+    /// refused anyway (`EXDEV`, a cross-mount boundary or permission quirk),
+    /// the bytes are copied via `std::fs::copy` (which attempts kernel-space
+    /// `copy_file_range` on Linux where supported, falling back gracefully)
+    /// and `source` is then unlinked. A partial copy is removed on failure, so
+    /// an `Err` never leaves a truncated entry behind. On `Placed` the source
+    /// name is therefore always gone.
     pub fn adopt(&self, hash: &str, source: &Path) -> io::Result<Adoption> {
         let target = self.path(hash);
         if target.exists() {
