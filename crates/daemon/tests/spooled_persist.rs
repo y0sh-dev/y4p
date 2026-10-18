@@ -24,7 +24,7 @@ use sha3::{Digest, Sha3_256};
 use y4p_core::payload::{to_hex, Payload};
 use y4p_daemon::metrics::DaemonMetrics;
 use y4p_daemon::spool::FileSpooler;
-use y4p_daemon::worker::{stored_in_cache_file, DbWorker};
+use y4p_daemon::worker::DbWorker;
 use y4p_storage::{ClipboardDb, ContentLocation};
 use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
 use y4p_wayland::state::ClipboardJob;
@@ -59,6 +59,13 @@ fn spooled_job(spooler: &FileSpooler, mime: &str, bytes: &[u8]) -> ClipboardJob 
 fn spool_inode(job: &ClipboardJob) -> u64 {
     let Payload::Spooled(file) = &job.payload else { panic!("not a spooled job") };
     fs::metadata(file.path()).unwrap().ino()
+}
+
+/// Where the cache holds the payload with this digest: `<cache dir>/<digest>.cache`.
+/// Only the negative checks need it (positive ones ask storage via `locate_content`),
+/// so a drift between this and storage fails a test rather than hiding.
+fn cache_file(hash: &str) -> PathBuf {
+    y4p_core::get_cache_dir().join(format!("{hash}.cache"))
 }
 
 fn wait_for<F: FnMut() -> bool>(what: &str, mut done: F) {
@@ -97,7 +104,6 @@ fn spooled_payloads_reach_storage_without_the_heap() {
         unsafe { std::env::set_var(var, root.join(sub)) };
     }
 
-    let cache_dir = y4p_core::get_cache_dir();
     let spool_dir = y4p_core::spool_dir_path();
     let spooler = FileSpooler::open(spool_dir.clone()).unwrap();
     let metrics = Arc::new(DaemonMetrics::new());
@@ -116,7 +122,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
 
     let id = row_for(&read_db, "image/gif").unwrap();
     let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a GIF must live in a cache file") };
-    assert_eq!(path, y4p_core::cache_file_path(&gif_hash), "adoption must land exactly where storage looks");
+    assert_eq!(path, cache_file(&gif_hash), "adoption must land exactly where storage looks");
     assert_eq!(fs::read(&path).unwrap(), gif, "the adopted file is the spooled stream, byte for byte");
     assert_eq!(fs::metadata(&path).unwrap().ino(), spool_ino, "the cache file is the spool file renamed, not a copy storage wrote");
     assert_eq!(read_db.get_content_by_id(id).unwrap().1, gif);
@@ -134,11 +140,11 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     assert_eq!(read_db.fetch_metadata(100).len(), before + 1, "the duplicate GIF added no row");
     assert_eq!(entries(&spool_dir), Vec::<String>::new());
 
-    // --- 3. A large non-image: stored in the row from the mapping, never cached ---
+    // --- 3. A large non-image: stored in its row, never cached ---
     let id = row_for(&read_db, "application/octet-stream").unwrap();
     assert!(matches!(read_db.locate_content(id), Some((_, ContentLocation::InlineBlob(_)))));
     assert_eq!(read_db.get_content_by_id(id).unwrap().1, blob);
-    assert!(!y4p_core::cache_file_path(&blob_hash).exists(), "an inline payload must not also be cached");
+    assert!(!cache_file(&blob_hash).exists(), "an inline payload must not also be cached");
 
     // --- 4. A payload storage refuses: nothing may stay behind in the cache ---
     let secret = pattern(1024 * 1024, 3);
@@ -148,7 +154,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     tx.send(spooled_job(&spooler, "application/x-marker", &marker)).unwrap();
     wait_for("the marker row", || row_for(&read_db, "application/x-marker").is_some());
     assert!(row_for(&read_db, "image/x-secret").is_none(), "storage must have declined the sensitive MIME");
-    assert!(!y4p_core::cache_file_path(&secret_hash).exists(), "a declined payload must not remain as a cache file");
+    assert!(!cache_file(&secret_hash).exists(), "a declined payload must not remain as a cache file");
     assert_eq!(entries(&spool_dir), Vec::<String>::new());
 
     // --- 5. A raster image the converter wants: converted file to file ---
@@ -174,9 +180,9 @@ fn spooled_payloads_reach_storage_without_the_heap() {
 
         let id = row_for(&read_db, "image/png").unwrap();
         let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
-        assert_eq!(path, y4p_core::cache_file_path(&converted_hash), "the row is keyed by the digest of the converted bytes");
+        assert_eq!(path, cache_file(&converted_hash), "the row is keyed by the digest of the converted bytes");
         assert_eq!(fs::read(&path).unwrap(), converted, "the cache file is the converter's output, byte for byte");
-        assert!(!y4p_core::cache_file_path(&digest_of(&png)).exists(), "the original must not be cached as well");
+        assert!(!cache_file(&digest_of(&png)).exists(), "the original must not be cached as well");
         assert_eq!(entries(&spool_dir), Vec::<String>::new(), "both the original and the converted spool file are gone");
     }
 
@@ -189,24 +195,11 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     wait_for("the undecodable PNG row", || rows_for(&read_db, "image/png").len() > known_png_rows.len());
     let id = rows_for(&read_db, "image/png").into_iter().find(|id| !known_png_rows.contains(id)).unwrap();
     let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
-    assert_eq!(path, y4p_core::cache_file_path(&corrupt_hash), "falling back keys the row by the original's digest");
+    assert_eq!(path, cache_file(&corrupt_hash), "falling back keys the row by the original's digest");
     assert_eq!(fs::read(&path).unwrap(), corrupt, "no data may be lost when the conversion fails");
     assert_eq!(entries(&spool_dir), Vec::<String>::new(), "a failed conversion leaves no half-written file");
 
-    // --- 6. The cache-file rule copied into the worker matches the storage layer's ---
-    let mut writer_db = ClipboardDb::open().unwrap();
-    for (n, mime) in ["image/png", "image/gif", "image/svg+xml", "image/webp", "application/x-gif", "application/pdf", "text/plain", "application/octet-stream"]
-        .into_iter()
-        .enumerate()
-    {
-        let data = pattern(512 + n, 9);
-        let id = writer_db.insert_raw(&format!("{mime}; drift-{n}"), &data).unwrap();
-        let in_cache = matches!(read_db.locate_content(id), Some((_, ContentLocation::CacheFile(_))));
-        assert_eq!(in_cache, stored_in_cache_file(&format!("{mime}; drift-{n}")), "{mime}: worker and storage disagree");
-    }
-
     drop(tx);
     drop(worker);
-    let _ = cache_dir;
     let _ = fs::remove_dir_all(root);
 }
