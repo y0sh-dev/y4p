@@ -4,7 +4,6 @@
 // crates/daemon/src/worker.rs
 
 use crate::core::constants::*;
-use crate::core::mapped::MappedFile;
 use crate::core::payload::{to_hex, Payload, SpooledFile};
 use crate::image::route::{route_file_for_ingest, FileRoute, SNIFF_HEAD_BYTES};
 use crate::metrics::DaemonMetrics;
@@ -12,9 +11,9 @@ use crate::spool;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
 use sha3::{Digest, Sha3_256};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{mpsc, Arc};
 
 /// Owns the single writer connection and its background thread. All
@@ -34,9 +33,11 @@ use std::sync::{mpsc, Arc};
 ///
 /// A *spooled* payload (a large one the ingestion thread already drained to a
 /// file, fingerprinting it on the way) takes a different road, `store_spooled`:
-/// its bytes never enter the heap at all. Not even a raster image the image
-/// pipeline rewrites: `magick` reads the spool file directly and writes a new
-/// one, fingerprinted as it goes.
+/// an image's bytes never enter the heap at all, not even one the image
+/// pipeline rewrites (`magick` reads the spool file directly and writes a new
+/// one, fingerprinted as it goes), and storage then renames the file into the
+/// cache. Only a payload that belongs in a database row is read, once, by
+/// storage.
 ///
 /// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
 /// conversion included, falls behind, producers wait and then shed rather than
@@ -98,50 +99,18 @@ fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usiz
 ///    spool file (with the digest of *its* bytes) replaces the original, which
 ///    is deleted. Anything else, and any conversion that is skipped or fails,
 ///    carries on with the original untouched.
-/// 2. The payload is then stored exactly as that file holds it, and the digest
-///    computed while it streamed in is the database key: nothing is hashed
-///    again. The storage layer wants a `&[u8]`, so the spool file is mapped
-///    (page cache, no heap, and untouched pages are never even read). A
-///    payload that storage keeps in a cache file is *adopted*: the spool file
-///    is renamed to its final `<hash>.cache` name before the insert, so
-///    storage finds it in place and writes nothing. Everything else is
-///    inserted from the mapping, and the spool file is then deleted.
-///
-/// A mapping that cannot be made falls back to reading the file; a failed or
-/// skipped insert takes an adopted file back out of the cache again.
+/// 2. The file is then handed to storage whole ([`ClipboardDb::insert_spooled`]),
+///    which keys the row by the digest computed while the file streamed in
+///    (nothing is hashed again) and decides what the file becomes: an image is
+///    renamed into the cache, anything else is read into its row and the spool
+///    file unlinked. Where a cache entry lives and which MIME types get one are
+///    storage's business alone; the worker holds no copy of those rules and no
+///    memory mapping of the file.
 fn store_spooled(db: &mut ClipboardDb, mime: String, spooled: SpooledFile, max_history: usize) -> Result<Option<Saved>, String> {
     let (mime, spooled) = convert_if_wanted(mime, spooled);
-
-    let hash = spooled.hex_digest();
-    // SAFETY: the spool file is private to this process: created `0600` in a
-    // `0700` directory under a unique name by `spool::FileSpooler`, written only
-    // by that copy (which has finished: the payload was queued only afterwards),
-    // and from here on renamed or unlinked, never written or truncated, by this
-    // thread alone. `MappedFile::map`'s contract is met.
-    let mapped = unsafe { MappedFile::map(spooled.path()) };
-    let mapped = match mapped {
-        Ok(m) if m.len() as u64 == spooled.len() => m,
-        // Unmappable (or not the recorded size): read it, keeping the digest.
-        _ => {
-            let data = Payload::Spooled(Box::new(spooled)).read_bounded(MAX_PAYLOAD_BYTES).map_err(|e| e.to_string())?;
-            db.insert_with_hash(&mime, &data, &hash, max_history)?;
-            return Ok(Some((mime, data.len())));
-        }
-    };
-
-    let adopted = adopt_into_cache(&mime, spooled.path(), &crate::core::cache_file_path(&hash));
-    if adopted.is_some() {
-        let _ = spooled.into_path();
-    }
-    let inserted = db.insert_with_hash(&mime, &mapped, &hash, max_history);
-    // `Ok(-1)` is storage declining the payload (a sensitive MIME): no row
-    // references the file, so an adopted one must not stay behind as debris.
-    if let Some(path) = adopted
-        && !matches!(inserted, Ok(id) if id >= 0)
-    {
-        let _ = fs::remove_file(path);
-    }
-    inserted.map(|_| Some((mime, mapped.len())))
+    let len = usize::try_from(spooled.len()).map_err(|e| e.to_string())?;
+    db.insert_spooled(&mime, spooled, max_history)?;
+    Ok(Some((mime, len)))
 }
 
 /// Runs a spooled payload through the image pipeline without reading it into
@@ -164,28 +133,6 @@ fn convert_if_wanted(mime: String, spooled: SpooledFile) -> (String, SpooledFile
         FileRoute::Converted { mime: converted, output } => (converted.to_owned(), output),
         FileRoute::Original => (mime, spooled),
     }
-}
-
-/// Whether `crates/storage` keeps a payload of this MIME in a cache file rather
-/// than in the database row (`SqliteStore::upsert_record`'s `is_image`). The
-/// storage layer is frozen and keeps the rule private; an integration test pins
-/// this copy to what storage actually does.
-pub fn stored_in_cache_file(mime: &str) -> bool {
-    mime.starts_with("image/") || mime.contains("gif")
-}
-
-/// Renames `spool` to `target` when `mime` is a cache-file payload and nothing
-/// is there yet. Returns `target` when the file was adopted, so a failed insert
-/// can take it back out; `None` when it was not (the caller then lets the spool
-/// file be deleted, and storage finds or writes its own cache file).
-///
-/// Never replaces an existing file: that one is the same content under the same
-/// hash and may already back a row.
-fn adopt_into_cache(mime: &str, spool: &Path, target: &Path) -> Option<PathBuf> {
-    if !stored_in_cache_file(mime) || target.exists() {
-        return None;
-    }
-    fs::rename(spool, target).ok().map(|()| target.to_path_buf())
 }
 
 /// The first bytes of a spool file, enough for the image router to classify it.
@@ -244,7 +191,9 @@ mod tests {
     // --- materialise (payload -> bytes) ---
 
     use crate::core::payload::{Payload, StreamDescriptor};
+    use std::fs;
     use std::io::Write;
+    use std::path::PathBuf;
     use std::os::fd::OwnedFd;
 
     fn stream_job(mime: &str, bytes: &[u8], hint: Option<u64>) -> ClipboardJob {
@@ -289,72 +238,13 @@ mod tests {
         assert!(materialise(missing).is_none());
     }
 
-    // --- spooled road: classification, adoption, head sniffing ---
+    // --- spooled road: head sniffing ---
 
     fn scratch(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("y4p-worker-spool-{}-{}", std::process::id(), tag));
         let _ = fs::remove_file(&p);
         p
-    }
-
-    #[test]
-    fn only_image_like_mimes_live_in_cache_files() {
-        for mime in ["image/png", "image/gif", "image/svg+xml", "image/webp", "application/x-gif"] {
-            assert!(stored_in_cache_file(mime), "{mime}");
-        }
-        for mime in ["text/plain", "application/pdf", "application/octet-stream", "text/uri-list", ""] {
-            assert!(!stored_in_cache_file(mime), "{mime}");
-        }
-    }
-
-    #[test]
-    fn an_image_spool_file_is_renamed_into_place_not_copied() {
-        let spool = scratch("adopt-src");
-        let target = scratch("adopt-dst");
-        fs::write(&spool, b"gif bytes").unwrap();
-        let ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&spool).unwrap());
-
-        assert_eq!(adopt_into_cache("image/gif", &spool, &target), Some(target.clone()));
-
-        assert!(!spool.exists(), "the spool name is gone");
-        assert_eq!(fs::read(&target).unwrap(), b"gif bytes");
-        assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(&target).unwrap()), ino, "same inode: renamed, not copied");
-        fs::remove_file(target).unwrap();
-    }
-
-    #[test]
-    fn adoption_never_replaces_an_existing_cache_file() {
-        let spool = scratch("keep-src");
-        let target = scratch("keep-dst");
-        fs::write(&spool, b"new").unwrap();
-        fs::write(&target, b"existing").unwrap();
-
-        assert_eq!(adopt_into_cache("image/gif", &spool, &target), None);
-
-        assert_eq!(fs::read(&target).unwrap(), b"existing");
-        assert!(spool.exists(), "an unadopted spool file stays for its owner to delete");
-        fs::remove_file(spool).unwrap();
-        fs::remove_file(target).unwrap();
-    }
-
-    #[test]
-    fn a_payload_storage_keeps_in_the_database_is_not_adopted() {
-        let spool = scratch("inline-src");
-        let target = scratch("inline-dst");
-        fs::write(&spool, b"%PDF").unwrap();
-        assert_eq!(adopt_into_cache("application/pdf", &spool, &target), None);
-        assert!(spool.exists() && !target.exists());
-        fs::remove_file(spool).unwrap();
-    }
-
-    #[test]
-    fn a_failed_rename_is_not_an_adoption() {
-        let spool = scratch("norename-src");
-        fs::write(&spool, b"x").unwrap();
-        let target = Path::new("/definitely/not/a/directory/y4p.cache");
-        assert_eq!(adopt_into_cache("image/gif", &spool, target), None);
-        fs::remove_file(spool).unwrap();
     }
 
     #[test]
