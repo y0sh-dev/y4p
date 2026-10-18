@@ -13,7 +13,7 @@ SQLite allows exactly one writer at a time. A second connection that tries to wr
 `y4p` avoids the problem structurally rather than defensively: only one thread in the process ever holds a write connection.
 
 ```rust
-// crates/daemon/src/worker.rs:L49-L73
+// crates/daemon/src/worker.rs:L50-L74
 pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
     let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
 
@@ -61,7 +61,7 @@ pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, ma
 
 ## 2. What the Worker Does Besides Writing (v0.6.7)
 
-Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L226`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
+Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`worker.rs:L173`](../crates/daemon/src/worker.rs)) takes a normalised raw payload and returns `(mime, data, hash)`:
 
 ```text
    ClipboardJob { mime, payload }  --materialise (no copy for Memory)-->  (mime, data)
@@ -83,7 +83,7 @@ Since v0.6.7 the worker owns the CPU-heavy half of ingestion. `process_job` ([`w
 | Conversion runs on the worker | The wayland ingestion thread never spawns `magick` or hashes; the cost is that a slow conversion delays the jobs queued behind it |
 | Conversion is bounded | Timeout, process throttle and circuit breaker cap how long and how often ([06](06_local_image_pipeline.md)) |
 
-A *spooled* payload (v0.7.3; a large non-text one the ingestion thread already drained to a file with `splice(2)`, [01](01_wayland_streaming_io.md) section 2.4) takes `store_spooled` instead. If the image router says the converter would rewrite it, `magick` is run on the file itself (v0.7.4 Part 1: the spool file is its stdin, its stdout is spliced into a second spool file and hashed on the way; the same timeout, process throttle and circuit breaker as in the table above, and any skip or failure keeps the original file); the digest of the file that results, computed while it was written, is the key, and the file is mapped for the storage layer and, for an image, renamed into the cache. Neither the queue nor the worker holds such a payload's bytes on the heap, converted or not, so the single worker thread also no longer spends its time hashing large payloads: the ingestion threads (up to 8, in parallel) hashed the stream, and `tee(2)` hashes `magick`'s output while `magick` is still producing it ([06](06_local_image_pipeline.md) section 6.4).
+A *spooled* payload (v0.7.3; a large non-text one the ingestion thread already drained to a file with `splice(2)`, [01](01_wayland_streaming_io.md) section 2.4) takes `store_spooled` instead. If the image router says the converter would rewrite it, `magick` is run on the file itself (v0.7.4 Part 1: the spool file is its stdin, its stdout is spliced into a second spool file and hashed on the way; the same timeout, process throttle and circuit breaker as in the table above, and any skip or failure keeps the original file); the digest of the file that results, computed while it was written, is the key, and the file is handed to the storage layer whole (`insert_spooled`): an image is renamed into the cache and its row built from its length, anything else is read into its row once and the file unlinked. Neither the queue nor the worker holds such a payload's bytes on the heap, converted or not, so the single worker thread also no longer spends its time hashing large payloads: the ingestion threads (up to 8, in parallel) hashed the stream, and `tee(2)` hashes `magick`'s output while `magick` is still producing it ([06](06_local_image_pipeline.md) section 6.4).
 
 ### 2.1 Bounded Queue, Backpressure and Load Shedding (v0.7.1)
 

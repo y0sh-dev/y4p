@@ -159,7 +159,7 @@ Ingestion sends `Payload::Memory` for text and for payloads that end inside one 
 | 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload }` over a bounded `sync_channel` (64); overload is shed and counted |
 | 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure). A spooled image is converted file to file, with no heap copy (v0.7.4); a spooled payload the converter would not touch skips this and the next step |
 | 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes (a spooled payload arrives with it, computed while it streamed in; a converted one, while `magick`'s output was written) |
-| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash`; a spooled image's file is renamed into the cache first |
+| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash`; a spooled payload goes to `ClipboardDb::insert_spooled`, which renames an image's file into the cache (no byte read) and stores anything else from the file |
 
 > **Invariant — the hash describes what is stored.** The fingerprint is computed last, after image routing, so a deduplicated row and its cache file are always keyed by the bytes actually saved.
 
