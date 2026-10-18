@@ -48,7 +48,9 @@ Keeping images out of SQLite leaves its page cache full of exactly what `list` a
 
 ### 1.1 Deduplication ties the stores together
 
-Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path). Since v0.7.3 that same rule lets the daemon place a streamed image *before* the insert: a spool file is renamed to `<hash>.cache`, `FileCache::store` finds the path taken and writes nothing, and the storage crate needed no change ([01](01_wayland_streaming_io.md) section 2.4).
+Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path). Since v0.7.4 Part 2 a streamed image is placed by storage itself: `ClipboardDb::insert_spooled` takes the finished spool file and `FileCache::adopt` renames it to `<hash>.cache` (never over an existing file), then writes a row built from the length alone, so the image's bytes are never read ([01](01_wayland_streaming_io.md) section 2.4). Placing the file first and the row second means a row never points at a missing file, and a failed commit takes the placed file out again.
+
+`wipe` also gives memory back: after `VACUUM` and the cache clear, `PRAGMA shrink_memory` empties the connection's page cache and `core::memory::release_unused_heap` (`malloc_trim(0)` on Linux with glibc, a no-op elsewhere) returns the allocator's free pages to the kernel. Measured on 40,000 rows after a full listing and search: resident memory 233.5 MiB before the wipe, 74.5 MiB after `VACUUM` alone, 4.2 MiB with the trim; the pragma by itself changed nothing at this scale (`PERFORMANCE.md` section 3.8).
 
 The daemon computes the hash **after** image routing (see [00](00_overview.md) section 5), so the key always describes the bytes actually stored. `ClipboardDb::insert_raw` (used by `y4p store`) computes the same digest itself.
 

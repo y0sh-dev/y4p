@@ -26,6 +26,54 @@ pub struct UpsertOutcome {
     pub expired_hashes: Vec<String>,
 }
 
+impl UpsertOutcome {
+    fn skipped() -> Self {
+        Self { real_id: -1, is_image: false, expired_hashes: Vec::new() }
+    }
+}
+
+/// A payload as the row builder sees it.
+enum Body<'a> {
+    /// The bytes themselves.
+    Bytes(&'a [u8]),
+    /// Only the length: the bytes are in a cache file and never touch the row.
+    Detached(u64),
+}
+
+impl Body<'_> {
+    fn len(&self) -> i64 {
+        match self {
+            Body::Bytes(data) => data.len() as i64,
+            Body::Detached(len) => *len as i64,
+        }
+    }
+}
+
+/// What goes into the `content` column.
+enum Content<'a> {
+    Text(&'a str),
+    Blob(&'a [u8]),
+    None,
+}
+
+/// Whether a payload of this MIME is kept in the on-disk cache (`FileCache`)
+/// rather than in the row: images, and anything GIF-like.
+pub fn is_cache_class(mime: &str) -> bool {
+    mime.starts_with("image/") || mime.contains("gif")
+}
+
+/// Whether the row of a cache-class payload can be built without its bytes:
+/// no text preview and no text content. Every real image qualifies; an odd
+/// "text/x-gif" does not, and is stored from its bytes like any other.
+pub fn is_detachable(mime: &str) -> bool {
+    is_cache_class(mime) && !is_text_like_mime(mime)
+}
+
+/// Payloads that are never stored: empty ones and sensitive MIME types.
+pub(crate) fn is_skipped(mime: &str, len: u64) -> bool {
+    len == 0 || SENSITIVE_MIME_HINTS.iter().any(|&hint| mime.contains(hint))
+}
+
 /// Pure SQL execution and transaction handling — no filesystem I/O. Binary
 /// cache placement is the caller's (facade's) responsibility.
 pub struct SqliteStore {
@@ -41,11 +89,26 @@ impl SqliteStore {
     /// beyond `max_history`. See `ClipboardDb::insert_with_hash` doc for why
     /// the ID is returned directly instead of via a follow-up query.
     pub fn upsert_record(&mut self, mime: &str, data: &[u8], hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
-        if data.is_empty() || SENSITIVE_MIME_HINTS.iter().any(|&hint| mime.contains(hint)) {
-            return Ok(UpsertOutcome { real_id: -1, is_image: false, expired_hashes: Vec::new() });
+        if is_skipped(mime, data.len() as u64) {
+            return Ok(UpsertOutcome::skipped());
         }
+        self.upsert(mime, Body::Bytes(data), hash, max_history)
+    }
 
-        let is_image = mime.starts_with("image/") || mime.contains("gif");
+    /// `upsert_record` for a payload whose bytes live (or are about to live) in
+    /// a cache file and are not needed to build the row: an image has no
+    /// preview, no text and no inline content, only a size. The caller must have
+    /// checked `is_detachable`, so no byte of the payload ever enters memory.
+    pub fn upsert_detached(&mut self, mime: &str, len: u64, hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
+        if is_skipped(mime, len) {
+            return Ok(UpsertOutcome::skipped());
+        }
+        self.upsert(mime, Body::Detached(len), hash, max_history)
+    }
+
+    fn upsert(&mut self, mime: &str, body: Body<'_>, hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
+        let is_image = is_cache_class(mime);
+        let size = body.len();
 
         // Was `.unwrap()`: a monotonic clock read before UNIX_EPOCH should
         // never happen on a real system, but `panic = "abort"` in the release
@@ -64,45 +127,24 @@ impl SqliteStore {
                 .map_err(|e| e.to_string())?;
             id
         } else {
-            // "application/xhtml+xml" doesn't contain "text" itself (unlike
-            // text/html), so it needs its own check here to get a preview at
-            // all rather than falling through to `None`. Also decides the
-            // `content` storage class below, so search's `content LIKE ?`
-            // (see search_metadata/validate_keywords) always lines up with
-            // what actually got stored as TEXT vs BLOB.
-            let is_markup = is_html_mime(mime);
-            let is_text_like = is_text_like_mime(mime);
-
-            let preview = if is_text_like {
-                // Rich markup's raw tags aren't a readable preview — strip
-                // them first so the preview column always shows plain,
-                // scannable text instead of leaking `<div>`/`<strong>` etc.
-                let text_data: Cow<[u8]> = if is_markup {
-                    Cow::Owned(strip_html_tags(data))
-                } else {
-                    Cow::Borrowed(data)
-                };
-                let s = String::from_utf8_lossy(&text_data);
-                Some(s.chars().take(PREVIEW_CHARS).collect::<String>().replace('\n', " "))
-            } else { None };
-
-            // TEXT storage class for textual content: lets `content LIKE ?`
-            // match directly, without a per-row `CAST(content AS TEXT)` at
-            // query time. Bytes claiming a text MIME but not actually valid
-            // UTF-8 fall through to the ordinary BLOB path rather than being
-            // rejected or corrupted.
-            if is_text_like && let Ok(text) = std::str::from_utf8(data) {
-                tx.execute(
+            let (preview, content) = match body {
+                Body::Detached(_) => (None, Content::None),
+                Body::Bytes(data) => Self::row_parts(mime, data, is_image),
+            };
+            match content {
+                Content::Text(text) => tx.execute(
                     "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![ts, mime, data.len() as i64, preview, text, hash],
-                ).map_err(|e| e.to_string())?;
-            } else {
-                let db_content = if is_image { None } else { Some(data) };
-                tx.execute(
+                    params![ts, mime, size, preview, text, hash],
+                ),
+                Content::Blob(blob) => tx.execute(
                     "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![ts, mime, data.len() as i64, preview, db_content, hash],
-                ).map_err(|e| e.to_string())?;
-            }
+                    params![ts, mime, size, preview, blob, hash],
+                ),
+                Content::None => tx.execute(
+                    "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                    params![ts, mime, size, preview, hash],
+                ),
+            }.map_err(|e| e.to_string())?;
 
             tx.last_insert_rowid()
         };
@@ -146,6 +188,42 @@ impl SqliteStore {
         tx.commit().map_err(|e| e.to_string())?;
 
         Ok(UpsertOutcome { real_id, is_image, expired_hashes })
+    }
+
+    /// The preview and stored content of a row built from its bytes.
+    ///
+    /// "application/xhtml+xml" doesn't contain "text" itself (unlike text/html),
+    /// so it needs its own check to get a preview at all rather than falling
+    /// through to `None`. The same check decides the `content` storage class, so
+    /// search's `content LIKE ?` (see search_metadata/validate_keywords) always
+    /// lines up with what actually got stored as TEXT vs BLOB.
+    fn row_parts<'a>(mime: &str, data: &'a [u8], is_image: bool) -> (Option<String>, Content<'a>) {
+        let is_markup = is_html_mime(mime);
+        let is_text_like = is_text_like_mime(mime);
+
+        let preview = if is_text_like {
+            // Rich markup's raw tags aren't a readable preview: strip them first
+            // so the preview column always shows plain, scannable text instead of
+            // leaking `<div>`/`<strong>` etc.
+            let text_data: Cow<[u8]> = if is_markup {
+                Cow::Owned(strip_html_tags(data))
+            } else {
+                Cow::Borrowed(data)
+            };
+            let s = String::from_utf8_lossy(&text_data);
+            Some(s.chars().take(PREVIEW_CHARS).collect::<String>().replace('\n', " "))
+        } else { None };
+
+        // TEXT storage class for textual content lets `content LIKE ?` match
+        // directly, without a per-row `CAST(content AS TEXT)` at query time. Bytes
+        // claiming a text MIME but not actually valid UTF-8 fall through to the
+        // ordinary BLOB path rather than being rejected or corrupted.
+        let content = match std::str::from_utf8(data) {
+            Ok(text) if is_text_like => Content::Text(text),
+            _ if is_image => Content::None,
+            _ => Content::Blob(data),
+        };
+        (preview, content)
     }
 
     /// See `ClipboardDb::search_metadata` doc: each hit carries its absolute
@@ -318,6 +396,9 @@ impl SqliteStore {
              VACUUM;
              PRAGMA journal_mode = WAL;",
         );
+        // VACUUM frees pages, but the connection keeps them in its page cache
+        // and lookaside memory; release them so the process can shrink.
+        let _ = self.conn.execute_batch("PRAGMA shrink_memory;");
         Ok(())
     }
 
@@ -363,6 +444,69 @@ mod tests {
     /// `ORDER BY timestamp DESC` non-deterministic.
     fn set_timestamp(store: &mut SqliteStore, hash: &str, ts: i64) {
         store.conn.execute("UPDATE clipboard SET timestamp = ?1 WHERE hash = ?2", params![ts, hash]).unwrap();
+    }
+
+    // --- upsert_detached: a row built from a length alone ---
+
+    #[test]
+    fn upsert_detached_builds_the_row_upsert_record_builds_for_an_image() {
+        let mut detached = test_store();
+        let mut from_bytes = test_store();
+        let data = vec![7u8; 4321];
+
+        let a = detached.upsert_detached("image/png", data.len() as u64, "h-img", 100).unwrap();
+        let b = from_bytes.upsert_record("image/png", &data, "h-img", 100).unwrap();
+
+        assert_eq!((a.real_id, a.is_image), (b.real_id, b.is_image));
+        let row = |s: &SqliteStore| s.conn.query_row(
+            "SELECT mime, size, preview, content, hash FROM clipboard", [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, String>(4)?)),
+        ).unwrap();
+        assert_eq!(row(&detached), row(&from_bytes));
+        assert_eq!(row(&detached).1, 4321);
+    }
+
+    #[test]
+    fn upsert_detached_skips_what_upsert_record_skips() {
+        let mut store = test_store();
+        assert_eq!(store.upsert_detached("image/png", 0, "h-empty", 100).unwrap().real_id, -1);
+        assert_eq!(store.upsert_detached("image/x-secret", 10, "h-secret", 100).unwrap().real_id, -1);
+        assert_eq!(store.get_total_count(), 0);
+    }
+
+    #[test]
+    fn upsert_detached_touches_an_existing_row_and_rotates_like_any_insert() {
+        let mut store = test_store();
+        let first = store.upsert_detached("image/png", 10, "h1", 1).unwrap();
+        let again = store.upsert_detached("image/png", 10, "h1", 1).unwrap();
+        assert_eq!(first.real_id, again.real_id, "same hash, same row");
+
+        set_timestamp(&mut store, "h1", 1);
+        let second = store.upsert_detached("image/gif", 20, "h2", 1).unwrap();
+        assert_ne!(second.real_id, first.real_id);
+        assert_eq!(second.expired_hashes, vec!["h1".to_owned()], "the older image rotates out");
+        assert_eq!(store.get_total_count(), 1);
+    }
+
+    #[test]
+    fn only_images_without_text_are_detachable() {
+        for mime in ["image/png", "image/gif", "image/svg+xml", "application/x-gif"] {
+            assert!(is_detachable(mime), "{mime}");
+        }
+        for mime in ["text/x-gif", "text/plain", "application/pdf", ""] {
+            assert!(!is_detachable(mime), "{mime}");
+        }
+        assert!(is_cache_class("text/x-gif"), "still cache class: its bytes are cached too");
+    }
+
+    #[test]
+    fn wipe_releases_the_connections_memory_without_breaking_it() {
+        let mut store = test_store();
+        store.upsert_record("text/plain", &vec![b'x'; 200_000], "h-big", 100).unwrap();
+        store.wipe().unwrap();
+        assert!(store.conn.execute_batch("PRAGMA shrink_memory;").is_ok(), "the pragma is supported by the bundled SQLite");
+        assert_eq!(store.get_total_count(), 0);
+        assert!(store.upsert_record("text/plain", b"again", "h-again", 100).unwrap().real_id > 0);
     }
 
     // --- upsert_record: text vs. image storage ---

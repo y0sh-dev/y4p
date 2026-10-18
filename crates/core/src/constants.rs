@@ -67,9 +67,8 @@ pub const SPOOL_DIR_NAME: &str = "spool";
 // Extension of a spool file. A leftover with this extension is, by definition,
 // debris of a previous run and is swept at daemon start.
 pub const SPOOL_FILE_EXTENSION: &str = "part";
-// Extension of a cached binary payload, `<hash>.<extension>`. Defined by
-// `crates/storage` (`FileCache::path`), which is frozen: `core::cache_file_path`
-// mirrors it and a daemon test pins the two together.
+// Extension of a cached binary payload, `<hash>.<extension>`: the one rule
+// `crates/storage` (`FileCache::path`) names cache files by.
 pub const CACHE_FILE_EXTENSION: &str = "cache";
 // Width of the payload fingerprint (SHA3-256) in bytes.
 pub const DIGEST_LEN: usize = 32;

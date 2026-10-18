@@ -192,6 +192,32 @@ Reading the numbers:
 
 **Re-check of sections 3.1-3.6 at v0.7.4** (four full runs, the new group last in the order): single-thread queue rows 77.8-78.3 ns (64 B), 96.8-98.8 ns (4 KiB) and 86.4-88.7 ns (shed), against 77.7, 96.5-97.0 and 86.4-87.2 at v0.7.3: within the 3 % noise floor; the splice and ingest rows of section 3.6 reproduce (the memory bound with spooled payloads again 64 queued, 64 shed, 0.011 MiB). The cross-thread producer/consumer rows swing 5.9-7.5 us (64 B) and 15.2-19.9 us (4 KiB) between runs, as they did at v0.7.2 and v0.7.3: no conclusion is drawn from them. A full run takes 79 s.
 
+### 3.8 Direct file adoption and memory reclamation on wipe (v0.7.4 Part 2)
+
+**Adoption.** The worker used to map a spooled file (`mmap`), rename image files into the cache itself and hand storage a `&[u8]`. Now `ClipboardDb::insert_spooled` takes the `SpooledFile`: an image is renamed into `<hash>.cache` by `FileCache::adopt` and its row is built from the length alone; anything else is read once into its row. Two full runs, the `ingest` group (a real `DbWorker`, database and cache directory; GIF so the converter does not touch it):
+
+| Payload | Road | v0.7.3 (section 3.6) | v0.7.4 Part 2, run 1 / run 2 | Heap bytes / op |
+| :--- | :--- | ---: | ---: | ---: |
+| 1 MiB GIF | spooled, splice + adopt | 6.82 ms | 6.91 / 6.92 ms | 6,477 -> **5,994** |
+| 16 MiB GIF | spooled, splice + adopt | 105.7 ms | 107.0 / 106.8 ms | 6,477 -> **5,994** |
+| 1 MiB GIF | `Vec` in the ingestion thread (control, untouched code) | 6.89 ms | 6.96 / 6.93 ms | 4,195,072 (unchanged) |
+| 16 MiB GIF | `Vec` in the ingestion thread (control, untouched code) | 111.5 ms | 112.4 / 112.7 ms | 67,110,011 (unchanged) |
+
+The spooled rows read 1.0-1.4 % slower than the figures recorded at v0.7.3, and the control rows, whose code did not change, read 0.6-1.1 % slower on the same runs: the difference is the machine's drift between sessions, inside the 3 % noise floor, not a cost of the new path. What the path saves is not on the wall clock: the mapping's `mmap` and `munmap` calls, one `unsafe` pair (the tree's only one of that kind), and 483 heap bytes per operation. The old rows of sections 3.1-3.6 reproduce (queue 77.8-78.2 ns and 96.8-98.0 ns, shed 87.6-88.7 ns; v0.7.3: 77.7, 96.5-97.0, 86.4-87.2).
+
+A non-image payload is now read into the heap once (one `Vec` of exactly its length) before SQLite copies it into the row; the mapping avoided that read, but rusqlite binds a blob with `SQLITE_TRANSIENT`, so SQLite copied from the mapping into its own buffer all the same, so the peak is one payload higher than it was for large inline blobs (a PDF, an archive). It is bounded by `MAX_PAYLOAD_BYTES` and by the recorded length. Reading it through an incremental `sqlite3_blob` write would remove the copy, but needs rusqlite's `blob` feature, a manifest change that is not made here (section 6).
+
+**`wipe`.** After `VACUUM` the process kept its pages: SQLite's page cache and the allocator's free lists stay resident. A throwaway program (not part of the tree) inserted 40,000 text rows of about 2 KiB, listed and searched the whole history and then called `ClipboardDb::wipe`; resident set size from `/proc/self/statm`, release build, two runs of each variant (identical to 0.1 MiB):
+
+| Variant | Before wipe | After wipe |
+| :--- | ---: | ---: |
+| `VACUUM` only (v0.7.3) | 233.5 MiB | 74.4 MiB |
+| + `PRAGMA shrink_memory` | 233.5 MiB | 74.5 MiB |
+| + `malloc_trim(0)` | 233.5 MiB | **4.2 MiB** |
+| both (shipped) | 233.5 MiB | **4.2 MiB** |
+
+At this scale the whole effect is the trim: freed small blocks in the middle of the heap stay resident until the allocator is asked to release them, and 70 MiB of them did. The pragma alone changes nothing measurable here (SQLite's default page cache is only about 2 MiB, below the run-to-run spread of the other figures); it stays because it is the documented way to release the connection's own memory and costs one statement. The trim is a hint: on a target whose C library has no `malloc_trim` it is a no-op, and the unit test (`core::memory`) frees 96 MiB of 4 KiB blocks and requires at least half of it back.
+
 ---
 
 ## 4. Memory Bounds
@@ -203,6 +229,7 @@ Reading the numbers:
 | Offer 128 x 1 MiB to a queue of capacity 64 with zero patience | **64 queued, 64 shed**; peak heap growth **65.0 MiB** (64 queued + the one payload in flight). The surplus is dropped, not held |
 | The same, with spooled payloads (v0.7.3) | **64 queued, 64 shed**; peak heap growth **0.010 MiB**; 64 spool files while queued, 0 afterwards (shed jobs unlink theirs) |
 | Convert one spooled 12 MiB raster image (v0.7.4) | peak heap growth **0.00 MiB**, against **36.12 MiB** when it is read back into memory first (v0.7.3); section 3.7 |
+| `y4p wipe` after a 40,000-row history was listed and searched (v0.7.4 Part 2) | resident set **233.5 MiB -> 4.2 MiB** (74.4 MiB with `VACUUM` alone); section 3.8 |
 
 ### 4.2 Worst case, by construction
 
@@ -232,13 +259,13 @@ By inspection of the code (not measured):
 | 1'. compositor pipe to spool file: large non-text payloads (v0.7.3) | 0 into the heap: `splice(2)` into the file; the digest reads the `tee`d duplicate through a 64 KiB **stack** buffer (the one copy SHA3 itself needs) |
 | 2. `ClipboardJob` through the queue, and the worker's `into_bytes` | 0 (moved; `Payload::Memory` is handed over without a copy; a `Spooled` job is a path) |
 | 3. text and unsupported types: hash, then insert | 0 (hashed in place; SQLite takes a borrowed slice) |
-| 3'. spooled, not transcoded: persist (v0.7.3) | 0 (digest already known; the file is mapped for the storage layer, and an image is renamed into the cache: same inode) |
+| 3'. spooled, not transcoded: persist | 0 for an image (digest already known; `insert_spooled` renames the file into the cache: same inode, and the row needs only its length); 1 for a payload stored in its row (read once into a `Vec`; v0.7.4 Part 2 replaced the v0.7.3 mapping) |
 | 4. raster image under the spool threshold (a few KiB): `Vec` to `magick` stdin, `magick` stdout to a new `Vec` | 2 (pipe relays) |
 | 4'. spooled raster image (v0.7.4): spool file to `magick` stdin, `magick` stdout to a new spool file | 0 (the file is the child's stdin; `splice(2)` into the new file; the digest reads the `tee`d duplicate through the stack buffer) |
-| 4''. converted spooled image: persist (v0.7.4) | 0 (as 3': digest known, file mapped, renamed into the cache) |
+| 4''. converted spooled image: persist (v0.7.4) | 0 (as 3': digest known, renamed into the cache) |
 | 5. egress (paste): cached image via `sendfile(2)` | 0 (kernel to kernel) |
 
-Ingestion now has no heap copy for a large payload whether or not the converter rewrites it, one for small payloads and text, and two more for a small raster image; egress has none. The remaining per-payload costs of a spooled one are the mapping and the mirrored layout rule, both removed by v0.7.4 Part 2 (section 6).
+Ingestion now has no heap copy for a large payload whether or not the converter rewrites it, one for small payloads and text, and two more for a small raster image; egress has none. The mapping and the mirrored layout rule that a spooled payload used to cost are gone (v0.7.4 Part 2); the one copy left is a non-image payload read into its database row.
 
 ---
 
@@ -253,6 +280,8 @@ Proposals derived from the baseline above, to be agreed per milestone. "Baseline
 | Peak payload buffer per in-flight reader | whole payload (up to 256 MiB) | <= 64 KiB chunk for streamed payloads | **v0.7.3: met** for spooled payloads (64 KiB stack buffer, 0 bytes of heap) |
 | Userspace copies, large payload that bypasses the converter | 1 | 0 (`splice(2)` into the cache file, hash streamed alongside) | **v0.7.3: met** (section 4.3) |
 | Userspace copies, raster image | 3 | <= 1 (descriptor to `magick`) | **v0.7.4 Part 1: met** for spooled images (0; section 4.3), and time falls to the converter's own floor (section 3.7); a raster under the 4 KiB spool threshold keeps the in-memory road |
+| `unsafe` mapping and mirrored storage rules in the daemon | `MappedFile` (`mmap`/`munmap`), `core::cache_file_path`, `worker::stored_in_cache_file` | none | **v0.7.4 Part 2: met** (section 3.8) |
+| Resident memory after `wipe` | 74.4 MiB (VACUUM only) | back to the process's idle footprint | **v0.7.4 Part 2: met** (4.2 MiB; section 3.8) |
 | Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.5 - v0.7.8 (hardening; for spooled payloads the budget is disk, see section 4.2) |
 | SHA3 throughput | 158 MiB/s | no regression; overlap with the transfer so that hashing no longer serialises behind it | **v0.7.3: met in the sense that matters**: no regression (154-159 MiB/s), and hashing runs on the ingestion threads in parallel instead of the single worker; a single stream is still hash-bound (section 3.6) |
 | Allocations to read a small text payload from a pipe | 3-9 | 1 | **v0.7.2: met** (section 3.5) |
@@ -267,6 +296,6 @@ One consequence to plan around: because SHA3-256 costs about 6.3 ms per MiB agai
 1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only, and since v0.7.3 the products in section 4.2 bound disk (the spool directory) rather than heap for large payloads. A byte budget (an atomic counter of queued bytes) has what it needs: `Payload::len_hint` reports the size without I/O, and a `SpooledFile` knows its length. It is not implemented.
 2. **Hash cost.** At 154-159 MiB/s with `opt-level = "s"`, hashing dominates large payloads, and v0.7.3 shows it is the *only* thing that does (the kernel copy is 26-34 times faster). Overlapping it with the transfer is done; the remaining lever is a per-package `opt-level = 3` override for the Keccak crates in `[profile.release.package]`, which adds no crate but changes release-profile settings and therefore needs approval; the second has not been measured.
 3. **Disk-backed numbers.** The recorded run is on tmpfs. A run with `Y4P_BENCH_DIR` on the real data disk should be added once, because `fsync` behaviour changes the SQLite rows by orders of magnitude.
-4. **The cost left on a spooled payload.** `MappedFile` (the only `mmap`/`munmap` `unsafe` in the tree) exists because the frozen storage layer takes a `&[u8]`, and `core::cache_file_path` / `worker::stored_in_cache_file` mirror its private layout rule. A storage entry point that takes a file (v0.7.4 Part 2, under a lifted storage invariant) removes both; it is not measured here because nothing in this harness would change by it except the page-cache mapping.
+4. **A large non-image payload meets the heap once.** `insert_spooled` reads a spooled PDF or archive into one `Vec` before SQLite copies it into the row. An incremental BLOB write (`zeroblob(n)` then `sqlite3_blob_open`, in 64 KiB steps) would keep it flat, but rusqlite's `blob` feature is a manifest change and was not requested; large non-image, non-text payloads are rare in a clipboard.
 5. **Two splice primitives.** `image::pipeline::{try_splice, splice_all}` (bare, tap-less, tested, unused by production code) and `core::splice` (bounded, fingerprinting, with the buffered fallback) overlap. Folding the first into the second is a refactoring for a `.N.5`-`.N.8` release, not a feature.
 6. **Realistic images.** Section 3.7 uses incompressible noise to make the byte volume the label says. A screenshot-like image spends proportionally more of its time in `magick`'s encoder and less in the plumbing; the memory result is independent of content, the time result is not.
