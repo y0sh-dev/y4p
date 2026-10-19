@@ -59,6 +59,16 @@ pub const PAYLOAD_PREALLOC_CAP_BYTES: usize = 16 * 1024 * 1024;
 // the default capacity of a Linux pipe (16 pages), so one round empties a full
 // pipe; a larger value could not move more per call.
 pub const SPLICE_CHUNK_BYTES: usize = 64 * 1024;
+
+// --- Content-Defined Chunking (core::cdc) ---
+// Bounds of a FastCDC chunk. The minimum is one SQLite page, so no chunk is
+// smaller than the unit the database stores anyway; the maximum is the Linux
+// pipe capacity (`SPLICE_CHUNK_BYTES`), so one chunk always moves in a single
+// splice round; the average sits between them and is the point where the
+// boundary test relaxes (normalised chunking).
+pub const CDC_MIN_CHUNK_BYTES: usize = 4 * 1024;
+pub const CDC_AVG_CHUNK_BYTES: usize = 16 * 1024;
+pub const CDC_MAX_CHUNK_BYTES: usize = 64 * 1024;
 // Directory (inside the cache directory, hence on the same filesystem as the
 // final `<hash>.cache` files) where a payload is spooled while it streams in.
 // Keeping it on one filesystem is what lets the finished file be adopted into
