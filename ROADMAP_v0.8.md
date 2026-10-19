@@ -64,7 +64,7 @@ Visual progress checklist across the zero-copy development cycle:
   - Leverage Linux `splice(2)` to stream data directly into temporary cache files without intermediate userspace `Vec<u8>` heap allocation.
   - Integrate streaming SHA3-256 fingerprint calculation alongside kernel streaming (via `tee(2)` or streaming block-hashing).
 
-- [ ] **v0.7.4: Zero-Copy Image, Scratch Pipeline & Extreme Storage Optimization**
+- [x] **v0.7.4: Zero-Copy Image, Scratch Pipeline & Extreme Storage Optimization**
   - **Part 1 (PR 1) — Zero-Copy Image & Scratch Pipeline Integration**:
     - Connect descriptor / spooled payloads with `y4p-image` sandbox (`ScratchDir`).
     - Optimise image preprocessing invocation (`magick`) with direct pipe streaming where possible.
