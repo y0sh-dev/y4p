@@ -81,9 +81,18 @@ fn spawn_egress<F: FnOnce() + Send + 'static>(job: F) {
     }
 }
 
+/// Whether `e` only says the receiving client went away mid-paste (for example
+/// `head -n 1` closing the pipe after the first line). That is the reader's
+/// choice, not a failure of ours, so every egress path stays quiet about it.
+fn receiver_left(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+}
+
 fn write_bytes(dest: OwnedFd, data: &[u8]) {
     let mut file = std::fs::File::from(dest);
-    if let Err(e) = file.write_all(data) {
+    if let Err(e) = file.write_all(data)
+        && !receiver_left(&e)
+    {
         eprintln!("{}egress transmission failure: {}", LOG_ERROR, e);
     }
     let _ = file.flush();
@@ -176,7 +185,7 @@ fn copy_remaining(src: &mut PayloadReader, dest: &mut std::fs::File, already_sen
         }
     }
     if let Err(e) = std::io::copy(src, dest)
-        && e.kind() != std::io::ErrorKind::BrokenPipe
+        && !receiver_left(&e)
     {
         eprintln!("{}egress: copy failed: {}", LOG_ERROR, e);
     }
@@ -342,5 +351,57 @@ mod tests {
     fn write_bytes_delivers_an_in_memory_payload() {
         let got = received_from(|dest| write_bytes(dest, b"inline"));
         assert_eq!(got, b"inline");
+    }
+
+    /// A pipe whose read end is already closed: every write meets `EPIPE`.
+    fn pipe_without_reader() -> OwnedFd {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        OwnedFd::from(writer)
+    }
+
+    #[test]
+    fn a_vanished_receiver_is_recognised_whichever_way_it_reports_it() {
+        use std::io::{Error, ErrorKind};
+        assert!(receiver_left(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(receiver_left(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(!receiver_left(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!receiver_left(&Error::from(ErrorKind::WriteZero)));
+    }
+
+    #[test]
+    fn write_bytes_survives_a_receiver_that_left_before_the_first_byte() {
+        // Larger than a pipe, so the write cannot slip into the buffer first.
+        write_bytes(pipe_without_reader(), &pattern(1024 * 1024));
+        write_bytes(pipe_without_reader(), b"x");
+        write_bytes(pipe_without_reader(), b"");
+    }
+
+    #[test]
+    fn write_bytes_survives_a_receiver_that_leaves_mid_stream() {
+        // `head -n 1` shape: take a little, then close while the sender still
+        // has most of the payload to push.
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let handle = std::thread::spawn(move || write_bytes(OwnedFd::from(writer), &pattern(4 * 1024 * 1024)));
+        let mut first = [0u8; 16];
+        reader.read_exact(&mut first).unwrap();
+        drop(reader);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn markup_stripping_survives_a_receiver_that_left() {
+        let path = temp_file("html-early", b"<p>hello</p>");
+        serve_descriptor_payload(Payload::File(path.clone()), true, pipe_without_reader());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_copy_fallback_survives_a_receiver_that_left() {
+        // A stream source forces the userspace copy (`ESPIPE` from sendfile).
+        let data = pattern(1024 * 1024);
+        serve_descriptor_payload(stream_of(&data, None), false, pipe_without_reader());
+        let reader = Payload::memory(data).into_reader().unwrap();
+        transfer(reader, pipe_without_reader());
     }
 }
