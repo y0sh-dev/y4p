@@ -9,6 +9,7 @@ pub mod config;
 pub mod payload;
 pub mod splice;
 pub mod memory;
+pub mod cdc;
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
