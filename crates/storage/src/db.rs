@@ -9,7 +9,7 @@ use sha3::{Digest, Sha3_256};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::core::cdc::FastCdc;
-use crate::core::constants::{CDC_MIN_CHUNK_BYTES, MAX_PAYLOAD_BYTES, SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
+use crate::core::constants::{CDC_MIN_CHUNK_BYTES, LOG_ERROR, MAX_PAYLOAD_BYTES, SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
 use crate::core::utils::{is_html_mime, is_text_like_mime, strip_html_tags};
 use super::MetaRow;
 
@@ -312,20 +312,37 @@ impl SqliteStore {
     /// shorter (or longer) payload.
     fn reassemble(&self, id: i64, size: i64) -> Option<Vec<u8>> {
         let expected = usize::try_from(size).ok()?;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = match self.conn.prepare(
             "SELECT ch.data FROM manifest m JOIN chunks ch ON ch.hash = m.chunk_hash
              WHERE m.clipboard_id = ?1 ORDER BY m.seq"
-        ).ok()?;
-        let mut rows = stmt.query(params![id]).ok()?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}chunk reassembly query preparation failed for row {}: {}", LOG_ERROR, id, e);
+                return None;
+            }
+        };
+        let mut rows = match stmt.query(params![id]) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}chunk reassembly query execution failed for row {}: {}", LOG_ERROR, id, e);
+                return None;
+            }
+        };
         // The recorded size only sizes the buffer up to the payload limit.
         let mut out = Vec::with_capacity(expected.min(usize::try_from(MAX_PAYLOAD_BYTES).unwrap_or(usize::MAX)));
         while let Some(row) = rows.next().ok()? {
             out.extend_from_slice(row.get_ref(0).ok()?.as_blob().ok()?);
             if out.len() > expected {
+                eprintln!("{}chunk reassembly exceeded expected size ({} > {}) for row {}", LOG_ERROR, out.len(), expected, id);
                 return None;
             }
         }
-        (out.len() == expected).then_some(out)
+        if out.len() != expected {
+            eprintln!("{}chunk reassembly size mismatch (got {}, expected {}) for row {}", LOG_ERROR, out.len(), expected, id);
+            return None;
+        }
+        Some(out)
     }
 
     /// See `ClipboardDb::search_metadata` doc: each hit carries its absolute
