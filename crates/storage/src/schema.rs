@@ -6,7 +6,7 @@
 use rusqlite::Connection;
 
 /// Bump this and add a `migrate_to_vN` below whenever the schema changes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Schema initialization and versioned migrations, gated by `PRAGMA user_version`
 /// so an existing on-disk DB only ever runs the migrations it's missing.
@@ -37,6 +37,9 @@ impl SchemaManager {
         }
         if version < 3 {
             Self::migrate_to_v3(conn)?;
+        }
+        if version < 4 {
+            Self::migrate_to_v4(conn)?;
         }
 
         if version < SCHEMA_VERSION {
@@ -118,6 +121,47 @@ impl SchemaManager {
         .map_err(|e| format!("v3 migration failed: {}", e))?;
         Ok(())
     }
+
+    /// Content-defined chunk storage (see `db::SqliteStore::store_chunks`).
+    ///
+    /// Purely additive, so every v1-v3 row stays exactly as it is:
+    /// - `clipboard.is_chunked` (default 0) marks a row whose bytes live in
+    ///   `chunks` instead of `content`; all existing rows backfill as inline.
+    /// - `chunks` holds each distinct chunk once, keyed by its SHA3-256 digest,
+    ///   with the number of manifest entries that reference it.
+    /// - `manifest` maps a row to its chunks in order; a chunk may appear more
+    ///   than once in one payload, hence `seq` rather than the digest in the key.
+    ///
+    /// No foreign keys: SQLite enforces them per connection and only when asked,
+    /// so reference counting is kept in the same transaction as the row change
+    /// instead (`db::SqliteStore::release_chunks`).
+    fn migrate_to_v4(conn: &mut Connection) -> Result<(), String> {
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('clipboard') WHERE name = 'is_chunked'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_or(false);
+
+        let tx = conn.transaction().map_err(|e| format!("v4 migration failed: {}", e))?;
+        if !has_column {
+            tx.execute("ALTER TABLE clipboard ADD COLUMN is_chunked INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(|e| format!("v4 migration failed: {}", e))?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chunks (
+                hash BLOB PRIMARY KEY,
+                data BLOB NOT NULL,
+                refcount INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS manifest (
+                clipboard_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                chunk_hash BLOB NOT NULL,
+                PRIMARY KEY (clipboard_id, seq)
+            ) WITHOUT ROWID;",
+        )
+        .map_err(|e| format!("v4 migration failed: {}", e))?;
+        tx.commit().map_err(|e| format!("v4 migration failed: {}", e))
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +184,7 @@ mod tests {
     // --- Fresh initialisation ---
 
     #[test]
-    fn initialize_on_fresh_db_builds_v3_schema_with_is_pinned_column() {
+    fn initialize_on_fresh_db_builds_current_schema_with_is_pinned_column() {
         let mut conn = Connection::open_in_memory().unwrap();
         SchemaManager::initialize(&mut conn, 1000).unwrap();
 
@@ -241,5 +285,99 @@ mod tests {
 
         assert!(!index_exists(&conn, "idx_pinned"), "stale single-column index must be dropped");
         assert!(index_exists(&conn, "idx_pinned_ts"));
+    }
+
+    // --- v4: chunk storage ---
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+            .and_then(|mut stmt| stmt.exists([name]))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn initialize_on_fresh_db_creates_the_chunk_tables_and_flag() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        SchemaManager::initialize(&mut conn, 1000).unwrap();
+
+        assert!(table_exists(&conn, "chunks"));
+        assert!(table_exists(&conn, "manifest"));
+        assert!(column_exists(&conn, "clipboard", "is_chunked"));
+        assert_eq!(SCHEMA_VERSION, 4);
+    }
+
+    #[test]
+    fn migration_from_v3_keeps_every_row_byte_for_byte_and_marks_it_inline() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // A v3 database: pin flag present, textual content already TEXT class,
+        // a binary row, and an image row whose bytes live in the file cache.
+        conn.execute_batch(
+            "CREATE TABLE clipboard (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                mime TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                preview TEXT,
+                content BLOB,
+                hash TEXT UNIQUE,
+                is_pinned INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO clipboard (timestamp, mime, size, preview, content, hash, is_pinned)
+            VALUES (1, 'text/plain', 5, 'hello', 'hello', 'h-text', 1),
+                   (2, 'application/pdf', 3, NULL, x'010203', 'h-bin', 0),
+                   (3, 'image/png', 9, NULL, NULL, 'h-img', 0);
+            PRAGMA user_version = 3;",
+        )
+        .unwrap();
+
+        SchemaManager::initialize(&mut conn, 1000).unwrap();
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 4);
+        type Row = (String, i64, Option<Vec<u8>>, i64, i64);
+        let rows: Vec<Row> = conn
+            .prepare("SELECT hash, size, CAST(content AS BLOB), is_pinned, is_chunked FROM clipboard ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![
+            ("h-text".to_owned(), 5, Some(b"hello".to_vec()), 1, 0),
+            ("h-bin".to_owned(), 3, Some(vec![1, 2, 3]), 0, 0),
+            ("h-img".to_owned(), 9, None, 0, 0),
+        ]);
+        let chunk_rows: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+        assert_eq!(chunk_rows, 0);
+    }
+
+    #[test]
+    fn migration_from_v1_reaches_v4_in_one_initialisation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clipboard (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                mime TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                preview TEXT,
+                content BLOB,
+                hash TEXT UNIQUE
+            );
+            INSERT INTO clipboard (timestamp, mime, size, preview, content, hash)
+            VALUES (1, 'text/plain', 2, 'v1', 'v1', 'h-v1');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        SchemaManager::initialize(&mut conn, 1000).unwrap();
+
+        assert!(column_exists(&conn, "clipboard", "is_pinned"));
+        assert!(column_exists(&conn, "clipboard", "is_chunked"));
+        assert!(table_exists(&conn, "manifest"));
+        let (content, chunked): (String, i64) = conn
+            .query_row("SELECT content, is_chunked FROM clipboard WHERE hash = 'h-v1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((content.as_str(), chunked), ("v1", 0));
     }
 }
