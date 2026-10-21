@@ -124,6 +124,11 @@ fn make_pipe() -> Option<(std::fs::File, OwnedFd)> {
         }
     }
 
+    // Best effort, and not a precondition: the compositor's client writes into
+    // this pipe, and a 1 MiB capacity lets it run ahead of the reader instead
+    // of sleeping every 64 KiB. A refusal leaves the default capacity.
+    let _ = crate::core::pipe::grow(&write_fd);
+
     // Convert read side to File for standard I/O compatibility
     Some((std::fs::File::from(read_fd), write_fd))
 }

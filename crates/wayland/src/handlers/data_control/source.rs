@@ -89,6 +89,11 @@ fn receiver_left(e: &std::io::Error) -> bool {
 }
 
 fn write_bytes(dest: OwnedFd, data: &[u8]) {
+    // Only a payload the default pipe cannot hold in one go benefits; small
+    // pastes skip the system calls.
+    if data.len() > PIPE_DEFAULT_BYTES {
+        let _ = crate::core::pipe::grow(&dest);
+    }
     let mut file = std::fs::File::from(dest);
     if let Err(e) = file.write_all(data)
         && !receiver_left(&e)
@@ -134,6 +139,9 @@ fn serve_descriptor_payload(payload: Payload, strip_markup: bool, dest: OwnedFd)
 /// because the fast path was unavailable. A reader without a descriptor (an
 /// in-memory source) takes that same copy.
 fn transfer(mut src: PayloadReader, dest: OwnedFd) {
+    // The paste target's pipe: a larger one lets `sendfile(2)` hand over more
+    // per call. Ignored when it is not a pipe or the system refuses.
+    let _ = crate::core::pipe::grow(&dest);
     let mut dest_file = std::fs::File::from(dest);
     let dest_fd = dest_file.as_raw_fd();
 
@@ -403,5 +411,85 @@ mod tests {
         serve_descriptor_payload(stream_of(&data, None), false, pipe_without_reader());
         let reader = Payload::memory(data).into_reader().unwrap();
         transfer(reader, pipe_without_reader());
+    }
+
+    // --- pipe capacity tuning ---
+
+    fn capacity_of(fd: &impl AsRawFd) -> usize {
+        // SAFETY: `F_GETPIPE_SZ` takes no argument and only reads a property of
+        // the open descriptor it is given.
+        let size = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        usize::try_from(size).unwrap()
+    }
+
+    /// Whether this machine lets an unprivileged process enlarge a pipe at all.
+    fn growth_is_allowed() -> bool {
+        let max = std::fs::read_to_string("/proc/sys/fs/pipe-max-size").ok().and_then(|s| s.trim().parse::<usize>().ok());
+        max.is_none_or(|max| max > PIPE_DEFAULT_BYTES)
+    }
+
+    #[test]
+    fn a_large_in_memory_payload_is_sent_through_an_enlarged_pipe() {
+        let data = pattern(2 * 1024 * 1024);
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        assert_eq!(capacity_of(&reader), PIPE_DEFAULT_BYTES);
+        let sent = data.clone();
+        let handle = std::thread::spawn(move || write_bytes(OwnedFd::from(writer), &sent));
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        handle.join().unwrap();
+
+        assert!(got == data);
+        if growth_is_allowed() {
+            assert!(capacity_of(&reader) > PIPE_DEFAULT_BYTES, "the destination pipe should have been enlarged");
+        }
+    }
+
+    #[test]
+    fn a_small_payload_does_not_touch_the_pipe_capacity() {
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        write_bytes(OwnedFd::from(writer), &pattern(1000));
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got.len(), 1000);
+        assert_eq!(capacity_of(&reader), PIPE_DEFAULT_BYTES);
+    }
+
+    #[test]
+    fn a_descriptor_payload_is_sent_through_an_enlarged_pipe() {
+        let data = pattern(1024 * 1024 + 5);
+        let path = temp_file("grown-file", &data);
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let handle = std::thread::spawn({
+            let path = path.clone();
+            move || serve_descriptor_payload(Payload::File(path), false, OwnedFd::from(writer))
+        });
+
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        handle.join().unwrap();
+
+        assert!(got == data);
+        if growth_is_allowed() {
+            assert!(capacity_of(&reader) > PIPE_DEFAULT_BYTES);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_destination_that_is_not_a_pipe_still_receives_the_payload() {
+        // A regular file: `F_SETPIPE_SZ` is refused, which must change nothing.
+        let data = pattern(300_000);
+        let target = temp_file("not-a-pipe-a", b"");
+        let dest = std::fs::OpenOptions::new().write(true).open(&target).unwrap();
+        write_bytes(OwnedFd::from(dest), &data);
+        assert!(std::fs::read(&target).unwrap() == data);
+
+        let dest = std::fs::OpenOptions::new().write(true).truncate(true).open(&target).unwrap();
+        transfer(Payload::memory(data.clone()).into_reader().unwrap(), OwnedFd::from(dest));
+        assert!(std::fs::read(&target).unwrap() == data);
+        std::fs::remove_file(target).unwrap();
     }
 }
