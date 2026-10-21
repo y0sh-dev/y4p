@@ -11,10 +11,14 @@
 //! hard byte limit and reports what it moved:
 //!
 //! 1. **Kernel path** -- `src` is a pipe (checked with `fstat`, not guessed).
-//!    Per round: `tee` duplicates up to one chunk into a private scratch pipe
-//!    (only when the tap observes), `splice` moves exactly those bytes from
-//!    `src` into `dst`, and the scratch copy is read into a fixed stack buffer
-//!    for the tap. No heap buffer holds the payload at any point.
+//!    Per round: `tee` duplicates up to [`SPLICE_ROUND_BYTES`] into a private
+//!    scratch pipe (only when the tap observes), `splice` moves exactly those
+//!    bytes from `src` into `dst`, and the scratch copy is read into a fixed
+//!    stack buffer, [`SPLICE_CHUNK_BYTES`] at a time, for the tap. No heap
+//!    buffer holds the payload at any point. A round is as large as the pipes
+//!    allow: the scratch pipe is enlarged here (`core::pipe`), and `src` is
+//!    whatever its creator made of it; a pipe left at 64 KiB just means more,
+//!    smaller rounds, with identical results.
 //! 2. **Buffered path** -- anything else, or a kernel that refuses (`EINVAL`,
 //!    `ENOSYS`, `EOPNOTSUPP`: a socket source, a file opened `O_APPEND`, a
 //!    filesystem without splice support). A fixed stack buffer is filled with
@@ -38,7 +42,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::ptr;
 
-use crate::constants::SPLICE_CHUNK_BYTES;
+use crate::constants::{SPLICE_CHUNK_BYTES, SPLICE_ROUND_BYTES};
 use crate::payload::PayloadError;
 
 /// Observer of a byte stream while it is being copied: the seam through which
@@ -148,7 +152,11 @@ fn kernel_loop<T: ByteTap>(
     // The scratch pipe exists only when somebody observes the stream.
     let scratch = if T::OBSERVES {
         match io::pipe() {
-            Ok(pair) => Some(pair),
+            Ok(pair) => {
+                // Best effort: a round can only be as large as this pipe.
+                let _ = crate::pipe::grow(&pair.1);
+                Some(pair)
+            }
             // No descriptors to spare for the scratch pipe: the buffered path
             // needs none, so this is a fallback, not a failure.
             Err(_) => return Ok(KernelEnd::Unsupported),
@@ -161,7 +169,7 @@ fn kernel_loop<T: ByteTap>(
     let allowed = allowance(limit);
 
     loop {
-        let want = usize::try_from((allowed - copied.len).min(SPLICE_CHUNK_BYTES as u64)).unwrap_or(SPLICE_CHUNK_BYTES);
+        let want = usize::try_from((allowed - copied.len).min(SPLICE_ROUND_BYTES as u64)).unwrap_or(SPLICE_ROUND_BYTES);
 
         let round = match &scratch {
             Some((scratch_r, scratch_w)) => {
@@ -178,11 +186,17 @@ fn kernel_loop<T: ByteTap>(
                     Err(SpliceFailure::Refused) => return Ok(KernelEnd::Unsupported),
                     Err(SpliceFailure::Io(e)) => return Err(e.into()),
                 }
-                // Exactly the `n` bytes just moved, as seen through the scratch pipe.
+                // Exactly the `n` bytes just moved, as seen through the scratch
+                // pipe, a staging buffer's worth at a time and in order.
                 let mut scratch_r = scratch_r;
-                let chunk = staging.get_mut(..n).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-                scratch_r.read_exact(chunk)?;
-                tap.update(chunk);
+                let mut left = n;
+                while left > 0 {
+                    let take = left.min(staging.len());
+                    let chunk = staging.get_mut(..take).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+                    scratch_r.read_exact(chunk)?;
+                    tap.update(chunk);
+                    left -= take;
+                }
                 n
             }
             None => match splice_once(src, dst_fd, want) {
@@ -573,5 +587,87 @@ mod tests {
         let result = copy_to_file(&mut Broken(file), &mut dst, 1024, &mut NoTap);
         assert!(matches!(result, Err(PayloadError::Io(_))));
         std::fs::remove_file(path).unwrap();
+    }
+
+    // --- grown pipes: rounds larger than the staging buffer ---
+
+    /// `fed_pipe` on a pipe tuned the way the daemon tunes the ones it creates.
+    fn grown_fed_pipe(data: Vec<u8>) -> (File, std::thread::JoinHandle<()>, Option<usize>) {
+        let (reader, mut writer) = io::pipe().unwrap();
+        let capacity = crate::pipe::grow(&writer);
+        let handle = std::thread::spawn(move || {
+            let _ = writer.write_all(&data);
+        });
+        (File::from(std::os::fd::OwnedFd::from(reader)), handle, capacity)
+    }
+
+    /// Records the largest chunk it was shown, next to the order-sensitive sum.
+    #[derive(Default)]
+    struct Widest {
+        sum: Checksum,
+        widest: usize,
+    }
+
+    impl ByteTap for Widest {
+        fn update(&mut self, chunk: &[u8]) {
+            self.widest = self.widest.max(chunk.len());
+            self.sum.update(chunk);
+        }
+    }
+
+    #[test]
+    fn on_a_grown_pipe_the_tap_still_sees_every_byte_once_in_order_in_bounded_chunks() {
+        let data = payload(5 * 1024 * 1024 + 123);
+        let (mut src, writer, capacity) = grown_fed_pipe(data.clone());
+        let (mut dst, path) = dest("grown-tee");
+        let mut tap = Widest::default();
+
+        let copied = copy_to_file(&mut src, &mut dst, 64 << 20, &mut tap).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!((copied.len, copied.kernel_bytes), (data.len() as u64, data.len() as u64));
+        assert_eq!((tap.sum.seen, tap.sum.value), (data.len() as u64, checksum_of(&data)));
+        assert!(tap.widest <= SPLICE_CHUNK_BYTES, "the tap is fed from the {SPLICE_CHUNK_BYTES}-byte staging buffer, got {}", tap.widest);
+        if capacity.is_some_and(|c| c > SPLICE_CHUNK_BYTES) {
+            // A round of more than one staging buffer was fed in several updates.
+            assert!(tap.sum.chunks >= data.len().div_ceil(SPLICE_CHUNK_BYTES) as u64);
+        }
+        assert_eq!(read_back(&path), data);
+    }
+
+    #[test]
+    fn on_a_grown_pipe_the_limit_is_still_exact() {
+        let data = payload(2 * 1024 * 1024 + 5);
+        let len = data.len() as u64;
+
+        let (mut src, writer, _) = grown_fed_pipe(data.clone());
+        let (mut dst, path) = dest("grown-fit");
+        let copied = copy_to_file(&mut src, &mut dst, len, &mut NoTap).unwrap();
+        writer.join().unwrap();
+        assert_eq!(copied.len, len);
+        assert_eq!(read_back(&path), data);
+
+        let (mut src, writer, _) = grown_fed_pipe(data);
+        let (mut dst, path) = dest("grown-over");
+        let err = copy_to_file(&mut src, &mut dst, len - 1, &mut Checksum::default()).unwrap_err();
+        assert!(matches!(err, PayloadError::TooLarge { limit } if limit == len - 1), "{err:?}");
+        drop(src);
+        let _ = writer.join();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_payload_smaller_than_one_round_on_a_grown_pipe_is_copied_whole() {
+        let data = payload(100_000);
+        let (mut src, writer, _) = grown_fed_pipe(data.clone());
+        let (mut dst, path) = dest("grown-small");
+        let mut tap = Checksum::default();
+
+        let copied = copy_to_file(&mut src, &mut dst, 64 << 20, &mut tap).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(copied.len, data.len() as u64);
+        assert_eq!((tap.seen, tap.value), (data.len() as u64, checksum_of(&data)));
+        assert_eq!(read_back(&path), data);
     }
 }
