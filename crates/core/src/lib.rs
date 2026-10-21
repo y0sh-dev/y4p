@@ -8,6 +8,7 @@ pub mod utils;
 pub mod config;
 pub mod payload;
 pub mod splice;
+pub mod pipe;
 pub mod memory;
 pub mod cdc;
 
