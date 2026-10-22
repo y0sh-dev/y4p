@@ -584,6 +584,12 @@ where
         reap(&mut child);
         return Err(PipelineError::Child(io::Error::other("child pipe handle missing")));
     }
+    // Best effort, before any byte moves: a 1 MiB pipe lets the child (or the
+    // feeder) run ahead of this thread instead of sleeping every 64 KiB.
+    let _ = crate::core::pipe::grow(&stdout);
+    if let Some(stdin) = &child_stdin {
+        let _ = crate::core::pipe::grow(stdin);
+    }
 
     // Declared before the scope so the watchdog thread may borrow them.
     let pid = child.id();

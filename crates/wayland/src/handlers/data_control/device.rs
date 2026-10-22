@@ -330,6 +330,28 @@ mod tests {
         read_file
     }
 
+    #[test]
+    fn make_pipe_hands_out_an_enlarged_pipe_when_the_system_allows_it() {
+        let (read_file, write_fd) = make_pipe().unwrap();
+        // SAFETY: `F_GETPIPE_SZ` takes no argument and only reads a property of
+        // the open descriptor it is given.
+        let capacity = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&read_file), libc::F_GETPIPE_SZ) };
+        let capacity = usize::try_from(capacity).unwrap();
+        let max = std::fs::read_to_string("/proc/sys/fs/pipe-max-size").ok().and_then(|s| s.trim().parse::<usize>().ok());
+
+        assert!(capacity >= PIPE_DEFAULT_BYTES);
+        if max.is_none_or(|max| max > PIPE_DEFAULT_BYTES) {
+            assert!(capacity > PIPE_DEFAULT_BYTES, "the ingest pipe should be enlarged, got {capacity}");
+        }
+        // Either way it works: the bytes come out as they went in.
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(b"through the tuned pipe").unwrap();
+        drop(writer);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut &read_file, &mut got).unwrap();
+        assert_eq!(got, "through the tuned pipe");
+    }
+
     fn gate_with_one_permit() -> (Arc<ReaderGate>, Option<ReaderPermit>) {
         let gate = Arc::new(ReaderGate::new(1));
         let permit = gate.try_acquire();

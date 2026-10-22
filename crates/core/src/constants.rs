@@ -56,9 +56,23 @@ pub const PAYLOAD_PREALLOC_CAP_BYTES: usize = 16 * 1024 * 1024;
 // --- Kernel Streaming (splice/tee) ---
 // Bytes moved per `splice(2)`/`tee(2)` round, and the size of the fixed stack
 // buffer the user-space fallback and the fingerprint tap read through. It is
-// the default capacity of a Linux pipe (16 pages), so one round empties a full
-// pipe; a larger value could not move more per call.
+// the default capacity of a Linux pipe (16 pages): the unit the fallback copy
+// works in. The kernel path moves up to `SPLICE_ROUND_BYTES` per round.
 pub const SPLICE_CHUNK_BYTES: usize = 64 * 1024;
+
+// --- Pipe Capacity Tuning (core::pipe) ---
+// What the kernel gives a new pipe (16 pages). Below it, tuning is a no-op.
+pub const PIPE_DEFAULT_BYTES: usize = 64 * 1024;
+// Capacity requested with `fcntl(F_SETPIPE_SZ)`: the unprivileged ceiling
+// (`/proc/sys/fs/pipe-max-size`) on a stock kernel. Sixteen times the default
+// means a writer blocks, and a context switch is paid, one sixteenth as often.
+// A refusal is never an error: `core::pipe::grow` steps down towards what the
+// system allows.
+pub const PIPE_TARGET_BYTES: usize = 1024 * 1024;
+// Bytes `tee(2)`/`splice(2)` move per round in `core::splice`. It follows the
+// pipe target: on a grown pipe one round empties a full pipe; on a pipe that
+// could not be grown a round simply moves what is there.
+pub const SPLICE_ROUND_BYTES: usize = PIPE_TARGET_BYTES;
 
 // --- Content-Defined Chunking (core::cdc) ---
 // Bounds of a FastCDC chunk. The minimum is one SQLite page, so no chunk is

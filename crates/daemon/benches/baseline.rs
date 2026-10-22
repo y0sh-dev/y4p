@@ -11,7 +11,7 @@
 //! cargo test  --workspace --all-targets           # smoke mode: one pass, no timing claims
 //! ```
 //!
-//! What is measured, and why these eight groups:
+//! What is measured, and why these eleven groups:
 //!
 //! | Group     | Subject                                                     |
 //! | :-------- | :---------------------------------------------------------- |
@@ -23,10 +23,15 @@
 //! | ingest    | pipe -> database end to end, in memory versus spooled; memory bound |
 //! | transcode | raster image: spool file -> converted bytes, heap road versus descriptor to descriptor |
 //! | sqlite    | insert, insert + rotation, duplicate hit, metadata scans      |
+//! | cdc       | FastCDC chunking throughput and allocations, 4 KiB - 16 MiB; chunking + SHA3; edit deduplication |
+//! | pipe      | pipe capacity 64 KiB versus 1 MiB (`F_SETPIPE_SZ`): read loop, splice, splice + tee + sha3, sendfile egress; with context switches |
+//! | chunked   | chunked payloads in SQLite: fresh insert, edited-copy insert (deduplicated), reassembly, deep search |
 //!
 //! Besides time, every row reports allocation calls and bytes per operation
 //! (a counting global allocator wraps `System`), the quantity the zero-copy
-//! milestones (v0.7.2 - v0.8.0) are meant to reduce.
+//! milestones (v0.7.2 - v0.8.0) are meant to reduce. The `pipe` group also
+//! reports context switches per operation (`getrusage(2)`, voluntary plus
+//! involuntary, all threads), the cost that a larger pipe is meant to cut.
 //!
 //! **Safety of the environment.** The SQLite group opens the real storage
 //! layer, which resolves its paths from `XDG_*`. The harness therefore never
@@ -36,12 +41,13 @@
 //! lies inside it. The user's clipboard history cannot be read or modified.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashSet;
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Write as _};
 use std::hint::black_box;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
@@ -52,6 +58,8 @@ use std::time::{Duration, Instant};
 use sha3::{Digest, Sha3_256};
 use y4p_core as core;
 use y4p_core::payload::{read_bounded, route_payload, to_hex, Payload, PayloadReader, SpooledFile, StreamDescriptor};
+use y4p_core::cdc::FastCdc;
+use y4p_core::pipe::grow_to;
 use y4p_core::splice::{copy_to_file, copy_to_file_buffered, ByteTap, NoTap};
 use y4p_daemon::metrics::DaemonMetrics;
 use y4p_daemon::spool::{transcode_spooled, FileSpooler};
@@ -154,6 +162,8 @@ struct Row {
     payload_bytes: u64,
     allocs_per_op: f64,
     alloc_bytes_per_op: f64,
+    /// Context switches per operation, for the groups that measure them.
+    switches_per_op: Option<f64>,
 }
 
 impl Row {
@@ -184,7 +194,7 @@ impl Mode {
         let alloc_bytes = (bytes1 - bytes0) as f64;
 
         if !self.full {
-            return Row { group, name: name.into(), median_ns: 0.0, min_ns: 0.0, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes };
+            return Row { group, name: name.into(), median_ns: 0.0, min_ns: 0.0, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes, switches_per_op: None };
         }
 
         let mut pass = |iters: u64| -> Duration {
@@ -200,7 +210,7 @@ impl Mode {
         }
         let mut samples: Vec<f64> = (0..ROUNDS).map(|_| pass(iters).as_nanos() as f64 / iters as f64).collect();
         let min_ns = minimum(&samples);
-        Row { group, name: name.into(), median_ns: median(&mut samples), min_ns, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes }
+        Row { group, name: name.into(), median_ns: median(&mut samples), min_ns, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes, switches_per_op: None }
     }
 
     /// Times a stateful batch of `ops` operations per round on a shared
@@ -239,20 +249,21 @@ impl Mode {
         }
         let min_ns = minimum(&samples);
         let median_ns = if self.full { median(&mut samples) } else { 0.0 };
-        Ok(Row { group, name: name.into(), median_ns, min_ns: if self.full { min_ns } else { 0.0 }, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes })
+        Ok(Row { group, name: name.into(), median_ns, min_ns: if self.full { min_ns } else { 0.0 }, payload_bytes, allocs_per_op: allocs, alloc_bytes_per_op: alloc_bytes, switches_per_op: None })
     }
 }
 
 fn print_header() {
-    println!("| group | case | median ns/op | min ns/op | MiB/s | allocs/op | alloc B/op |");
-    println!("| :--- | :--- | ---: | ---: | ---: | ---: | ---: |");
+    println!("| group | case | median ns/op | min ns/op | MiB/s | allocs/op | alloc B/op | ctx sw/op |");
+    println!("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |");
 }
 
 fn print_row(row: &Row) {
     let rate = row.mib_per_s().map_or_else(|| "-".to_owned(), |v| format!("{v:.0}"));
+    let switches = row.switches_per_op.map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"));
     println!(
-        "| {} | {} | {:.1} | {:.1} | {} | {:.1} | {:.0} |",
-        row.group, row.name, row.median_ns, row.min_ns, rate, row.allocs_per_op, row.alloc_bytes_per_op
+        "| {} | {} | {:.1} | {:.1} | {} | {:.1} | {:.0} | {} |",
+        row.group, row.name, row.median_ns, row.min_ns, rate, row.allocs_per_op, row.alloc_bytes_per_op, switches
     );
 }
 
@@ -835,6 +846,7 @@ fn throughput(mode: &Mode, len: usize, messages: u64) -> Result<Row, String> {
         payload_bytes: len as u64,
         allocs_per_op: allocs,
         alloc_bytes_per_op: alloc_bytes,
+        switches_per_op: None,
     })
 }
 
@@ -988,6 +1000,335 @@ fn bench_sqlite(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// cdc: the FastCDC engine on its own (v0.7.5)
+// ---------------------------------------------------------------------------
+
+/// Printable ASCII, so a payload is valid UTF-8 and takes the text road in the
+/// storage layer, while still being content-rich enough for boundaries to fall
+/// where the content puts them.
+fn prose(len: usize, seed: u64) -> Vec<u8> {
+    payload(len, seed).into_iter().map(|b| b' ' + b % 95).collect()
+}
+
+/// Bytes of distinct chunks among `payloads`: what a deduplicating store keeps.
+fn unique_chunk_bytes(payloads: &[&[u8]]) -> (usize, usize, usize) {
+    let mut seen = HashSet::new();
+    let (mut total, mut unique_bytes, mut chunks) = (0usize, 0usize, 0usize);
+    for data in payloads {
+        for chunk in FastCdc::new(data) {
+            total += chunk.len();
+            chunks += 1;
+            if seen.insert(Sha3_256::digest(chunk).to_vec()) {
+                unique_bytes += chunk.len();
+            }
+        }
+    }
+    (total, unique_bytes, chunks)
+}
+
+/// Largest payload of the v0.7.5 - v0.7.7 groups. Smoke mode (`cargo test`, an
+/// unoptimised build) stays at 1 MiB: it only has to prove each case runs.
+fn top_size(mode: &Mode) -> usize {
+    if mode.full { 16 * 1024 * 1024 } else { 1024 * 1024 }
+}
+
+fn bench_cdc(mode: &Mode, rows: &mut Vec<Row>, facts: &mut Vec<String>) {
+    let top = top_size(mode);
+    let mut walk_sizes = vec![4 * 1024usize, 64 * 1024, 1024 * 1024];
+    if top > 1024 * 1024 {
+        walk_sizes.push(top);
+    }
+    for len in walk_sizes {
+        let data = prose(len, 0xcdc0);
+        let (count, min, max) = FastCdc::new(&data).fold((0usize, usize::MAX, 0usize), |(n, lo, hi), c| (n + 1, lo.min(c.len()), hi.max(c.len())));
+        let label = size_label(len);
+        facts.push(format!("cdc {label}: {count} chunks, mean {} B, min {min} B, max {max} B", len / count.max(1)));
+        rows.push(mode.micro("cdc", format!("FastCdc walk {label} ({count} chunks)"), len as u64, || {
+            FastCdc::new(black_box(&data)).map(<[u8]>::len).sum::<usize>()
+        }));
+    }
+    let hashed_sizes: &[usize] = if top > 1024 * 1024 { &[1024 * 1024, 16 * 1024 * 1024] } else { &[1024 * 1024] };
+    for &len in hashed_sizes {
+        let data = prose(len, 0xcdc2);
+        rows.push(mode.micro("cdc", format!("FastCdc + SHA3-256 per chunk {} (storage write path minus SQL)", size_label(len)), len as u64, || {
+            FastCdc::new(black_box(&data)).map(|c| Sha3_256::digest(c)[0]).fold(0u8, u8::wrapping_add)
+        }));
+    }
+
+    // Deduplication after an edit: what a store keeps for original + edited copy.
+    // Hashes ~100 MiB, so it belongs to the full measurement only.
+    if !mode.full {
+        return;
+    }
+    let original = prose(16 * 1024 * 1024, 0xcdc3);
+    for (label, position, inserted) in [("1 byte inserted mid-way", original.len() / 2, 1usize), ("1 byte inserted at the front", 0, 1), ("4 KiB inserted mid-way", original.len() / 2, 4096)] {
+        let mut edited = original.clone();
+        let filler = prose(inserted, 0xed17);
+        edited.splice(position..position, filler);
+        let (total, kept, _) = unique_chunk_bytes(&[&original, &edited]);
+        let first = unique_chunk_bytes(&[&original]).1;
+        facts.push(format!(
+            "cdc dedup, 16 MiB original + edited copy ({label}): {total} B offered, {kept} B kept; the copy added {} B ({:.3} % of it)",
+            kept - first,
+            (kept - first) as f64 * 100.0 / edited.len() as f64
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pipe: F_SETPIPE_SZ, 64 KiB (the kernel default) against 1 MiB (v0.7.7)
+// ---------------------------------------------------------------------------
+
+/// Context switches of this process so far (voluntary + involuntary, all threads).
+fn context_switches() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` is a valid, writable `rusage` for `getrusage(2)` to fill;
+    // the all-zero pattern is a valid value of that plain-integer C struct, so
+    // reading it back is sound even if the call were to fail.
+    let usage = unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+        usage.assume_init()
+    };
+    u64::try_from(usage.ru_nvcsw).unwrap_or(0) + u64::try_from(usage.ru_nivcsw).unwrap_or(0)
+}
+
+/// Context switches per call of `f`, averaged over `reps` calls.
+fn switches_per_op<R>(mode: &Mode, f: &mut impl FnMut() -> R) -> f64 {
+    let reps = if mode.full { 20u64 } else { 1 };
+    let before = context_switches();
+    for _ in 0..reps {
+        black_box(f());
+    }
+    (context_switches().saturating_sub(before)) as f64 / reps as f64
+}
+
+/// Same as `fed_pipe`, with the pipe's capacity set first: `None` leaves the
+/// kernel default (64 KiB), `Some(n)` asks for `n` (the 1 MiB target).
+fn fed_pipe_sized(data: &Arc<Vec<u8>>, capacity: Option<usize>) -> Option<(File, std::thread::JoinHandle<()>)> {
+    let (reader, mut writer) = std::io::pipe().ok()?;
+    if let Some(bytes) = capacity {
+        grow_to(&writer, bytes)?;
+    }
+    let reader = File::from(OwnedFd::from(reader));
+    let data = Arc::clone(data);
+    let handle = std::thread::spawn(move || {
+        let _ = writer.write_all(&data);
+    });
+    Some((reader, handle))
+}
+
+/// A file of `len` bytes to serve with `sendfile(2)`, kept open for the run.
+fn egress_source(data: &[u8]) -> Option<(File, PathBuf)> {
+    let (mut file, path) = bench_file()?;
+    file.write_all(data).ok()?;
+    drop(file);
+    Some((File::open(&path).ok()?, path))
+}
+
+/// `sendfile(2)` of the whole of `src` into a pipe whose capacity is `capacity`,
+/// drained by a reader thread in 64 KiB reads (a paste target such as `wl-paste`).
+fn sendfile_egress(src: &File, len: usize, capacity: Option<usize>) -> usize {
+    let Ok((mut reader, writer)) = std::io::pipe() else { return 0 };
+    if let Some(bytes) = capacity
+        && grow_to(&writer, bytes).is_none()
+    {
+        return 0;
+    }
+    let drain = std::thread::spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    });
+    let mut offset: libc::off_t = 0;
+    while (offset as usize) < len {
+        // SAFETY: both descriptors are open for the whole call (`src` is borrowed
+        // and `writer` is a local), and `offset` is a valid `&mut off_t`.
+        let n = unsafe { libc::sendfile(writer.as_raw_fd(), src.as_raw_fd(), &mut offset, 1 << 30) };
+        if n <= 0 {
+            break;
+        }
+    }
+    drop(writer);
+    drain.join().unwrap_or(0)
+}
+
+fn bench_pipe(mode: &Mode, rows: &mut Vec<Row>, facts: &mut Vec<String>) {
+    let limit = core::constants::MAX_PAYLOAD_BYTES;
+    let target = core::constants::PIPE_TARGET_BYTES;
+    let granted = std::io::pipe().ok().and_then(|(_, w)| grow_to(&w, target));
+    facts.push(format!("pipe: requested {target} B, this system granted {} B (default {} B)", granted.unwrap_or(0), core::constants::PIPE_DEFAULT_BYTES));
+
+    let top = top_size(mode);
+    let sizes: &[usize] = if top == 1024 * 1024 { &[1024 * 1024] } else { &[1024 * 1024, 16 * 1024 * 1024] };
+    for &len in sizes {
+        let data = Arc::new(payload(len, 0xb1be));
+        let label = size_label(len);
+        for (cap_label, capacity) in [("64 KiB pipe", None), ("1 MiB pipe", Some(target))] {
+            let mut cases: Vec<(String, Box<dyn FnMut() -> u64 + '_>)> = Vec::new();
+            cases.push((format!("write -> read(64 KiB) loop {label}, {cap_label}"), Box::new(|| {
+                let Some((mut src, handle)) = fed_pipe_sized(&data, capacity) else { return 0 };
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total = 0u64;
+                while let Ok(n) = src.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    total += n as u64;
+                }
+                let _ = handle.join();
+                total
+            })));
+            cases.push((format!("pipe -> file {label}: splice only, {cap_label}"), Box::new(|| {
+                let (Some((mut src, handle)), Some((mut dst, path))) = (fed_pipe_sized(&data, capacity), bench_file()) else { return 0 };
+                let copied = copy_to_file(&mut src, &mut dst, limit, &mut NoTap).map_or(0, |c| c.len);
+                let _ = handle.join();
+                let _ = std::fs::remove_file(path);
+                copied
+            })));
+            cases.push((format!("pipe -> file {label}: splice + tee + sha3, {cap_label}"), Box::new(|| {
+                let (Some((mut src, handle)), Some((mut dst, path))) = (fed_pipe_sized(&data, capacity), bench_file()) else { return 0 };
+                let tap = &mut Sha3Tap(Sha3_256::new());
+                let copied = copy_to_file(&mut src, &mut dst, limit, tap).map_or(0, |c| c.len);
+                black_box(std::mem::replace(&mut tap.0, Sha3_256::new()).finalize());
+                let _ = handle.join();
+                let _ = std::fs::remove_file(path);
+                copied
+            })));
+            for (name, mut case) in cases {
+                let mut row = mode.micro("pipe", name, len as u64, &mut case);
+                row.switches_per_op = Some(switches_per_op(mode, &mut case));
+                rows.push(row);
+            }
+        }
+
+        // Egress: the paste target's pipe, filled with sendfile(2).
+        if let Some((src, path)) = egress_source(&data) {
+            for (cap_label, capacity) in [("64 KiB pipe", None), ("1 MiB pipe", Some(target))] {
+                let mut case = || sendfile_egress(&src, len, capacity);
+                let mut row = mode.micro("pipe", format!("egress sendfile file -> pipe -> read(64 KiB) {label}, {cap_label}"), len as u64, &mut case);
+                row.switches_per_op = Some(switches_per_op(mode, &mut case));
+                rows.push(row);
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// chunked: content-defined chunk storage in SQLite (v0.7.6)
+// ---------------------------------------------------------------------------
+
+/// Payloads built before the timed region, consumed one per operation, so every
+/// insert is unique by content and none pays for generating its bytes.
+struct ChunkCtx {
+    db: ClipboardDb,
+    payloads: Vec<Vec<u8>>,
+    next: usize,
+    hash: String,
+    counter: u64,
+    base_id: i64,
+}
+
+impl ChunkCtx {
+    fn insert_next(&mut self) -> Result<(), String> {
+        let data = self.payloads.get(self.next).ok_or("ran out of prepared payloads")?;
+        self.next += 1;
+        self.counter += 1;
+        self.hash.clear();
+        let _ = write!(self.hash, "{:064x}", self.counter);
+        self.db.insert_with_hash("text/plain", data, &self.hash, 1_000_000).map(|_| ())
+    }
+}
+
+fn bench_chunked(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
+    let mut ctx = ChunkCtx { db: ClipboardDb::open()?, payloads: Vec::new(), next: 0, hash: String::with_capacity(64), counter: 0, base_id: 0 };
+    let wipe = |c: &mut ChunkCtx| c.db.wipe().map_err(|e| format!("wipe failed: {e}"));
+
+    let top = top_size(mode);
+    for (len, full_ops) in [(64 * 1024usize, 100u64), (1024 * 1024, 20), (16 * 1024 * 1024, 3)] {
+        if len > top {
+            continue;
+        }
+        let ops = if mode.full { full_ops } else { 1 };
+        let label = size_label(len);
+        let seed = std::cell::Cell::new(0x5eed_u64);
+
+        // Fresh content: every chunk is new, so every chunk is written.
+        rows.push(mode.batched(
+            "chunked", format!("insert {label} text, all chunks new"), ops, len as u64, &mut ctx,
+            |c| {
+                wipe(c)?;
+                c.next = 0;
+                c.payloads = (0..ops).map(|_| { seed.set(seed.get() + 1); prose(len, seed.get()) }).collect();
+                Ok(())
+            },
+            ChunkCtx::insert_next,
+        )?);
+
+        // An edited copy of a stored payload: almost every chunk already exists.
+        let base = prose(len, 0xba5e);
+        rows.push(mode.batched(
+            "chunked", format!("insert {label} text, edited copy of a stored one (chunks shared)"), ops, len as u64, &mut ctx,
+            |c| {
+                wipe(c)?;
+                c.next = 0;
+                c.hash.clear();
+                let _ = write!(c.hash, "{:064x}", u64::MAX);
+                c.db.insert_with_hash("text/plain", &base, &c.hash, 1_000_000)?;
+                c.payloads = (0..ops as usize).map(|k| {
+                    let mut edited = base.clone();
+                    edited.insert(len / 4 + k * 97, b'#');
+                    edited
+                }).collect();
+                Ok(())
+            },
+            ChunkCtx::insert_next,
+        )?);
+
+        // Reassembly of a stored payload.
+        rows.push(mode.batched(
+            "chunked", format!("reassemble {label} (get_content_by_id)"), ops.max(1) * 10, len as u64, &mut ctx,
+            |c| {
+                wipe(c)?;
+                c.hash.clear();
+                let _ = write!(c.hash, "{:064x}", u64::MAX - 1);
+                c.base_id = c.db.insert_with_hash("text/plain", &base, &c.hash, 1_000_000)?;
+                Ok(())
+            },
+            |c| match c.db.get_content_by_id(c.base_id) {
+                Some((_, bytes)) if bytes.len() == len => Ok(()),
+                _ => Err("reassembly returned the wrong payload".to_owned()),
+            },
+        )?);
+    }
+
+    // Deep search: a keyword that appears nowhere forces a pass over every chunked body.
+    let search_ops = if mode.full { 20u64 } else { 1 };
+    let query = vec!["zqxjk-not-in-the-text".to_owned()];
+    let bodies = if mode.full { 16u64 } else { 2 };
+    rows.push(mode.batched(
+        "chunked", format!("search_metadata over {bodies} x 1 MiB chunked text (no hit)"), search_ops, bodies * 1024 * 1024, &mut ctx,
+        |c| {
+            wipe(c)?;
+            for n in 0..bodies {
+                c.hash.clear();
+                let _ = write!(c.hash, "{:064x}", n + 7_000_000);
+                c.db.insert_with_hash("text/plain", &prose(1024 * 1024, 0x5ea0 + n), &c.hash, 1_000_000)?;
+            }
+            Ok(())
+        },
+        |c| if c.db.search_metadata(black_box(&query), 10).is_empty() { Ok(()) } else { Err("the absent keyword matched".to_owned()) },
+    )?);
+    wipe(&mut ctx)
+}
+
+// ---------------------------------------------------------------------------
 // Sandbox and entry point
 // ---------------------------------------------------------------------------
 
@@ -1052,9 +1393,15 @@ fn run_measurements(root: &Path) -> Result<(), String> {
     bench_splice(&mode, &mut rows);
     bench_ingest(&mode, &mut rows)?;
     bench_transcode(&mode, &mut rows)?;
+    let mut facts = Vec::new();
+    bench_cdc(&mode, &mut rows, &mut facts);
+    bench_pipe(&mode, &mut rows, &mut facts);
+    bench_chunked(&mode, &mut rows)?;
 
     print_header();
     rows.iter().for_each(print_row);
+    println!();
+    facts.iter().for_each(|fact| println!("- {fact}"));
     Ok(())
 }
 
