@@ -27,11 +27,12 @@ use ipc::Command;
 use metrics::DaemonMetrics;
 use worker::DbWorker;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::Duration;
 use std::sync::Arc;
+use wayland_client::backend::{ReadEventsGuard, WaylandError};
 
 /// Initialise and run the clipboard daemon with a unified, high-performance event loop.
 ///
@@ -164,13 +165,47 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         }
 
         if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }
+        // `POLLHUP` is not the only way a connection ends. The backend stores
+        // the first fatal error it meets (end of file, a protocol error, ...)
+        // and fails every later read with it at once, whatever the socket
+        // looks like. If the socket stays readable (`POLLIN` without `POLLHUP`)
+        // while that error is ignored, `poll` returns immediately and this loop
+        // spins at 100 % of a core. The read's own result is therefore the
+        // authority: a fatal one ends the loop.
         if poll_fds[0].revents & libc::POLLIN != 0
-        && let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read();
+            && let Some(guard) = event_queue.prepare_read()
+            && !read_compositor_events(guard)
+        {
+            break;
         }
     }
 
     true
+}
+
+/// Reads what the compositor has sent. `false` means the connection is gone
+/// and the event loop must stop; `true` means keep serving.
+///
+/// `WouldBlock` (another thread already read, or the wake-up was spurious) and
+/// `Interrupted` are not failures. Anything else is: an I/O error, including
+/// the `EPIPE` the backend reports for end of file, or a protocol error, after
+/// which the compositor drops the client anyway.
+fn read_compositor_events(guard: ReadEventsGuard) -> bool {
+    match guard.read() {
+        Ok(_) => true,
+        Err(error) if !read_failure_is_fatal(&error) => true,
+        Err(error) => {
+            eprintln!("{}lost the compositor connection: {}", LOG_ERROR, error);
+            false
+        }
+    }
+}
+
+fn read_failure_is_fatal(error: &WaylandError) -> bool {
+    match error {
+        WaylandError::Io(io) => !matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted),
+        WaylandError::Protocol(_) => true,
+    }
 }
 
 /// Bind the data-control device from the currently-known manager + seat, if
@@ -262,5 +297,67 @@ fn handle_restore_request(
         if state.verbose {
             println!("{}", log_restore(real_id as usize));
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use wayland_client::backend::protocol::ProtocolError;
+    use wayland_client::Connection;
+
+    fn io_error(kind: ErrorKind) -> WaylandError {
+        WaylandError::Io(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn a_transient_read_failure_is_not_fatal() {
+        assert!(!read_failure_is_fatal(&io_error(ErrorKind::WouldBlock)));
+        assert!(!read_failure_is_fatal(&io_error(ErrorKind::Interrupted)));
+    }
+
+    #[test]
+    fn a_dead_connection_is_fatal() {
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset, ErrorKind::UnexpectedEof, ErrorKind::NotConnected] {
+            assert!(read_failure_is_fatal(&io_error(kind)), "{kind:?} must end the event loop");
+        }
+        let protocol = ProtocolError { code: 0, object_id: 0, object_interface: String::new(), message: String::new() };
+        assert!(read_failure_is_fatal(&WaylandError::Protocol(protocol)));
+    }
+
+    /// A client connection over a socketpair whose "compositor" end we hold.
+    fn connection() -> (Connection, UnixStream) {
+        let (client, server) = UnixStream::pair().unwrap();
+        (Connection::from_socket(client).unwrap(), server)
+    }
+
+    fn poll_in(conn: &Connection) -> libc::c_short {
+        let mut fds = [libc::pollfd { fd: conn.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        // SAFETY: `fds` is a valid, correctly-sized array of one `pollfd`;
+        // a zero timeout makes the call return immediately.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+        assert!(ready >= 0);
+        fds[0].revents
+    }
+
+    #[test]
+    fn an_idle_connection_keeps_the_loop_running() {
+        let (conn, _server) = connection();
+        let queue = conn.new_event_queue::<()>();
+        assert_eq!(poll_in(&conn) & libc::POLLIN, 0);
+        // Nothing to read: a spurious wake-up is `WouldBlock`, which is fine.
+        assert!(read_compositor_events(queue.prepare_read().unwrap()));
+    }
+
+    #[test]
+    fn a_compositor_that_closed_its_end_stops_the_loop_instead_of_spinning() {
+        let (conn, server) = connection();
+        let queue = conn.new_event_queue::<()>();
+        drop(server);
+
+        // Readable at once (end of file), and the read has to report it.
+        assert_ne!(poll_in(&conn) & libc::POLLIN, 0, "a closed peer makes the socket readable");
+        assert!(!read_compositor_events(queue.prepare_read().unwrap()));
     }
 }

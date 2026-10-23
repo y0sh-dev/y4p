@@ -10,9 +10,9 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_source_v1::ExtDataControlSourceV1,
 };
 use std::sync::{Arc, Mutex, mpsc};
-use crate::core::constants::INGEST_MAX_CONCURRENT_READERS;
+use crate::core::constants::{INGEST_MAX_CONCURRENT_READERS, INGEST_QUEUE_BYTE_BUDGET};
 use crate::core::payload::{Payload, PayloadError};
-use crate::ingest::{IngestStats, ReaderGate};
+use crate::ingest::{BytePermit, ByteBudget, IngestStats, ReaderGate};
 use crate::spool::PayloadSpooler;
 
 pub struct OfferData {
@@ -40,22 +40,36 @@ pub struct SourceMetadata {
 /// threshold (and always for text, which it must normalise), and
 /// `Payload::Spooled` for a larger one it has already drained to a spool file
 /// (see `crate::spool`): the queue then carries a path and a digest, not the
-/// bytes, so what a full queue pins is bounded by the number of slots, not by
-/// the size of the payloads. Moving either through the queue moves a pointer.
+/// bytes, so what a full queue pins in memory is bounded by the number of
+/// slots, not by the size of the payloads (the byte budget, `permit` below,
+/// bounds the spool files too). Moving either through the queue moves a pointer.
+///
+/// `permit` is the job's share of the queue's byte budget
+/// (`crate::ingest::enqueue_bounded`). It is `None` until the job is queued
+/// that way; the worker drops it once the payload has been persisted or
+/// discarded, which is what frees the bytes for the next payload.
 pub struct ClipboardJob {
     pub mime: String,
     pub payload: Payload,
+    pub permit: Option<BytePermit>,
 }
 
 impl ClipboardJob {
     /// The common case, and the shape every caller had before payloads became
     /// polymorphic: a MIME and fully-materialised bytes.
     pub fn new(mime: String, data: Vec<u8>) -> Self {
-        Self { mime, payload: Payload::memory(data) }
+        Self::from_payload(mime, Payload::memory(data))
     }
 
     pub fn from_payload(mime: String, payload: Payload) -> Self {
-        Self { mime, payload }
+        Self { mime, payload, permit: None }
+    }
+
+    /// What this job counts for against the byte budget: its length when known
+    /// without I/O, otherwise nothing. Saturates on a (32-bit) overflow, which
+    /// then simply exceeds any budget.
+    pub fn accounted_bytes(&self) -> usize {
+        self.len_hint().map_or(0, |len| usize::try_from(len).unwrap_or(usize::MAX))
     }
 
     /// Length in bytes when known without I/O (see `Payload::len_hint`).
@@ -84,6 +98,8 @@ pub struct WaylandState {
     pub reader_gate: Arc<ReaderGate>,
     /// What overload has cost so far; read by the daemon for `y4p status`.
     pub ingest_stats: Arc<IngestStats>,
+    /// Ceiling on the payload bytes queued for the worker (see `crate::ingest`).
+    pub byte_budget: Arc<ByteBudget>,
     /// Where a large payload is drained to disk instead of into the heap
     /// (see `crate::spool`). `None`: every payload is read into memory.
     pub spooler: Option<Arc<dyn PayloadSpooler>>,
@@ -119,6 +135,7 @@ impl WaylandState {
             job_tx: Some(job_tx),
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
+            byte_budget: Arc::new(ByteBudget::new(INGEST_QUEUE_BYTE_BUDGET)),
             spooler: None,
             verbose,
             target_mime: None,
@@ -149,6 +166,7 @@ impl WaylandState {
             job_tx: None,
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
+            byte_budget: Arc::new(ByteBudget::new(INGEST_QUEUE_BYTE_BUDGET)),
             spooler: None,
             verbose,
             target_mime: Some(target_mime),

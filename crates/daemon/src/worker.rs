@@ -39,9 +39,11 @@ use std::sync::{mpsc, Arc};
 /// cache. Only a payload that belongs in a database row is read, once, by
 /// storage.
 ///
-/// The queue is bounded (`INGEST_QUEUE_CAPACITY`): when persistence, image
-/// conversion included, falls behind, producers wait and then shed rather than
-/// letting payloads accumulate (see `y4p_wayland::ingest`).
+/// The queue is bounded twice over (`INGEST_QUEUE_CAPACITY` payloads and
+/// `INGEST_QUEUE_BYTE_BUDGET` bytes, the latter held by each job's `permit`):
+/// when persistence, image conversion included, falls behind, producers wait
+/// and then shed rather than letting payloads accumulate (see
+/// `y4p_wayland::ingest`).
 pub struct DbWorker {
     tx: mpsc::SyncSender<ClipboardJob>,
 }
@@ -52,11 +54,16 @@ impl DbWorker {
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let ClipboardJob { mime, payload } = job;
+                let ClipboardJob { mime, payload, permit } = job;
                 let stored = match payload {
                     Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
                     payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
                 };
+                // Persisted, or discarded: either way the payload no longer
+                // occupies the queue's byte budget (its spool file was renamed
+                // into the cache or unlinked, its buffer dropped). Releasing it
+                // here, whatever `stored` says, is what lets a blocked reader in.
+                drop(permit);
                 match stored {
                     Ok(Some((mime, len))) => {
                         metrics.record_ingress();
