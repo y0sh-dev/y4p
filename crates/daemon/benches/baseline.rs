@@ -67,7 +67,7 @@ use y4p_daemon::worker::DbWorker;
 use y4p_image::transcode::{self, InputFormat, OutputFormat, Transcode};
 use y4p_storage::ClipboardDb;
 use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
-use y4p_wayland::ingest::{self, Enqueue, ReaderGate};
+use y4p_wayland::ingest::{self, ByteBudget, Enqueue, ReaderGate};
 use y4p_wayland::state::ClipboardJob;
 
 // ---------------------------------------------------------------------------
@@ -743,6 +743,23 @@ fn bench_queue(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
             (outcome, rx.try_recv().is_ok())
         }));
     }
+
+    // The same hand-off under the byte budget: one compare-and-swap to reserve,
+    // one atomic subtraction when the dequeued job (and its permit) is dropped.
+    let budget = Arc::new(ByteBudget::new(core::constants::INGEST_QUEUE_BYTE_BUDGET));
+    for len in [64usize, 4 * 1024] {
+        let (tx, rx) = sync_channel::<ClipboardJob>(capacity);
+        rows.push(mode.micro("queue", format!("enqueue_bounded + dequeue, {} payload", size_label(len)), 0, || {
+            let outcome = ingest::enqueue_bounded(&tx, &budget, job(len), Duration::ZERO);
+            (outcome, rx.try_recv().is_ok())
+        }));
+    }
+    // Cost of refusing work for want of bytes: the queue has room, the budget has none.
+    let tight = Arc::new(ByteBudget::new(64));
+    let held = tight.try_reserve(64).ok_or("could not fill the benchmark byte budget")?;
+    let (tx, _rx) = sync_channel::<ClipboardJob>(capacity);
+    rows.push(mode.micro("queue", "shed on a full byte budget (zero patience)", 0, || ingest::enqueue_bounded(&tx, &tight, job(64), Duration::ZERO)));
+    drop(held);
 
     // Cost of refusing work: the queue is full, nobody drains it, patience is zero.
     let (tx, rx) = sync_channel::<ClipboardJob>(capacity);
