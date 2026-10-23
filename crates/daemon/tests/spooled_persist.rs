@@ -26,6 +26,7 @@ use y4p_daemon::metrics::DaemonMetrics;
 use y4p_daemon::spool::FileSpooler;
 use y4p_daemon::worker::DbWorker;
 use y4p_storage::{ClipboardDb, ContentLocation};
+use y4p_wayland::ingest::{self, ByteBudget, Enqueue};
 use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
 use y4p_wayland::state::ClipboardJob;
 
@@ -198,6 +199,23 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     assert_eq!(path, cache_file(&corrupt_hash), "falling back keys the row by the original's digest");
     assert_eq!(fs::read(&path).unwrap(), corrupt, "no data may be lost when the conversion fails");
     assert_eq!(entries(&spool_dir), Vec::<String>::new(), "a failed conversion leaves no half-written file");
+
+    // --- 6. The byte budget: every outcome the worker can reach returns the bytes ---
+    // Persisted, deduplicated and refused-by-storage jobs all end in the
+    // worker dropping the job's permit; otherwise the budget would leak shut.
+    let budget = Arc::new(ByteBudget::new(8 << 20));
+    let fresh = pattern(1024 * 1024, 6);
+    let outcomes = [
+        ("application/octet-stream", fresh.clone()),
+        ("application/octet-stream", fresh), // duplicate of the first
+        ("image/x-secret", pattern(1024 * 1024, 7)), // declined by storage
+    ];
+    for (mime, bytes) in &outcomes {
+        let job = spooled_job(&spooler, mime, bytes);
+        assert_eq!(ingest::enqueue_bounded(&tx, &budget, job, Duration::from_secs(5)), Enqueue::Queued);
+    }
+    wait_for("the byte budget to be returned", || budget.used() == 0);
+    assert_eq!(entries(&spool_dir), Vec::<String>::new());
 
     drop(tx);
     drop(worker);

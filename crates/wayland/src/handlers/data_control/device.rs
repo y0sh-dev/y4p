@@ -14,7 +14,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::state::{WaylandState, OfferData, ClipboardJob};
-use crate::ingest::{self, Enqueue, IngestStats, ReaderPermit};
+use crate::ingest::{self, ByteBudget, Enqueue, IngestStats, ReaderPermit};
 use crate::spool::{PayloadSpooler, SpoolOutcome};
 use crate::core::constants::*;
 use crate::core::payload::{self, Payload, PayloadRoute, SpooledFile};
@@ -72,9 +72,12 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             };
 
             // Initialise data transfer pipe
-            let (read_file, write_fd) = match make_pipe() {
-                Some(p) => p,
-                None => return,
+            // `pipe(2)` fails with `EMFILE`/`ENFILE` once descriptors run out. The
+            // selection is lost either way, so it is counted and reported like
+            // every other shed; `permit` is released by the early return.
+            let Some((read_file, write_fd)) = make_pipe() else {
+                shed_unallocatable_pipe(&state.ingest_stats);
+                return;
             };
 
             // Request data transmission from the compositor
@@ -86,13 +89,14 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             if let Some(ref tx) = state.job_tx {
                 let job_tx_clone = tx.clone();
                 let stats = Arc::clone(&state.ingest_stats);
+                let budget = Arc::clone(&state.byte_budget);
                 let spooler = state.spooler.clone();
                 let enqueue_wait = Duration::from_millis(INGEST_ENQUEUE_WAIT_MS);
                 // `Builder::spawn` reports a refused thread instead of
                 // panicking like `thread::spawn`; the closure (and with it the
                 // pipe and the permit) is then dropped, which frees everything.
                 let spawned = std::thread::Builder::new().name("y4p-ingest".to_owned()).spawn(move || {
-                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, permit, enqueue_wait, spooler.as_deref());
+                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, &budget, permit, enqueue_wait, spooler.as_deref());
                 });
                 if spawned.is_err() {
                     let total = state.ingest_stats.record_shed_reader();
@@ -116,6 +120,14 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
     wayland_client::event_created_child!(WaylandState, ExtDataControlDeviceV1, [
         ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, OfferData { mimes: Arc::new(Mutex::new(Vec::new())) })
     ]);
+}
+
+/// Accounts for a selection that could not be read because no pipe could be
+/// allocated (descriptor exhaustion), and returns the running shed total.
+fn shed_unallocatable_pipe(stats: &IngestStats) -> u64 {
+    let total = stats.record_shed_reader();
+    ingest::report_shed("could not allocate pipe descriptors (EMFILE)", total);
+    total
 }
 
 /// Chooses which of an offer's `mimes` to request from the compositor.
@@ -167,11 +179,17 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
 /// keeps its readers' gate slots occupied: that is the backpressure which
 /// makes new selections get refused instead of piling up payloads in memory.
 /// A shed job is dropped here, which also unlinks its spool file.
+///
+/// The hand-over is [`ingest::enqueue_bounded`]: besides a queue slot, the
+/// payload needs room in `budget`, and the bytes it reserves travel with the
+/// job until the worker is done with it.
+#[allow(clippy::too_many_arguments)]
 fn ingest_and_send(
     read_file: std::fs::File,
     mime_to_get: String,
     job_tx: &SyncSender<ClipboardJob>,
     stats: &IngestStats,
+    budget: &Arc<ByteBudget>,
     _permit: Option<ReaderPermit>,
     enqueue_wait: Duration,
     spooler: Option<&dyn PayloadSpooler>,
@@ -188,9 +206,13 @@ fn ingest_and_send(
         None => return,
     };
 
-    if ingest::enqueue(job_tx, job, enqueue_wait) == Enqueue::Shed {
+    let bytes = job.accounted_bytes();
+    if ingest::enqueue_bounded(job_tx, budget, job, enqueue_wait) == Enqueue::Shed {
         let total = stats.record_shed_queue();
-        ingest::report_shed("worker queue full", total);
+        // A payload above the whole budget will never fit: say so, because
+        // retrying the copy cannot help, unlike a merely busy worker.
+        let reason = if bytes > budget.limit() { "payload exceeds the queue byte budget" } else { "worker queue or byte budget full" };
+        ingest::report_shed(reason, total);
     }
 }
 
@@ -352,6 +374,11 @@ mod tests {
         assert_eq!(got, "through the tuned pipe");
     }
 
+    /// A budget no test payload can exhaust, for the tests that are not about it.
+    fn roomy() -> Arc<ByteBudget> {
+        Arc::new(ByteBudget::new(usize::MAX))
+    }
+
     fn gate_with_one_permit() -> (Arc<ReaderGate>, Option<ReaderPermit>) {
         let gate = Arc::new(ReaderGate::new(1));
         let permit = gate.try_acquire();
@@ -366,7 +393,7 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO, None);
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
 
         let queued = rx.try_recv().unwrap();
         assert_eq!((queued.mime.as_str(), queued.payload.as_bytes()), ("text/plain", Some(b"hello".as_slice())));
@@ -383,7 +410,7 @@ mod tests {
 
         let wait = Duration::from_millis(30);
         let started = Instant::now();
-        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, permit, wait, None);
+        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, wait, None);
 
         assert!(started.elapsed() >= wait, "backpressure: the reader must wait before shedding");
         assert_eq!(stats.shed_queue(), 1);
@@ -403,7 +430,7 @@ mod tests {
             let stats = Arc::clone(&stats);
             let pipe = filled_pipe(b"newer");
             std::thread::spawn(move || {
-                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10), None);
+                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
             })
         };
 
@@ -424,7 +451,7 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO, None);
+        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(stats.shed_queue(), 0, "an empty read is not overload");
@@ -438,10 +465,82 @@ mod tests {
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, permit, Duration::from_secs(10), None);
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
 
         assert_eq!(stats.shed_queue(), 0, "shutdown is not shedding");
         assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn ingest_and_send_charges_the_queued_payload_to_the_byte_budget_until_the_job_is_dropped() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(2);
+        let budget = Arc::new(ByteBudget::new(1024));
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &IngestStats::default(), &budget, None, Duration::ZERO, None);
+
+        assert_eq!(budget.used(), 5);
+        drop(rx.try_recv().unwrap());
+        assert_eq!(budget.used(), 0, "the worker dropping the job returns the bytes");
+    }
+
+    #[test]
+    fn ingest_and_send_sheds_a_payload_that_exceeds_the_whole_budget_and_counts_it() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(2);
+        let stats = IngestStats::default();
+        let budget = Arc::new(ByteBudget::new(4));
+        let started = Instant::now();
+
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_secs(10), None);
+
+        assert!(started.elapsed() < Duration::from_secs(5), "an oversized payload must not be waited on");
+        assert_eq!(stats.shed_queue(), 1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn ingest_and_send_sheds_when_the_byte_budget_stays_full() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(2);
+        let stats = IngestStats::default();
+        let budget = Arc::new(ByteBudget::new(8));
+        let held = budget.try_reserve(6).unwrap();
+
+        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_millis(30), None);
+
+        assert_eq!(stats.shed_queue(), 1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(budget.used(), 6, "only the unrelated reservation remains");
+        drop(held);
+    }
+
+    #[test]
+    fn a_spooled_job_is_charged_for_its_file_and_a_shed_one_frees_it() {
+        let spooler = FakeSpooler::new(Behaviour::Spool);
+        let (tx, rx) = sync_channel::<ClipboardJob>(2);
+        let stats = IngestStats::default();
+        let budget = Arc::new(ByteBudget::new(150_000));
+
+        let (read_file, feeder) = fed_pipe(pattern(100_000));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+        assert_eq!(budget.used(), 100_000, "a spool file counts as much as a buffer");
+
+        let (read_file, feeder) = fed_pipe(pattern(100_000));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
+        feeder.join().unwrap();
+        assert_eq!(stats.shed_queue(), 1, "the second file does not fit next to the first");
+        assert_eq!(budget.used(), 100_000, "the shed job returned what it had reserved");
+
+        drop(rx.try_recv().unwrap());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(spooler.leftovers(), 0);
+    }
+
+    #[test]
+    fn a_missing_pipe_is_counted_as_a_shed_reader() {
+        let stats = IngestStats::default();
+        assert_eq!(shed_unallocatable_pipe(&stats), 1);
+        assert_eq!(shed_unallocatable_pipe(&stats), 2);
+        assert_eq!((stats.shed_readers(), stats.shed_queue()), (2, 0));
     }
 
     // --- spooled ingestion: head read, spooler hand-off, fallbacks ---
@@ -537,7 +636,7 @@ mod tests {
         let spooler = FakeSpooler::new(Behaviour::Spool);
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let (read_file, feeder) = fed_pipe(pattern(300_000));
-        ingest_and_send(read_file, "text/plain".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "text/plain".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert!(spooler.calls().is_empty());
         let job = only_job(&rx);
@@ -549,7 +648,7 @@ mod tests {
         let spooler = FakeSpooler::new(Behaviour::Spool);
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(INLINE_PAYLOAD_THRESHOLD_BYTES - 1);
-        ingest_and_send(filled_pipe(&data), "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        ingest_and_send(filled_pipe(&data), "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         assert!(spooler.calls().is_empty(), "a payload that ends inside the head is never spooled");
         let job = only_job(&rx);
         assert_eq!(job.payload.as_bytes(), Some(data.as_slice()));
@@ -561,7 +660,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(1 << 20);
         let (read_file, feeder) = fed_pipe(data.clone());
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
 
         assert_eq!(spooler.calls(), vec![(INLINE_PAYLOAD_THRESHOLD_BYTES, MAX_PAYLOAD_BYTES)]);
@@ -579,7 +678,7 @@ mod tests {
         let mut data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         data.extend(pattern(100_000));
         let (read_file, feeder) = fed_pipe(data);
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(only_job(&rx).mime, "image/png", "the bytes outrank the announced label");
     }
@@ -590,7 +689,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(200_000);
         let (read_file, feeder) = fed_pipe(data.clone());
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(spooler.calls().len(), 1);
         assert_eq!(only_job(&rx).payload.as_bytes(), Some(data.as_slice()), "no byte lost between head and remainder");
@@ -603,7 +702,7 @@ mod tests {
         let (gate, permit) = gate_with_one_permit();
         let stats = IngestStats::default();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, permit, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
         let _ = feeder.join();
         assert!(rx.try_recv().is_err());
         assert_eq!(stats.shed_queue(), 0);
@@ -619,7 +718,7 @@ mod tests {
         let (gate, permit) = gate_with_one_permit();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
 
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, permit, Duration::ZERO, Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
 
         assert_eq!(stats.shed_queue(), 1);
@@ -635,7 +734,7 @@ mod tests {
         drop(rx);
         let stats = IngestStats::default();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, None, Duration::from_secs(10), Some(&spooler));
+        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), None, Duration::from_secs(10), Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(stats.shed_queue(), 0);
         assert_eq!(spooler.leftovers(), 0);
