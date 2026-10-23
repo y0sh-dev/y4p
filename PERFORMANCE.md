@@ -1,4 +1,4 @@
-# PERFORMANCE — Baseline for the Zero-Copy Cycle (v0.7.1, extended in v0.7.2 - v0.7.7)
+# PERFORMANCE — Baseline for the Zero-Copy Cycle (v0.7.1, extended in v0.7.2 - v0.7.8)
 
 This document records the quantitative baseline against which the zero-copy milestones (v0.7.2 - v0.8.0) are judged: what the ingestion path costs today in time, allocations and memory, which bounds hold, and which targets the next milestones aim at. Numbers are measurements, not claims; every figure below was produced by the harness described in section 1 on the machine in section 2.
 
@@ -289,7 +289,7 @@ Reading the numbers:
 - **Control against drift.** The `splice only` rows of the old `splice` group, whose source pipes are not tuned, read 4.28 ms (16 MiB) against 4.19-4.25 ms for the same-day v0.7.5 tree: within 2 %, so the larger splice round costs nothing on a pipe that cannot hold it. (The 4.0 ms recorded on 2026-10-15 is a different session.)
 - **What this does not show.** The reader in the harness is a thread of the same process; a real paste target (`wl-paste`, a terminal) and a real compositor were not measured. A pipe's page buffers are allocated as it fills, not when it is enlarged; at most 8 ingestion readers and the egress threads hold such pipes at once.
 
-### 3.12 Evolution, v0.7.0 to v0.7.7
+### 3.12 Evolution, v0.7.0 to v0.7.8
 
 Figures are the medians recorded in the sections named; "-" means the milestone did not touch the metric.
 
@@ -306,11 +306,29 @@ Figures are the medians recorded in the sections named; "-" means the milestone 
 | CPU to insert 1 MiB of text | 0.87-0.93 ms | v0.7.6: **7.4 ms** (8.3x, hash-bound; 3.10) |
 | Context switches per MiB through a pipe | 31 | v0.7.7: **1** (3.11) |
 | Paste direction (`sendfile` to a pipe), 16 MiB | 825-862 us | v0.7.7: **533-564 us** (3.11) |
-| Queue enqueue + dequeue, 64 B / 4 KiB | 77-79 / 95 ns | 78.0-78.2 / 96.8-97.2 ns: unchanged (3.13) |
+| Queue enqueue + dequeue, 64 B / 4 KiB | 77-79 / 95 ns | v0.7.7: 78.0-78.2 / 96.8-97.2 ns, unchanged (3.13); v0.7.8: 83.0-83.8 / 98.0-99.6 ns (3.14) |
+| Bytes the queue may hold | 64 jobs of any size (up to 64 x 256 MiB) | v0.7.8: **64 MiB** in addition to the count; `enqueue_bounded` 99.3-101.0 / 111.5-115.3 ns (3.14, 4.2) |
 
 ### 3.13 Re-check of sections 3.1 - 3.8 at v0.7.7
 
 Three full runs. SHA3 digest of 1 MiB 6.32-6.33 ms (158 MiB/s; 6.31 ms recorded) and the 64 B fingerprint 0.885-0.888 us (0.90): unchanged. Single-thread queue rows 78.0-78.2 ns (64 B), 96.8-97.2 ns (4 KiB), 88.1-88.4 ns (shed), against 77.8-78.3, 96.8-98.8 and 86.4-88.7 at v0.7.4: unchanged. The spooled ingest rows reproduce (1 MiB 6.79-6.93 ms, 16 MiB 105.2-106.9 ms; same-day v0.7.5 control 6.88-6.91 and 106.6-106.8), and so does the 12 MiB descriptor transcode (216.8-221.2 ms; control 215.2-216.9, recorded 214.6-216.9 at v0.7.4: 0-3 %, one run at the top of the range). The SQLite rows that changed, and by how much, are in section 3.10. Every row that spawns a thread allocates 393 bytes more than the figures of sections 3.6 - 3.8 (644 against 251 bytes for `splice only`); the v0.7.5 tree run the same day shows the identical 644, so the difference is the toolchain's thread bookkeeping and not a change of these milestones.
+
+### 3.14 Queue byte budget (v0.7.8)
+
+`enqueue_bounded` reserves the payload's bytes in a lock-free `ByteBudget` (one compare-and-swap) before the queue slot, and the reservation rides in the job as a `BytePermit` that returns the bytes when the job is dropped. Three full runs of the harness, single thread, no contention:
+
+| Row | ns per operation (3 runs) | Allocations | Bytes |
+| :--- | ---: | ---: | ---: |
+| `enqueue` + dequeue, 64 B payload | 83.0 / 83.8 / 83.1 | 2 | 74 |
+| `enqueue_bounded` + dequeue, 64 B payload | 99.6 / 101.0 / 99.3 | 2 | 74 |
+| `enqueue` + dequeue, 4 KiB payload | 99.6 / 98.5 / 98.0 | 2 | 4,106 |
+| `enqueue_bounded` + dequeue, 4 KiB payload | 111.5 / 115.3 / 112.9 | 2 | 4,106 |
+| shed on a full byte budget (zero patience) | 83.8 / 86.0 / 83.9 | 2 | 74 |
+| shed on a full queue (zero patience) | 91.4 / 91.5 / 91.6 | 2 | 74 |
+
+- The reservation costs **about 16 ns** (a CAS, an `Arc` clone and, on the way out, an atomic subtraction) and **no allocation**: the allocation counts equal the unbounded rows. Next to an ingest that takes milliseconds (3.6) it is not measurable; it is recorded because the harness has recorded every queue row since v0.7.1.
+- **A regression to name:** the unchanged `enqueue` + dequeue row moved from 78.0-78.2 ns (v0.7.7) to **83.0-83.8 ns** (+6 %, above the 3 % floor) at 64 B and from 96.8-97.2 to 98.0-99.6 ns (+1-3 %) at 4 KiB. `ClipboardJob` gained a field (`permit: Option<BytePermit>`, 16 bytes), and the job is moved through the channel; no code on that path changed. This was not isolated further (no same-day v0.7.7 control was run), so the cause is an inference from the size of the move, not a measurement.
+- Refusing for want of bytes (83.9 ns) is cheaper than refusing for want of a slot (91.5 ns): the budget check fails before the job is offered to the channel.
 
 ---
 
@@ -327,19 +345,22 @@ Three full runs. SHA3 digest of 1 MiB 6.32-6.33 ms (158 MiB/s; 6.31 ms recorded)
 
 ### 4.2 Worst case, by construction
 
-The bounds are **counts**, not byte budgets; the worst-case resident payload memory is therefore a product, reached only if every slot holds a maximal payload:
+Until v0.7.7 the bounds were **counts** only, and the worst-case payload memory was a product, reached if every slot held a maximal payload. Since v0.7.8 the queue also has a byte budget:
 
 | Quantity | Constant | Value | Bound |
 | :--- | :--- | ---: | :--- |
 | Single payload | `MAX_PAYLOAD_BYTES` | 256 MiB | read with a +1 probe byte, oversized streams discarded |
 | Queued payloads | `INGEST_QUEUE_CAPACITY` | 64 | `sync_channel` capacity; the worker holds one more while it processes |
+| Queued bytes (v0.7.8) | `INGEST_QUEUE_BYTE_BUDGET` | 64 MiB | heap and spool files alike, counted from the moment a payload is queued until the worker has persisted or discarded it; a payload above the whole budget is shed without waiting |
 | Concurrent readers | `INGEST_MAX_CONCURRENT_READERS` | 8 | one thread, one pipe read end and one buffer each; checked **before** the pipe is created |
 | Queue patience | `INGEST_ENQUEUE_WAIT_MS` | 2000 ms | a reader keeps its gate slot while waiting, then sheds |
 | Image conversion | `IMAGE_CONCURRENCY_LIMIT` | 2 | plus the converter's own `-limit memory 256MiB` |
 
-Theoretical ceiling: (64 + 8 + 1) x 256 MiB. In practice clipboard payloads are kilobytes (text) to a few megabytes (screenshots), where the same bounds mean tens of megabytes. **The count bound is not a byte bound**; section 6 names the follow-up.
+Theoretical ceiling until v0.7.7: (64 + 8 + 1) x 256 MiB. Since v0.7.8 what is *queued or being processed* is at most 64 MiB; the 8 readers still hold their own payload before it is offered to the queue (a reader is not budgeted until it has finished reading), so the ceiling is 64 MiB + 8 x 256 MiB, about 2.1 GiB, and one more converted file (256 MiB) beside the job being converted. In practice clipboard payloads are kilobytes (text) to a few megabytes (screenshots), where the same bounds mean tens of megabytes.
 
-Since v0.7.3 that ceiling is a *heap* ceiling only for text, small payloads and the in-memory fallback. A large non-text payload is spooled to disk and queued as a path and a digest: the same product (72 x 256 MiB) then bounds **disk** space in the cache directory's `spool/`, and the heap stays flat (section 3.6). Disk is the cheaper resource, but the bound is as loose as the heap one was; a spool byte budget belongs with section 6, item 1. Since v0.7.4 the worker converting a spooled image briefly holds a second file besides the queued ones (the converted output, bounded by the same `MAX_PAYLOAD_BYTES`; the original is unlinked once it is in place), so the ceiling is (64 + 8 + 1) x 256 MiB. The converter's own scratch directory is separate and bounded by `-limit disk 1GiB`.
+One consequence: `MAX_PAYLOAD_BYTES` (256 MiB) is above the budget (64 MiB), so a payload between 64 and 256 MiB is read in full (or spooled in full) and then shed. Section 6, item 10.
+
+Since v0.7.3 that ceiling is a *heap* ceiling only for text, small payloads and the in-memory fallback. A large non-text payload is spooled to disk and queued as a path and a digest: the same product (72 x 256 MiB) then bounds **disk** space in the cache directory's `spool/`, and the heap stays flat (section 3.6). Disk is the cheaper resource; since v0.7.8 the byte budget counts a spool file exactly as it counts a buffer, so the *queued* part of that bound is 64 MiB as well. Since v0.7.4 the worker converting a spooled image briefly holds a second file besides the queued ones (the converted output, bounded by the same `MAX_PAYLOAD_BYTES`; the original is unlinked once it is in place), so the ceiling before v0.7.8 was (64 + 8 + 1) x 256 MiB. The converter's own scratch directory is separate and bounded by `-limit disk 1GiB`.
 
 File descriptors: at most 8 ingestion readers at any time, independent of how fast selections change. A reader that spools holds four (pipe read end, spool file, the two ends of the `tee` scratch pipe), so at most 32; a queued job holds none.
 
@@ -377,7 +398,7 @@ Proposals derived from the baseline above, to be agreed per milestone. "Baseline
 | Userspace copies, raster image | 3 | <= 1 (descriptor to `magick`) | **v0.7.4 Part 1: met** for spooled images (0; section 4.3), and time falls to the converter's own floor (section 3.7); a raster under the 4 KiB spool threshold keeps the in-memory road |
 | `unsafe` mapping and mirrored storage rules in the daemon | `MappedFile` (`mmap`/`munmap`), `core::cache_file_path`, `worker::stored_in_cache_file` | none | **v0.7.4 Part 2: met** (section 3.8) |
 | Resident memory after `wipe` | 74.4 MiB (VACUUM only) | back to the process's idle footprint | **v0.7.4 Part 2: met** (4.2 MiB; section 3.8) |
-| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | v0.7.5 - v0.7.8 (hardening; for spooled payloads the budget is disk, see section 4.2) |
+| Queue memory bound | 64 jobs, any size | byte budget (for example 64 MiB) in addition to the count | **v0.7.8: met** (`INGEST_QUEUE_BYTE_BUDGET` = 64 MiB, heap and spool files alike; +16 ns per enqueue, section 3.14) |
 | SHA3 throughput | 158 MiB/s | no regression; overlap with the transfer so that hashing no longer serialises behind it | **v0.7.3: met in the sense that matters**: no regression (154-159 MiB/s), and hashing runs on the ingestion threads in parallel instead of the single worker; a single stream is still hash-bound (section 3.6) |
 | Allocations to read a small text payload from a pipe | 3-9 | 1 | **v0.7.2: met** (section 3.5) |
 | Context switches per MiB through a pipe | 31 | <= 2 | **v0.7.7: met** (1.0-1.2; section 3.11) |
@@ -392,12 +413,13 @@ One consequence to plan around: because SHA3-256 costs about 6.3 ms per MiB agai
 
 ## 6. Open Questions Carried Forward
 
-1. **Byte budget for the queue.** `INGEST_QUEUE_CAPACITY` bounds the count only, and since v0.7.3 the products in section 4.2 bound disk (the spool directory) rather than heap for large payloads. A byte budget (an atomic counter of queued bytes) has what it needs: `Payload::len_hint` reports the size without I/O, and a `SpooledFile` knows its length. It is not implemented.
+1. ~~**Byte budget for the queue.**~~ Done in v0.7.8 (sections 3.14 and 4.2).
 2. **Hash cost.** At 154-159 MiB/s with `opt-level = "s"`, hashing dominates large payloads, and v0.7.3 shows it is the *only* thing that does (the kernel copy is 26-34 times faster). Overlapping it with the transfer is done; the remaining lever is a per-package `opt-level = 3` override for the Keccak crates in `[profile.release.package]`, which adds no crate but changes release-profile settings and therefore needs approval; the second has not been measured.
 3. **Disk-backed numbers.** The recorded run is on tmpfs. A run with `Y4P_BENCH_DIR` on the real data disk should be added once, because `fsync` behaviour changes the SQLite rows by orders of magnitude.
 4. **A large non-image payload meets the heap once.** `insert_spooled` reads a spooled PDF or archive into one `Vec` before SQLite copies it into the row. An incremental BLOB write (`zeroblob(n)` then `sqlite3_blob_open`, in 64 KiB steps) would keep it flat, but rusqlite's `blob` feature is a manifest change and was not requested; large non-image, non-text payloads are rare in a clipboard.
-5. **Two splice primitives.** `image::pipeline::{try_splice, splice_all}` (bare, tap-less, tested, unused by production code) and `core::splice` (bounded, fingerprinting, with the buffered fallback) overlap. Folding the first into the second is a refactoring for a `.N.5`-`.N.8` release, not a feature.
+5. ~~**Two splice primitives.**~~ Done in v0.7.8: `try_splice` and `splice_all` now live in `core::splice` (sharing its `splice_once`), and `image::pipeline` re-exports them. One behaviour is unified rather than preserved: `try_splice` now also reports `EOPNOTSUPP` as "unsupported" (`Ok(None)`), as the rest of `core::splice` always did; before it was an `Err`. `splice_all` still moves 64 KiB per step.
 6. **Realistic images.** Section 3.7 uses incompressible noise to make the byte volume the label says. A screenshot-like image spends proportionally more of its time in `magick`'s encoder and less in the plumbing; the memory result is independent of content, the time result is not.
 7. **Chunk hashing doubles the hash cost of a large non-image payload** (section 3.10). The fingerprint and the per-chunk digests are both SHA3-256 over the same bytes. Levers, none applied: compute the chunk digests where the fingerprint is computed (the ingestion threads, in parallel, while the data streams) and pass them to storage; use a cheaper chunk key such as a 128-bit non-cryptographic hash with a byte comparison on a hit (no new crate, but a storage-format and trust decision); or raise the 4 KiB threshold so mid-sized payloads stay inline. Each needs approval because it changes the storage contract or the format.
 8. **Pipe tuning against a real compositor and a real paste target.** Section 3.11 measures the kernel and the daemon's own code with both ends in one process. An end-to-end run with a live Wayland session (`wl-copy` of a multi-megabyte selection into the daemon, `wl-paste` out of it) would confirm the egress figures; it needs a compositor and is not part of the harness.
 9. **The pipe budget of a user.** Each enlarged pipe counts against `/proc/sys/fs/pipe-user-pages-soft` (16,384 pages on this machine, 64 MiB); a pipe is 256 pages, so about 64 simultaneous 1 MiB pipes would exhaust it, after which the kernel refuses growth (handled: `EPERM` halves the request down to the default) and limits further pipes. With at most 8 readers plus the egress threads that is not reachable in normal use, but it has not been tested under a pipe-heavy load from other programs.
+10. **A payload between 64 and 256 MiB is read, then shed.** The byte budget (64 MiB) is below `MAX_PAYLOAD_BYTES` (256 MiB), and the budget is consulted when a payload is offered to the queue, after it has been fully read or spooled. The loss is the one the budget asks for, but the work (up to 256 MiB of pipe reads, splices and SHA3 at 6.3 ms per MiB) is spent first. Passing `min(MAX_PAYLOAD_BYTES, INGEST_QUEUE_BYTE_BUDGET)` as the read limit would shed such a stream at the 64 MiB mark instead; that is a change of the effective maximum payload size and needs approval.
