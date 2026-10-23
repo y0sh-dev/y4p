@@ -99,14 +99,20 @@ pub const DIGEST_LEN: usize = 32;
 
 // --- Ingestion Backpressure & Concurrency Bounds ---
 // Capacity of the bounded channel between the Wayland ingestion threads and
-// the database worker. A count, not a byte budget: the worst-case resident
-// payload memory is (INGEST_QUEUE_CAPACITY + INGEST_MAX_CONCURRENT_READERS)
-// * MAX_PAYLOAD_BYTES, reached only if every slot holds a maximal *in-memory*
-// payload (text, or anything while no spool directory is usable). A payload
-// that streams in past INLINE_PAYLOAD_THRESHOLD_BYTES is spooled to disk and
-// queued as a path and a digest: it costs a spool file, not heap, so the same
-// bound then applies to disk space, and the heap stays flat.
+// the database worker. A count: it bounds how many payloads wait, while
+// INGEST_QUEUE_BYTE_BUDGET (below) bounds how many bytes they hold between
+// them. A payload that streams in past INLINE_PAYLOAD_THRESHOLD_BYTES is
+// spooled to disk and queued as a path and a digest: it costs a spool file, not
+// heap, but the byte budget counts it all the same, so the disk it pins is
+// bounded too.
 pub const INGEST_QUEUE_CAPACITY: usize = 64;
+// Ceiling on the payload bytes queued but not yet persisted, in memory and in
+// spool files together. Without it the count bound alone still admits
+// INGEST_QUEUE_CAPACITY maximal payloads (64 * MAX_PAYLOAD_BYTES). A payload
+// larger than the whole budget can never be admitted and is shed at once
+// instead of being waited on. Note that this is below MAX_PAYLOAD_BYTES: a
+// payload between the two is read in full, then shed.
+pub const INGEST_QUEUE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 // Simultaneous ingestion readers (one thread, one pipe read end and one
 // payload buffer each). Checked *before* the pipe is allocated, so a burst of
 // selection changes can neither exhaust file descriptors (`EMFILE`) nor spawn
@@ -123,7 +129,7 @@ pub const INGEST_ENQUEUE_POLL_MS: u64 = 5;
 // only while the worker is already blocked in `recv`, so nearly every payload
 // would be shed. A zero reader limit would admit nobody. Both are build errors.
 const _: () = assert!(
-    INGEST_QUEUE_CAPACITY >= 1 && INGEST_MAX_CONCURRENT_READERS >= 1,
+    INGEST_QUEUE_CAPACITY >= 1 && INGEST_MAX_CONCURRENT_READERS >= 1 && INGEST_QUEUE_BYTE_BUDGET >= 1,
     "the ingestion bounds must admit at least one reader and one queued payload",
 );
 
