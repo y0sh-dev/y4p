@@ -36,14 +36,79 @@
 //! told apart from one that overflows, and an overflow is an error rather than
 //! a silent truncation. On any error `dst` may hold a partial copy; discarding
 //! it is the caller's job (see `payload::SpooledFile`, which unlinks on drop).
+//!
+//! [`try_splice`] and [`splice_all`] are the bare primitive underneath, for a
+//! caller that wants one `splice(2)` step, or a whole stream moved between two
+//! descriptors, with no limit, no tap and no buffered fallback of its own.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::ptr;
 
-use crate::constants::{SPLICE_CHUNK_BYTES, SPLICE_ROUND_BYTES};
+use crate::constants::{PIPELINE_CHUNK_BYTES, SPLICE_CHUNK_BYTES, SPLICE_ROUND_BYTES};
 use crate::payload::PayloadError;
+
+/// One `splice(2)` step: moves up to `len` bytes from `src` to `dst` inside
+/// the kernel, by handing over pipe pages instead of copying them through
+/// user space. [`copy_to_file`] builds on the same primitive and adds the
+/// byte limit, the `tee(2)` tap and the buffered fallback; this is the bare
+/// step, for callers that want a plain splice between two pipes or a pipe and
+/// a file.
+///
+/// The result separates three situations the caller must treat differently:
+///
+/// - `Ok(Some(n))`: `n` bytes were moved. `Some(0)` means end of input
+///   (`src` is drained and every writer is closed), as with `read(2)`.
+/// - `Ok(None)`: the kernel cannot splice between these two descriptors
+///   (`EINVAL`: neither side is a pipe, or `dst` is opened for append, ...;
+///   `ENOSYS`/`EOPNOTSUPP`: no `splice` at all, or not for this file system).
+///   Nothing was moved and nothing was consumed, so the caller can carry on
+///   with a plain user-space copy of the same descriptors. This is a
+///   capability answer, not a failure.
+/// - `Err(_)`: a real I/O failure (`EPIPE`, `EIO`, `EBADF`, ...) that a
+///   fallback copy would only run into again. Reported, never swallowed.
+///
+/// `EINTR` is retried. Both offsets are left null, so each descriptor's own
+/// position is used and advanced (required for pipes). The call blocks like
+/// the equivalent `read`/`write` would. A `len` of 0 returns `Ok(Some(0))`
+/// without a syscall, which callers must not mistake for EOF.
+pub fn try_splice<S: AsFd, D: AsFd>(src: &S, dst: &D, len: usize) -> io::Result<Option<usize>> {
+    if len == 0 {
+        return Ok(Some(0));
+    }
+    // The raw descriptors are borrowed from `src`/`dst`, which outlive the call.
+    match splice_once(src.as_fd().as_raw_fd(), dst.as_fd().as_raw_fd(), len) {
+        Ok(moved) => Ok(Some(moved)),
+        Err(error) if is_unsupported(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Splices `src` into `dst` until end of input, in `PIPELINE_CHUNK_BYTES`
+/// steps (the default pipe capacity), and returns the byte count.
+///
+/// `Ok(None)` is returned only when the very first step reports that
+/// splicing is unsupported for this pair: zero bytes have moved, so the
+/// caller can copy the whole stream the conventional way. Whether the kernel
+/// supports splicing depends on the descriptor types, which cannot change
+/// mid-stream; if it ever did, silently restarting a copy would duplicate or
+/// drop the bytes already moved, so that case is an `Err` instead.
+pub fn splice_all<S: AsFd, D: AsFd>(src: &S, dst: &D) -> io::Result<Option<u64>> {
+    let mut total = 0u64;
+    loop {
+        match try_splice(src, dst, PIPELINE_CHUNK_BYTES)? {
+            Some(0) => return Ok(Some(total)),
+            Some(moved) => total += moved as u64,
+            None if total == 0 => return Ok(None),
+            None => {
+                return Err(io::Error::other(format!(
+                    "splice became unsupported after {total} bytes had already been moved"
+                )));
+            }
+        }
+    }
+}
 
 /// Observer of a byte stream while it is being copied: the seam through which
 /// the daemon fingerprints a payload (SHA3-256) without this crate, or the
@@ -669,5 +734,108 @@ mod tests {
         assert_eq!(copied.len, data.len() as u64);
         assert_eq!((tap.seen, tap.value), (data.len() as u64, checksum_of(&data)));
         assert_eq!(read_back(&path), data);
+    }
+
+    // --- try_splice / splice_all: the bare primitive ---
+
+    #[test]
+    fn splice_all_moves_a_payload_between_two_pipes() {
+        let data = payload(40_000);
+        let (a_read, mut a_write) = io::pipe().unwrap();
+        let (mut b_read, b_write) = io::pipe().unwrap();
+        a_write.write_all(&data).unwrap();
+        drop(a_write);
+
+        assert_eq!(splice_all(&a_read, &b_write).unwrap(), Some(data.len() as u64));
+        drop(b_write);
+        let mut received = Vec::new();
+        b_read.read_to_end(&mut received).unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[test]
+    fn splice_all_drains_a_pipe_into_a_file_across_many_steps() {
+        let data = payload(5 * PIPELINE_CHUNK_BYTES + 123);
+        let (src, writer) = fed_pipe(data.clone());
+        let (dst, path) = dest("splice-all");
+
+        assert_eq!(splice_all(&src, &dst).unwrap(), Some(data.len() as u64));
+        writer.join().unwrap();
+        assert_eq!(read_back(&path), data);
+    }
+
+    #[test]
+    fn splice_all_of_a_closed_empty_pipe_reports_end_of_input() {
+        let (a_read, a_write) = io::pipe().unwrap();
+        let (_b_read, b_write) = io::pipe().unwrap();
+        drop(a_write);
+        assert_eq!(splice_all(&a_read, &b_write).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn try_splice_honours_the_requested_length() {
+        let (a_read, mut a_write) = io::pipe().unwrap();
+        let (mut b_read, b_write) = io::pipe().unwrap();
+        a_write.write_all(&payload(100)).unwrap();
+
+        assert_eq!(try_splice(&a_read, &b_write, 10).unwrap(), Some(10));
+        assert_eq!(try_splice(&a_read, &b_write, 1000).unwrap(), Some(90));
+        drop((a_write, b_write));
+        let mut received = Vec::new();
+        b_read.read_to_end(&mut received).unwrap();
+        assert_eq!(received, payload(100));
+    }
+
+    #[test]
+    fn a_zero_length_try_splice_makes_no_syscall_and_is_not_an_error() {
+        // A file/file pair would be EINVAL if the kernel were asked.
+        let (file, path) = dest("zero-len");
+        assert_eq!(try_splice(&file, &file, 0).unwrap(), Some(0));
+        read_back(&path);
+    }
+
+    #[test]
+    fn two_regular_files_are_unsupported_and_nothing_is_consumed() {
+        let data = payload(5_000);
+        let src_path = scratch_path("unsupported-src");
+        std::fs::write(&src_path, &data).unwrap();
+        let mut source = File::open(&src_path).unwrap();
+        let (mut sink, path) = dest("unsupported-dst");
+
+        // Neither side is a pipe: the kernel answers EINVAL, which must come
+        // back as a neutral `None`, not as an error.
+        assert!(try_splice(&source, &sink, 4096).unwrap().is_none());
+        assert!(splice_all(&source, &sink).unwrap().is_none());
+        assert_eq!(source.stream_position().unwrap(), 0, "nothing may have been consumed");
+
+        // ...and the conventional copy then takes over from the same descriptors.
+        assert_eq!(io::copy(&mut source, &mut sink).unwrap(), data.len() as u64);
+        assert_eq!(read_back(&path), data);
+        std::fs::remove_file(src_path).unwrap();
+    }
+
+    #[test]
+    fn a_dead_reader_is_a_real_error_not_a_silent_fallback() {
+        let (a_read, mut a_write) = io::pipe().unwrap();
+        let (b_read, b_write) = io::pipe().unwrap();
+        drop(b_read);
+
+        // A process forked by a concurrently running test holds a copy of every
+        // inheritable descriptor until its `exec`, so the reader can look alive
+        // for a moment after the drop. Feed one byte at a time (never filling
+        // the pipe, so nothing can block) until the kernel reports it.
+        let mut failure = None;
+        for _ in 0..10 {
+            a_write.write_all(&[1]).unwrap();
+            match try_splice(&a_read, &b_write, 1) {
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let error = failure.expect("the dead reader was never reported");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }
