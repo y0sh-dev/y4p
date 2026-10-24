@@ -15,8 +15,6 @@
 デーモンはひとつだけ。監視用と提供用でプロセスを分ける必要はありません。単一のバイナリが、クリップボードの監視、履歴の復元、そして永続化までを担います。
 データを失わない厳格な整合性と、多層防御のリソース制御を備え、テキスト、バイナリ、高解像度の画像までを一定の性能で扱います。
 
-[English README](README.md)
-
 </div>
 
 ---
@@ -134,14 +132,12 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 `y4p` はCargoワークスペースです。ルートのパッケージは薄い組み立て役（`src/main.rs`）に徹し、各ドメインは専用のクレートに分かれています。依存関係は常に `y4p-core` に向かって一方向に流れ、循環はコンパイラが拒否します。
 
-| クレート | 責務 |
-| :--- | :--- |
-| [`crates/core`](crates/core)（`y4p-core`） | 定数、XDGパス、`y4p.toml` パーサ、MIMEユーティリティ、終了フラグ |
-| [`crates/storage`](crates/storage)（`y4p-storage`） | SQLiteストア、スキーマのマイグレーション、ファイルシステム上のBLOBキャッシュ |
-| [`crates/image`](crates/image)（`y4p-image`） | 画像の判別、サンドボックス化された変換、サーキットブレーカー、同時実行制限 |
-| [`crates/wayland`](crates/wayland)（`y4p-wayland`） | `ext-data-control-v1` のハンドラとストリーミングI/O |
-| [`crates/daemon`](crates/daemon)（`y4p-daemon`） | イベントループ、IPCソケット、バックグラウンドワーカー（画像変換・ハッシュ計算・永続化） |
-| [`crates/cli`](crates/cli)（`y4p-cli`） | 厳格な引数解析、コマンドハンドラ、出力整形 |
+- **[`crates/core`](crates/core)（`y4p-core`）**: 定数、XDGパス、`y4p.toml` パーサ、MIMEユーティリティ、`Payload` の語彙、`splice(2)`・パイプ容量・FastCDC のプリミティブ、終了フラグ。
+- **[`crates/storage`](crates/storage)（`y4p-storage`）**: SQLiteストア、スキーマのマイグレーション、重複排除付きチャンク保存、ファイルシステム上のBLOBキャッシュ。
+- **[`crates/image`](crates/image)（`y4p-image`）**: 画像の判別、サンドボックス化された変換、サーキットブレーカー、同時実行制限。
+- **[`crates/wayland`](crates/wayland)（`y4p-wayland`）**: `ext-data-control-v1` のハンドラ、ストリーミングI/O、上限付きの取り込みキュー。
+- **[`crates/daemon`](crates/daemon)（`y4p-daemon`）**: イベントループ、IPCソケット、バックグラウンドワーカー（画像変換・ハッシュ計算・永続化）。
+- **[`crates/cli`](crates/cli)（`y4p-cli`）**: 厳格な引数解析、コマンドハンドラ、出力整形。
 
 ---
 
@@ -149,24 +145,14 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 このREADMEは、あえて短くまとめた入門ガイドです。
 
-デーモンがなぜ単一スレッドでI/Oを多重化するのか、Pin保護が履歴ローテーションとどう連携するのか、不変IDがなぜ必要なのか——そうした内部設計の「なぜ」は、`docs/` に技術文書としてまとめています（英語）。まずは概要からお読みください。
+デーモンがなぜ単一スレッドでI/Oを多重化するのか、Pin保護が履歴ローテーションとどう連携するのか、不変IDがなぜ必要なのか——そうした内部設計の「なぜ」は、`docs/` に技術文書としてまとめています（英語）。入口は [`docs/00_overview.md`](docs/00_overview.md) です。ワークスペースの構成、クレートの責務、依存の向き、取り込みのストリーム契約を扱い、`docs/` 全体への案内も兼ねています。
 
-| 文書 | テーマ |
-| :--- | :--- |
-| [`00_overview.md`](docs/00_overview.md) | ワークスペースの構成、クレートの責務、依存の向き、取り込みのストリーム契約 |
-| [`01_wayland_streaming_io.md`](docs/01_wayland_streaming_io.md) | 単一スレッドでのI/O多重化、上限付き読み取り、`provider_locks`、`sendfile(2)` によるゼロコピー送出 |
-| [`02_hybrid_storage_and_pin.md`](docs/02_hybrid_storage_and_pin.md) | SQLiteとキャッシュの分離、冪等なマイグレーション、Pinの絶対保護 |
-| [`03_concurrency_and_memory.md`](docs/03_concurrency_and_memory.md) | 単一ライターのワーカー、WAL、`open_read_only`、ペイロードのメモリ寿命 |
-| [`04_strict_cli_and_stable_id.md`](docs/04_strict_cli_and_stable_id.md) | MRU位置と不変IDの座標系、相関サブクエリによる検索、`--raw` の契約 |
-| [`05_filter_pipeline_and_app_rules.md`](docs/05_filter_pipeline_and_app_rules.md) | 取り込みゲートとMIME選択、送出、`y4p.toml` |
-| [`06_local_image_pipeline.md`](docs/06_local_image_pipeline.md) | マジックバイト判別、スクラッチのサンドボックス、階層的タイムアウト、サーキットブレーカー |
+プロジェクトの運営・計画・参照文書:
 
-プロジェクトの運営に関する文書:
-
-- [`.github/AI_POLICY.md`](.github/AI_POLICY.md) — 生成AI（LLM）の利用に関する方針（英語）。
-- [`PERFORMANCE.md`](PERFORMANCE.md) — 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
-- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md) — v0.8.0 へ向かう v0.7.x ゼロコピーのロードマップ（英語）。
-- [`README.md`](README.md) — 英語版README。
+- [`.github/AI_POLICY.md`](.github/AI_POLICY.md): 生成AI（LLM）の利用に関する方針（英語）。
+- [`PERFORMANCE.md`](PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
+- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md): v0.8.0 へ向かう v0.7.x ゼロコピーのロードマップ（英語）。
+- [`README.md`](README.md): 英語版README。
 
 ---
 

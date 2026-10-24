@@ -15,8 +15,6 @@
 It runs as a single daemon — no separate monitor process, no separate provider process — that watches the clipboard, serves history back out, and persists everything to disk.
 Engineered with strict zero-loss integrity and defence-in-depth resource controls, it seamlessly handles text streams, binary payloads, and high-resolution images with deterministic performance.
 
-[日本語版 README](README_ja.md)
-
 </div>
 
 ---
@@ -128,37 +126,25 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 `y4p` is a Cargo workspace. The root package is a thin composition root (`src/main.rs`); every domain lives in its own crate, and dependencies flow strictly inward towards `y4p-core`.
 
-| Crate | Responsibility |
-| :--- | :--- |
-| [`crates/core`](crates/core) (`y4p-core`) | Constants, XDG paths, `y4p.toml` parser, MIME helpers, exit flag |
-| [`crates/storage`](crates/storage) (`y4p-storage`) | SQLite store, schema migrations, filesystem blob cache |
-| [`crates/image`](crates/image) (`y4p-image`) | Image sniffing, sandboxed transcoding, circuit breaker, throttle |
-| [`crates/wayland`](crates/wayland) (`y4p-wayland`) | `ext-data-control-v1` handlers and streaming clipboard I/O |
-| [`crates/daemon`](crates/daemon) (`y4p-daemon`) | Event loop, IPC socket, background worker (image routing, hashing, persistence) |
-| [`crates/cli`](crates/cli) (`y4p-cli`) | Strict argument parsing, command handlers, output formatting |
+- **[`crates/core`](crates/core) (`y4p-core`)**: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, `splice(2)` / pipe-sizing / FastCDC primitives, exit flag.
+- **[`crates/storage`](crates/storage) (`y4p-storage`)**: SQLite store, schema migrations, deduplicated chunk storage, filesystem blob cache.
+- **[`crates/image`](crates/image) (`y4p-image`)**: image sniffing, sandboxed transcoding, circuit breaker, throttle.
+- **[`crates/wayland`](crates/wayland) (`y4p-wayland`)**: `ext-data-control-v1` handlers, streaming clipboard I/O, bounded ingestion queue.
+- **[`crates/daemon`](crates/daemon) (`y4p-daemon`)**: event loop, IPC socket, background worker (image routing, hashing, persistence).
+- **[`crates/cli`](crates/cli) (`y4p-cli`)**: strict argument parsing, command handlers, output formatting.
 
 ---
 
 ## Documentation
 
-The `docs/` directory contains the technical architecture documents. Start with the overview; each other file is a self-contained theme.
+The technical architecture lives in [`docs/00_overview.md`](docs/00_overview.md): workspace topology, crate responsibilities, dependency direction and the ingestion stream contract. It is the hub for the rest of `docs/`, and each document it links is a self-contained theme.
 
-| Document | Theme |
-| :--- | :--- |
-| [`00_overview.md`](docs/00_overview.md) | Workspace topology, crate responsibilities, dependency direction, the ingestion stream contract |
-| [`01_wayland_streaming_io.md`](docs/01_wayland_streaming_io.md) | Single-thread I/O multiplexing, bounded reads, `provider_locks`, zero-copy `sendfile(2)` egress |
-| [`02_hybrid_storage_and_pin.md`](docs/02_hybrid_storage_and_pin.md) | SQLite / cache bifurcation, idempotent migrations, absolute pin protection |
-| [`03_concurrency_and_memory.md`](docs/03_concurrency_and_memory.md) | Single-writer worker, WAL concurrency, `open_read_only`, payload memory lifecycle |
-| [`04_strict_cli_and_stable_id.md`](docs/04_strict_cli_and_stable_id.md) | MRU vs stable ID coordinate spaces, correlated-subquery search, the `--raw` contract |
-| [`05_filter_pipeline_and_app_rules.md`](docs/05_filter_pipeline_and_app_rules.md) | Ingress gate and MIME selection, dynamic egress, `y4p.toml` |
-| [`06_local_image_pipeline.md`](docs/06_local_image_pipeline.md) | Magic sniffing, scratch sandbox, hierarchical timeouts, circuit breaker |
+Project governance, planning and references:
 
-Project governance and planning:
-
-- [`.github/AI_POLICY.md`](.github/AI_POLICY.md) — Shared policies and guidelines on Generative AI (LLMs) usage.
-- [`PERFORMANCE.md`](PERFORMANCE.md) — Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
-- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md) — The v0.7.x zero-copy roadmap towards v0.8.0.
-- [`README_ja.md`](README_ja.md) — Japanese README (日本語版).
+- [`.github/AI_POLICY.md`](.github/AI_POLICY.md): Shared policies and guidelines on Generative AI (LLMs) usage.
+- [`PERFORMANCE.md`](PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
+- [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md): The v0.7.x zero-copy roadmap towards v0.8.0.
+- [`README_ja.md`](README_ja.md): Japanese README (日本語版).
 
 ---
 
