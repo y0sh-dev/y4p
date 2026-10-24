@@ -75,15 +75,31 @@ Visual progress checklist across the zero-copy development cycle:
     - Investigate SQLite incremental blob streaming (`sqlite3_blob_open`) for high-throughput zero-heap persistence.
     - Maintain strict schema compatibility, zero corruptions, and unpinned rotation invariants.
 
-- [ ] **v0.7.5 — v0.7.8: Benchmarking, Profiling & Fault Tolerance**
-  - Quantitative comparison against v0.7.0 baseline in `PERFORMANCE.md` (allocations, throughput, CPU time).
-  - Harden against broken pipes (`EPIPE`), compositor disconnects, malformed descriptors, and burst-induced `EMFILE`.
-  - Fine-tune pipe buffer sizes (`F_SETPIPE_SZ`) and splice chunk thresholds.
+- [x] **v0.7.5: FastCDC Chunking Engine**
+  - `core::cdc::FastCdc`, a content-defined chunker (4 / 16 / 64 KiB minimum / average / maximum, normalised chunking) that yields borrowed sub-slices.
+  - **3.23 GiB/s with zero heap allocation** at every payload size; chunking is 4.5 % of the chunk-and-hash cost.
+  - An edited 16 MiB text adds only 0.11-0.14 % new bytes to a store (`PERFORMANCE.md` section 7.5).
 
-- [ ] **v0.7.9: Documentation Distillation & Architecture Freeze**
-  - Distil zero-copy streaming contracts, pipe lifecycles, and failure matrices into `docs/` (`01` through `06`).
-  - Update architecture diagrams and sync `status.md`.
-  - Freeze workspace and prepare release candidate.
+- [x] **v0.7.6: Schema v4 Chunked Storage**
+  - `SCHEMA_VERSION = 4`: purely additive migration (`clipboard.is_chunked`, `chunks`, `manifest`); every existing row stays inline.
+  - Payloads above 4 KiB that are not images are stored as reference-counted chunks, released in the same transaction that deletes a row (rotation, `delete`, `wipe`). Reassembly is verified against the recorded size.
+  - Storage of an edited 16 MiB text: 33.55 MB to 16.80 MB. Cost, named openly: inserting a large non-image payload is 7-12x more CPU, hash-bound (`PERFORMANCE.md` section 9, item 5).
+
+- [x] **v0.7.7: Pipe Buffer Tuning & Benchmarking**
+  - `core::pipe::grow`: `F_SETPIPE_SZ` to 1 MiB with a tested fallback (`EPERM`/`ENOMEM` halve and retry; non-pipes untouched); `splice`/`tee` rounds of up to 1 MiB.
+  - Context switches per MiB through a pipe fall from 31 to 1; the paste direction is about 35 % faster. Hash-bound paths are unchanged, as predicted.
+  - Benchmark harness groups `cdc`, `pipe` and `chunked`, with context-switch counting and a same-day control run.
+
+- [x] **v0.7.8: Fault Tolerance & Resource Hardening**
+  - **Queue byte budget**: `INGEST_QUEUE_BYTE_BUDGET` = 64 MiB. Lock-free `ByteBudget` (CAS, overflow-safe) and RAII `BytePermit` carried in `ClipboardJob`; `enqueue_bounded` waits for room in the queue and the budget within the patience budget, and sheds a payload above the whole budget at once. The worker drops the permit once persistence returns. About 16 ns per enqueue, no extra allocation.
+  - **One splice module**: `try_splice` and `splice_all` moved to `core::splice`, re-exported from `image::pipeline`.
+  - **EMFILE diagnostics**: a pipe that cannot be allocated is counted (`record_shed_reader`) and logged.
+  - **Compositor disconnection**: a fatal `guard.read()` error ends the poll loop instead of spinning on `POLLIN`.
+
+- [x] **v0.7.9: Documentation Distillation & Architecture Freeze**
+  - Zero-copy streaming contracts, pipe lifecycles and failure matrices distilled into `docs/` (`00`, `01`, `02`, `03`, `06`): the byte budget, compositor-disconnect handling, `EMFILE` shed, dynamic pipe sizing, schema v4 chunk storage, unified splice.
+  - `PERFORMANCE.md` reorganised by domain, with a navigation table, an executive summary, the evolution table, memory bounds and the copy audit; resolved open questions removed.
+  - READMEs simplified; workspace version synchronised to `0.7.9` (README badges stay at `0.7.0` until the formal release).
 
 - [ ] **v0.8.0: Official Major Release: The Zero-Copy Architecture**
   - Conclude the zero-copy ingestion and bounded queue milestone.

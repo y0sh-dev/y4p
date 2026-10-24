@@ -20,7 +20,7 @@ The [README](../README.md) tells you *what* the tool does and how to run it. Eve
   (ext-data-control-v1)                                 /y4p/y4p.sock  (IPC)
           |                                                    |
           v                                                    v
-   y4p-wayland ----(bounded: ClipboardJob {mime, payload})-->  y4p-daemon
+   y4p-wayland ----(bounded: ClipboardJob {mime, payload, permit})-->  y4p-daemon
      (Ingress: read, normalise)                     worker: image route, SHA3-256,
           ^                                         single DB writer
           |                                                    |
@@ -54,11 +54,11 @@ y4p/
 ├── Cargo.toml          workspace manifest, shared version / lints / pinned dependencies
 ├── src/main.rs         composition root: signal handler, DB open, command dispatch
 ├── crates/
-│   ├── core/           y4p-core     constants, XDG paths, config parser, MIME utilities, exit flag
-│   ├── storage/        y4p-storage  SQLite facade, schema migrations, on-disk blob cache
+│   ├── core/           y4p-core     constants, XDG paths, config parser, MIME utilities, Payload, splice / pipe / FastCDC primitives, exit flag
+│   ├── storage/        y4p-storage  SQLite facade, schema migrations (v4), chunked content store, on-disk blob cache
 │   ├── image/          y4p-image    sniffing, sandbox, transcode pipeline, breaker, throttle
-│   ├── wayland/        y4p-wayland  ext-data-control-v1 handlers and streaming clipboard I/O
-│   ├── daemon/         y4p-daemon   event loop, IPC socket, background worker
+│   ├── wayland/        y4p-wayland  ext-data-control-v1 handlers, streaming clipboard I/O, ingestion backpressure
+│   ├── daemon/         y4p-daemon   event loop, IPC socket, background worker, payload spooler
 │   └── cli/            y4p-cli      strict argument parsing, command handlers, formatting
 ├── docs/               this directory
 └── scripts/check.sh    workspace-wide tests + strict clippy
@@ -66,17 +66,17 @@ y4p/
 
 ### 2.1 Crate responsibility matrix
 
-| Crate | Single responsibility | Workspace dependencies | Third-party dependencies | Unit tests |
+| Crate | Single responsibility | Workspace dependencies | Third-party dependencies | Tests |
 | :--- | :--- | :--- | :--- | ---: |
-| `y4p-core` | Shared plumbing: constants, XDG paths, `y4p.toml` parser, MIME helpers, exit flag | none | `libc`, `percent-encoding` | 57 |
-| `y4p-storage` | Persistence: SQL store, schema gate, blob cache, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 32 |
-| `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 161 |
-| `y4p-wayland` | Compositor I/O: offers, bounded reads, normalisation, egress | core | `wayland-client`, `wayland-protocols`, `libc` | 38 |
-| `y4p-daemon` | Process lifecycle: poll loop, IPC, `DbWorker` (image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 7 |
+| `y4p-core` | Shared plumbing: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, `splice(2)` / pipe-sizing / FastCDC primitives, exit flag | none | `libc`, `percent-encoding` | 140 |
+| `y4p-storage` | Persistence: SQL store, schema gate (`SCHEMA_VERSION = 4`), chunked content store, blob cache, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 84 |
+| `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 192 |
+| `y4p-wayland` | Compositor I/O: offers, bounded reads, normalisation, egress; ingestion backpressure (reader gate, `ByteBudget`, `enqueue_bounded`) | core | `wayland-client`, `wayland-protocols`, `libc` | 110 |
+| `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `FileSpooler`, `DbWorker` (image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 43 |
 | `y4p-cli` | Argument parsing, validation, output formatting; returns `CliAction` to the root | core, storage | `unicode-width` | 0 |
 | `y4p` (root) | Wiring only | all of the above | `libc`, `ctrlc` | 0 |
 
-Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event loop and the root have no live-compositor tests; they are verified by black-box comparison and manual runs.
+Total: 569 tests (568 unit tests and one integration test, `crates/daemon/tests/spooled_persist.rs`), plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. `y4p-cli` and the root have no tests of their own, and nothing runs against a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), and the rest by black-box comparison and manual runs.
 
 ### 2.2 Dependency direction
 
@@ -121,7 +121,7 @@ Total: 295 unit tests (`bash scripts/check.sh`). `y4p-cli`, `y4p-daemon`'s event
 
 ## 4. Crossing the Wayland / Storage Boundary
 
-The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L211`](../crates/daemon/src/lib.rs):
+The only place the two vocabularies meet is `handle_restore_request` in [`crates/daemon/src/lib.rs:L246`](../crates/daemon/src/lib.rs):
 
 ```text
   storage::ClipboardDb::locate_content(id)
@@ -136,7 +136,7 @@ The only place the two vocabularies meet is `handle_restore_request` in [`crates
 
 ---
 
-## 5. The Ingestion Stream Contract (v0.6.7)
+## 5. The Ingestion Stream Contract (v0.6.7, byte budget v0.7.8)
 
 The hand-off from sensor to worker is deliberately minimal:
 
@@ -145,21 +145,24 @@ The hand-off from sensor to worker is deliberately minimal:
 pub struct ClipboardJob {
     pub mime: String,
     pub payload: Payload, // core::payload: Memory(Vec<u8>) | Stream(StreamDescriptor) | File(PathBuf) | Spooled(Box<SpooledFile>)
+    pub permit: Option<BytePermit>, // v0.7.8: this job's share of the queue's byte budget; dropped by the worker
 }
 ```
 
 Ingestion sends `Payload::Memory` for text and for payloads that end inside one page (built with `ClipboardJob::new(mime, data)`), and, since v0.7.3, `Payload::Spooled` for a large non-text payload: the ingestion thread drains the pipe into a spool file with `splice(2)`, fingerprinting it on the way, and the queue carries the file's path and digest instead of the bytes. Egress uses the same `Payload` type in `SourceMetadata`. See [01](01_wayland_streaming_io.md) sections 2.3 and 2.4.
 
+Since v0.7.8 the job also carries a `BytePermit`: a reservation of its payload's length in a lock-free `ByteBudget` (`INGEST_QUEUE_BYTE_BUDGET`, 64 MiB) that is returned when the job is dropped, wherever that happens (persisted or discarded by the worker, shed from a full queue, or abandoned with the receiver). Heap buffers and spool files count alike. See [03](03_concurrency_and_memory.md) section 2.1.
+
 | Stage | Where | What happens |
 | :--- | :--- | :--- |
-| 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened |
+| 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened. A pipe that still cannot be allocated (`EMFILE`) is shed, counted and logged (v0.7.8) |
 | 2. Select | `y4p-wayland` | Richest MIME chosen by `MIME_PRIORITY_ORDER` |
 | 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte). Large non-text payloads are spooled to a file with `splice(2)` and fingerprinted on the way (v0.7.3) |
 | 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
-| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload }` over a bounded `sync_channel` (64); overload is shed and counted |
+| 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload, permit }` over a bounded `sync_channel` (64 slots) and a 64 MiB byte budget (`enqueue_bounded`); overload is shed and counted. A payload above the whole budget is shed at once |
 | 6. Route | `y4p-daemon` worker | Raster images privacy-stripped and re-encoded by `y4p-image` (original kept on any failure). A spooled image is converted file to file, with no heap copy (v0.7.4); a spooled payload the converter would not touch skips this and the next step |
 | 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes (a spooled payload arrives with it, computed while it streamed in; a converted one, while `magick`'s output was written) |
-| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash`; a spooled payload goes to `ClipboardDb::insert_spooled`, which renames an image's file into the cache (no byte read) and stores anything else from the file |
+| 8. Persist | `y4p-daemon` worker | `ClipboardDb::insert_with_hash`; a spooled payload goes to `ClipboardDb::insert_spooled`, which renames an image's file into the cache (no byte read) and stores anything else from the file. Text and other payloads above 4 KiB are stored as reference-counted FastCDC chunks (schema v4, [02](02_hybrid_storage_and_pin.md) section 7). The worker then drops the job's byte permit |
 
 > **Invariant — the hash describes what is stored.** The fingerprint is computed last, after image routing, so a deduplicated row and its cache file are always keyed by the bytes actually saved.
 
