@@ -101,7 +101,10 @@ Visual progress checklist across the zero-copy development cycle:
   - `PERFORMANCE.md` reorganised by domain, with a navigation table, an executive summary, the evolution table, memory bounds and the copy audit; resolved open questions removed.
   - READMEs simplified; workspace version synchronised to `0.7.9` (README badges stay at `0.7.0` until the formal release).
 
-- [ ] **v0.8.0: Official Major Release: The Zero-Copy Architecture**
-  - Conclude the zero-copy ingestion and bounded queue milestone.
-  - Verify complete test suite (300+ tests, 0 warnings, strict invariants).
-  - Tag and publish official `v0.8.0` release.
+- [x] **v0.8.0: Official Major Release: The Zero-Copy Architecture**
+  - **Ingestion**: a selection is moved from the compositor pipe to a spool file by `splice(2)`/`tee(2)` instead of through a heap buffer; ingesting a 16 MiB GIF fell from 67.1 MB allocated (32 MiB peak) to 7.1 KB. Egress is `sendfile(2)` from the cache file, and pipes are sized to 1 MiB (31 to 1 context switch per MiB, v0.7.2-v0.7.4, v0.7.7).
+  - **Bounds**: readers (8), queue slots (64) and queued bytes (64 MiB, `ByteBudget`/`BytePermit`) are all capped; overload is shed, never queued without limit (v0.7.1, v0.7.8).
+  - **Storage**: schema v4 stores large non-image payloads as FastCDC chunks with reference-counted deduplication (v0.7.5, v0.7.6).
+  - **Fault tolerance**: `EMFILE` is logged and counted, and a compositor disconnection ends the poll loop instead of spinning (v0.7.8).
+  - **Evidence**: 569 tests, 0 clippy warnings, a benchmark suite and `PERFORMANCE.md`; the architecture is documented in `docs/00`-`06` (v0.7.9). Open trade-offs are listed in `PERFORMANCE.md` section 9.
+  - Workspace version and README badges set to `0.8.0`. The `v0.8.0` tag and GitHub release are cut by the maintainer after the merge.
