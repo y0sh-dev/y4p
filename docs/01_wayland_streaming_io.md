@@ -11,7 +11,7 @@ Crates involved: `y4p-wayland` (protocol handlers, pipe plumbing) and `y4p-daemo
 The daemon has two independent sources of work: Wayland events (a new offer arrived) and IPC commands (someone ran `y4p copy-to 3`). It does not spawn a thread per source. Both descriptors are watched by one `poll(2)` call on the same thread:
 
 ```rust
-// crates/daemon/src/lib.rs:L136-L143 — the daemon's main loop
+// crates/daemon/src/lib.rs:L137-L144 — the daemon's main loop
 let mut poll_fds = [
     libc::pollfd { fd: conn.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
     libc::pollfd { fd: listener.as_fd().as_raw_fd(),  events: libc::POLLIN, revents: 0 },
@@ -38,11 +38,36 @@ if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 | Property | Consequence |
 | :--- | :--- |
 | Kernel wakes the process only on real activity | 0 % CPU between clipboard events; no helper threads parked on `recv()` |
-| 500 ms timeout is a watchdog, not a busy-loop | `is_exiting()` and the seat-rebind self-heal (`bind_data_device`, [lib.rs:L178](../crates/daemon/src/lib.rs)) are re-evaluated even with zero I/O |
+| 500 ms timeout is a watchdog, not a busy-loop | `is_exiting()` and the seat-rebind self-heal (`bind_data_device`, [lib.rs:L133](../crates/daemon/src/lib.rs)) are re-evaluated even with zero I/O |
 | Wayland and IPC handling share one thread | No lock between "event" and "command"; they can never run concurrently |
 | Everything that *needs* concurrency is pushed off-thread | Reads of offered payloads, image conversion, hashing and SQLite writes never stall the loop |
 
 > **Invariant — the poll loop never blocks on payload work.** Anything proportional to payload size runs on a spawned thread (ingestion read, egress write) or on the `DbWorker` (conversion, hashing, persistence).
+
+### 1.1 When the compositor goes away (v0.7.8)
+
+A daemon that outlives its compositor must stop, not spin. If the loop kept polling a Wayland socket whose peer is gone, `poll` would report it readable at once on every pass and the daemon would burn a full core on a connection that can never recover. Two checks end the loop, in this order ([`crates/daemon/src/lib.rs`](../crates/daemon/src/lib.rs), `start_daemon` and `read_compositor_events`):
+
+```rust
+if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }   // the socket says so
+if poll_fds[0].revents & libc::POLLIN != 0
+    && let Some(guard) = event_queue.prepare_read()
+    && !read_compositor_events(guard)                                       // the read says so
+{
+    break;
+}
+```
+
+`POLLHUP` is not the only way a connection ends. `wayland-backend` stores the **first fatal error** it meets (end of file, a protocol error) and fails every later read with it at once, whatever the socket looks like; if the socket stayed readable while that error was ignored, the loop would spin. The read's own result is therefore the authority:
+
+| `guard.read()` result | `read_compositor_events` | Loop |
+| :--- | :--- | :--- |
+| `Ok` | `true` | keep serving |
+| `Io(WouldBlock)` (another reader already took the data, or a spurious wake-up) or `Io(Interrupted)` | `true` | keep serving |
+| any other `Io` error, including the `EPIPE` the backend reports for end of file | `false`, logs `lost the compositor connection: ...` | stop |
+| `Protocol` error | `false`, same log | stop (the compositor drops the client anyway) |
+
+> **Invariant — a fatal read ends the loop and non-fatal ones never do.** The tests drive a real `UnixStream::pair` through `Connection::from_socket`: an idle connection keeps running, a transient error is not fatal, a dead one is, and a closed peer stops the loop.
 
 ---
 
@@ -56,6 +81,7 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
       v
  [gate]      is_sensitive(mimes)?  provider_locks > 0?  paused?   -> return, no pipe opened
              reader_gate.try_acquire() fails (8 readers)?          -> shed, no pipe opened
+             make_pipe() fails (EMFILE)?                           -> shed, counted, logged
       |
       v
  [select]    select_mime(mimes, target_mime, drop_rtf)
@@ -70,9 +96,16 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
              relabel_by_magic(mime, head)                (Spooled: magic bytes of the head only)
       |
       v
- [forward]   ingest::enqueue(job_tx, ClipboardJob, 2 s)  (daemon mode; bounded, may shed)
+ [forward]   ingest::enqueue_bounded(job_tx, budget, ClipboardJob, 2 s)  (daemon mode; bounded, may shed)
              state.rx_buf = payload                        (Action Mode: `y4p paste-from`)
 ```
+
+### 2.0 The pipe handed to the compositor (v0.7.7, v0.7.8)
+
+`make_pipe` ([`crates/wayland/src/handlers/data_control/mod.rs`](../crates/wayland/src/handlers/data_control/mod.rs)) creates the pipe whose write end `offer.receive` passes to the compositor. Two properties matter:
+
+- **Dynamic sizing.** `core::pipe::grow` raises the pipe from the kernel default of 64 KiB to 1 MiB (`PIPE_TARGET_BYTES`) with `fcntl(F_SETPIPE_SZ)`, the unprivileged ceiling (`/proc/sys/fs/pipe-max-size`). The request is a hint: a descriptor that is not a pipe is left alone, `EPERM` and `ENOMEM` halve the request and retry (at most 16 attempts), a pipe already large enough is untouched and none is ever shrunk. A pipe that stays at 64 KiB works exactly as before, in more rounds. The same helper sizes the paste pipe (`write_bytes` above 64 KiB, `transfer` for descriptor payloads), the converter child's stdin and stdout, and the `tee(2)` scratch pipe. The effect, measured with both ends in one process: context switches fall from 31 to 1 per MiB, and the paste direction is about 35 % faster ([`PERFORMANCE.md`](../PERFORMANCE.md) section 7.3).
+- **Allocation can fail.** `pipe(2)` returns `EMFILE` or `ENFILE` once descriptors run out. Until v0.7.7 the handler returned silently; since v0.7.8 the selection is **counted** (`IngestStats::record_shed_reader`, shown as `shed_readers=` in `y4p status`) and logged as `could not allocate pipe descriptors (EMFILE)`, with the same power-of-two log throttling as every other shed. The reader permit taken a moment earlier is released by the early return, so a descriptor shortage cannot also leak a gate slot.
 
 ### 2.1 Bounded read: `read_bounded`
 
@@ -90,7 +123,7 @@ pub fn read_bounded<R: Read>(reader: R, limit: u64, capacity_hint: Option<u64>) 
 }
 ```
 
-`device.rs` wraps it as `read_pipe_payload(reader, mime, limit)` (returning `Option`, as before) and supplies the hint: a Wayland pipe carries no length, so a text-like MIME reserves one page up front (`INLINE_PAYLOAD_THRESHOLD_BYTES`) and anything else starts empty. That turns the 3-9 allocations of a growing buffer into one for a typical payload ([`PERFORMANCE.md`](../PERFORMANCE.md) section 3.5).
+`device.rs` wraps it as `read_pipe_payload(reader, mime, limit)` (returning `Option`, as before) and supplies the hint: a Wayland pipe carries no length, so a text-like MIME reserves one page up front (`INLINE_PAYLOAD_THRESHOLD_BYTES`) and anything else starts empty. That turns the 3-9 allocations of a growing buffer into one for a typical payload ([`PERFORMANCE.md`](../PERFORMANCE.md) section 7.1).
 
 `Read::take` stops *silently* at its cap: no error, no flag, just `Ok(_)`. If the reader were capped at exactly `limit`, an oversized stream would be cut off mid-transfer and look identical to one that happened to be exactly `limit` bytes long, and the truncated bytes would be hashed and persisted as if they were the whole entry: silent corruption that restores "successfully".
 
@@ -191,7 +224,7 @@ The switch happens only *between* rounds or before a round has consumed anything
 
 `ClipboardDb::insert_spooled` consumes the `SpooledFile` on every path: it ends up as the cache entry or unlinked, and the caller never cleans up. The worker no longer mirrors any storage rule (`core::cache_file_path` and `worker::stored_in_cache_file` are gone, and so is `core::mapped`, the tree's only `mmap`/`munmap` `unsafe`).
 
-**Resource accounting.** A reader that spools holds a pipe read end, the spool file and the two ends of the scratch pipe: four descriptors, at most `INGEST_MAX_CONCURRENT_READERS` (8) readers, so 32. The queue carries paths, not descriptors: no descriptor waits in it. The heap cost of a queued spooled job is the box and the path (about 160 bytes, measured), whatever the payload's size; the cost moves to disk, bounded by the same counts: (64 + 8) x 256 MiB in the worst case, plus one more file while the worker converts an image (the converted output; the original is unlinked as soon as it is in place), so (64 + 8 + 1) x 256 MiB (a byte budget is the open question in `PERFORMANCE.md` section 6). A cache wipe removes the spool directory with the rest of the cache; the spooler re-creates it on the next payload, and a directory that cannot be created hands the pipe back for an in-memory read, so spooling is an optimisation that can fail without losing a clipboard entry. Leftover `.part` files of a dead process are swept when the daemon starts; a live process's files, and any other file, are never touched.
+**Resource accounting.** A reader that spools holds a pipe read end, the spool file and the two ends of the scratch pipe: four descriptors, at most `INGEST_MAX_CONCURRENT_READERS` (8) readers, so 32. The queue carries paths, not descriptors: no descriptor waits in it. The heap cost of a queued spooled job is the box and the path (about 160 bytes, measured), whatever the payload's size; the cost moves to disk. Since v0.7.8 the **queued** part of that is bounded in bytes: a spool file counts against the 64 MiB queue byte budget exactly as a heap buffer would (section 6, [03](03_concurrency_and_memory.md) section 2.1). The readers' own files (8 x 256 MiB) and one more file while the worker converts an image (the converted output; the original is unlinked as soon as it is in place) come on top, so the disk ceiling is 64 MiB + 8 x 256 MiB + 256 MiB, not the former (64 + 8 + 1) x 256 MiB ([`PERFORMANCE.md`](../PERFORMANCE.md) section 5.2). A cache wipe removes the spool directory with the rest of the cache; the spooler re-creates it on the next payload, and a directory that cannot be created hands the pipe back for an in-memory read, so spooling is an optimisation that can fail without losing a clipboard entry. Leftover `.part` files of a dead process are swept when the daemon starts; a live process's files, and any other file, are never touched.
 
 ---
 
@@ -283,9 +316,9 @@ For every payload kind the only transformation is markup stripping: if the store
 
 | Hand-off | From -> To | Type | Guarantee |
 | :--- | :--- | :--- | :--- |
-| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::SyncSender<ClipboardJob>` (capacity `INGEST_QUEUE_CAPACITY`), `ClipboardJob { mime, payload: Payload }` | the payload is non-empty and at most `MAX_PAYLOAD_BYTES` (`Memory`: once materialised, `ClipboardJob::into_bytes`, a no-copy hand-over; `Spooled`: a complete file with its SHA3-256, owned and unlinked on drop), already normalised or relabelled; no conversion |
+| Ingress | `y4p-wayland` -> `y4p-daemon` | `mpsc::SyncSender<ClipboardJob>` (capacity `INGEST_QUEUE_CAPACITY` = 64) and a `ByteBudget` (`INGEST_QUEUE_BYTE_BUDGET` = 64 MiB), `ClipboardJob { mime, payload: Payload, permit: Option<BytePermit> }` | the payload is non-empty and at most `MAX_PAYLOAD_BYTES` (`Memory`: once materialised, `ClipboardJob::into_bytes`, a no-copy hand-over; `Spooled`: a complete file with its SHA3-256, owned and unlinked on drop), already normalised or relabelled; no conversion. A queued job holds a `BytePermit` for its length, returned when the job is dropped; a payload above the whole budget never enters the queue |
 | Spool | `y4p-wayland` -> `y4p-daemon` | `PayloadSpooler::spool(head, pipe, limit) -> SpoolOutcome` | `Spooled` (complete, fingerprinted), `Rejected` (nothing left on disk) or `Unavailable(pipe)` (untouched beyond the head, read it into memory) |
-| Persistence | `y4p-daemon` -> `y4p-storage` | `insert_with_hash(mime, data, hash, max_history)` | `hash` is SHA3-256 over the final bytes (see [03](03_concurrency_and_memory.md)) |
+| Persistence | `y4p-daemon` -> `y4p-storage` | `insert_with_hash(mime, data, hash, max_history)`, `insert_spooled(...)` | `hash` is SHA3-256 over the final bytes (see [03](03_concurrency_and_memory.md)); the worker drops the job's byte permit once the call has returned |
 | Egress | `y4p-storage` -> `y4p-daemon` -> `y4p-wayland` | `ContentLocation` -> `core::payload::Payload` (`SourceMetadata.payload`) | Large payloads are passed as a path, never materialised |
 
 > **Invariant — `y4p-wayland` is a pure sensor.** It depends on neither `y4p-storage`, `y4p-image` nor `sha3`; it never converts, fingerprints or persists a payload.
