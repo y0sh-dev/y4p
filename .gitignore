@@ -26,6 +26,6 @@ Session.vim
 .DS_Store
 Thumbs.db
 
-# --- Agent Instructions / Local Metadata ---
-GEMINI.md
+# --- Agent Local Metadata ---
+.protocols/
 
