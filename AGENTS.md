@@ -1,31 +1,32 @@
 # Project Instructions — y4p-rs
 
 ## 0. Non-negotiables (Project-Specific)
-- Global `~/.agent-protocols/CARD.md` is the authoritative safety set. If this file conflicts with CARD, follow the more restrictive rule and report it.
-- **Zero External Dependencies**: Do not add external crates to `Cargo.toml` without human approval.
+- Global `~/.agent-protocols/CARD.md` is the authoritative safety set. On conflict, follow the more restrictive rule and report it.
 - **Storage Layer Invariant**: Do not modify `crates/storage/` (0 lines changed).
-- **Strict Panic-Free**: Do not introduce `unwrap()`, `expect()`, or `panic!()`.
+- **Zero External Dependencies**: Do not add external crates to `Cargo.toml` without human approval.
+- **Strict Panic-Free**: Do not introduce `unwrap()`, `expect()`, or `panic!()`. Keep Clippy warning-free under `-D warnings`.
+- **Language**: Deliverables (code, comments, commits, PRs, docs) strictly in British English.
 
 ## 1. First 5 Minutes (Immediate Verification)
-1. Verify working branch: `git status && git branch --show-current` (Do not edit directly on `main`).
-2. Run standard verification: `bash scripts/check.sh` (Tests workspace + strict Clippy; exit 0).
-3. If the same failure appears twice, stop and report (Hard limiter: 5 attempts max).
+1. Verify working branch: `git status && git branch --show-current` (Never edit directly on `main`).
+2. Run standard verification: `bash scripts/check.sh` (Runs workspace tests + strict Clippy; exit 0 required).
+3. If the same failure signature appears twice, stop and evaluate (Hard limiter: 5 attempts max).
 
-## 2. Commands & Detailed Rules
-- Full verification command reference: `.protocols/commands.md`
-- Detailed project invariants & exceptions: `.protocols/project_invariants.md`
+## 2. Roles & Archetypes
+- **Orchestrator (Gemini)**: Macro specifications, Pre-Commit Deliberation reports, human-hub task delegation.
+- **Implementer (OpenCode / Coder)**: Fast, minimal diffs, local test verification (`scripts/check.sh`), panic-free compliance.
+- **Reasoner (Auditor)**: Deep logic audit on concurrency, memory bounds, error handling, and soundness.
 
 ## 3. Architecture & Workspace Topology
 - Inward-only layered dependency: `core` <- `storage` / `image` / `wayland` <- `daemon` / `cli`.
-- Persisted payloads: Hybrid storage (SQLite v4 metadata + SHA3-256 chunked cache).
+- Persisted payloads: Hybrid storage (SQLite v4 metadata + SHA3-256 FastCDC chunked cache).
 - Kernel egress: Zero-copy pipe streaming via `splice(2)` / `vmsplice(2)` / `sendfile(2)`.
 
-## 4. Load When (Dynamic Routing)
-| Situation / Task | File to Load |
-| :--- | :--- |
-| Multi-agent collaboration / Hand-off | `.protocols/collaboration.md` |
-| Deep testing / Sanitizers / Miri | `.protocols/commands.md` |
-| Roadmap planning / Distillation | `docs/templates/ROADMAP_TEMPLATE.md` |
+## 4. Key Verification Commands
+- **Primary Check**: `bash scripts/check.sh` (Standard gate: tests + strict linter).
+- **Granular Test**: `cargo test -p y4p-<crate>` | Single test: `cargo test -p y4p-<crate> -- <test_name>`
+- **Strict Lint**: `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets -- -D warnings`
+- **Deep Sanitizers**: `cargo miri test -p y4p-core` | `RUSTFLAGS="-Zsanitizer=address" cargo test -p y4p-core`
 
 ## 5. Fallback Safety Set
 If `~/.agent-protocols/CARD.md` is unavailable:
