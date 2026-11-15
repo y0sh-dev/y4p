@@ -146,6 +146,7 @@ impl Drop for BytePermit {
 pub struct IngestStats {
     shed_readers: AtomicU64,
     shed_queue: AtomicU64,
+    shed_timeout: AtomicU64,
 }
 
 impl IngestStats {
@@ -159,12 +160,21 @@ impl IngestStats {
         self.shed_queue.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Counts a pipe read aborted by the ingestion deadline; returns the new total.
+    pub fn record_shed_timeout(&self) -> u64 {
+        self.shed_timeout.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     pub fn shed_readers(&self) -> u64 {
         self.shed_readers.load(Ordering::Relaxed)
     }
 
     pub fn shed_queue(&self) -> u64 {
         self.shed_queue.load(Ordering::Relaxed)
+    }
+
+    pub fn shed_timeout(&self) -> u64 {
+        self.shed_timeout.load(Ordering::Relaxed)
     }
 }
 
@@ -672,7 +682,8 @@ mod tests {
         let stats = IngestStats::default();
         assert_eq!((stats.record_shed_reader(), stats.record_shed_reader()), (1, 2));
         assert_eq!(stats.record_shed_queue(), 1);
-        assert_eq!((stats.shed_readers(), stats.shed_queue()), (2, 1));
+        assert_eq!((stats.record_shed_timeout(), stats.record_shed_timeout(), stats.record_shed_timeout()), (1, 2, 3));
+        assert_eq!((stats.shed_readers(), stats.shed_queue(), stats.shed_timeout()), (2, 1, 3));
     }
 
     #[test]

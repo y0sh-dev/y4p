@@ -55,10 +55,10 @@ impl DaemonMetrics {
     /// Structured status text for IPC `Command::Status` responses. `paused`
     /// and the shed totals come from `WaylandState` (private mode, ingestion
     /// overload), which this type has no access to on its own.
-    pub fn format_status(&self, paused: bool, shed_readers: u64, shed_queue: u64) -> String {
+    pub fn format_status(&self, paused: bool, shed_readers: u64, shed_queue: u64, shed_timeout: u64) -> String {
         let last = self.last_event_at_ms.load(Ordering::Relaxed);
         format!(
-            "uptime_ms={} ingress={} egress={} paused={} last_event_ms_ago={} shed_readers={} shed_queue={}\n",
+            "uptime_ms={} ingress={} egress={} paused={} last_event_ms_ago={} shed_readers={} shed_queue={} shed_timeout={}\n",
             now_ms() - self.started_at_ms,
             self.ingress_count.load(Ordering::Relaxed),
             self.egress_count.load(Ordering::Relaxed),
@@ -66,6 +66,7 @@ impl DaemonMetrics {
             if last == 0 { -1 } else { now_ms() - last },
             shed_readers,
             shed_queue,
+            shed_timeout,
         )
     }
 }
@@ -78,8 +79,8 @@ mod tests {
     #[test]
     fn status_reports_the_shed_totals_as_stable_key_value_pairs() {
         let metrics = DaemonMetrics::new();
-        let line = metrics.format_status(true, 3, 7);
-        assert!(line.ends_with("shed_readers=3 shed_queue=7\n"), "{line}");
+        let line = metrics.format_status(true, 3, 7, 2);
+        assert!(line.ends_with("shed_readers=3 shed_queue=7 shed_timeout=2\n"), "{line}");
         assert!(line.contains("paused=true"));
         assert_eq!(line.lines().count(), 1, "status stays a single line");
     }
@@ -98,9 +99,9 @@ mod tests {
         let metrics = DaemonMetrics::new();
         metrics.record_ingress();
         metrics.record_egress();
-        let line = metrics.format_status(false, 0, 0);
+        let line = metrics.format_status(false, 0, 0, 0);
         let keys: Vec<&str> = line.split_whitespace().filter_map(|kv| kv.split('=').next()).collect();
-        assert_eq!(keys, ["uptime_ms", "ingress", "egress", "paused", "last_event_ms_ago", "shed_readers", "shed_queue"]);
+        assert_eq!(keys, ["uptime_ms", "ingress", "egress", "paused", "last_event_ms_ago", "shed_readers", "shed_queue", "shed_timeout"]);
         assert!(line.contains("ingress=1 egress=1"));
     }
 }

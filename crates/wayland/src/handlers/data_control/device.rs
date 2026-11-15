@@ -8,16 +8,17 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_offer_v1::ExtDataControlOfferV1,
 };
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crate::state::{WaylandState, OfferData, ClipboardJob};
 use crate::ingest::{self, ByteBudget, Enqueue, IngestStats, ReaderPermit};
 use crate::spool::{PayloadSpooler, SpoolOutcome};
 use crate::core::constants::*;
-use crate::core::payload::{self, Payload, PayloadRoute, SpooledFile};
+use crate::core::payload::{self, Payload, PayloadError, PayloadRoute, SpooledFile};
+use crate::core::pipe::DeadlineReader;
 use super::{make_pipe, is_sensitive};
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
@@ -92,11 +93,12 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 let budget = Arc::clone(&state.byte_budget);
                 let spooler = state.spooler.clone();
                 let enqueue_wait = Duration::from_millis(INGEST_ENQUEUE_WAIT_MS);
+                let read_timeout = Duration::from_millis(INGEST_READ_TIMEOUT_MS);
                 // `Builder::spawn` reports a refused thread instead of
                 // panicking like `thread::spawn`; the closure (and with it the
                 // pipe and the permit) is then dropped, which frees everything.
                 let spawned = std::thread::Builder::new().name("y4p-ingest".to_owned()).spawn(move || {
-                    ingest_and_send(read_file, mime_to_get, &job_tx_clone, &stats, &budget, permit, enqueue_wait, spooler.as_deref());
+                    ingest_and_send_with_timeout(read_file, mime_to_get, &job_tx_clone, &stats, &budget, permit, enqueue_wait, read_timeout, spooler.as_deref());
                 });
                 if spawned.is_err() {
                     let total = state.ingest_stats.record_shed_reader();
@@ -107,7 +109,9 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 // Applies the same boundary guard and normalisation as the
                 // daemon path (`ingest_and_send`) so `paste-from` returns
                 // exactly the bytes that would otherwise have been persisted.
-                if let Some(payload) = read_pipe_payload(read_file, &mime_to_get, MAX_PAYLOAD_BYTES)
+                let deadline = Instant::now() + Duration::from_millis(INGEST_READ_TIMEOUT_MS);
+                if let Ok(reader) = DeadlineReader::new(read_file, deadline)
+                    && let Ok(payload) = read_pipe_payload(reader, &mime_to_get, MAX_PAYLOAD_BYTES)
                     && let Some((_, payload)) = normalise_payload(mime_to_get, payload)
                 {
                     state.rx_buf = payload;
@@ -183,6 +187,7 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
 /// The hand-over is [`ingest::enqueue_bounded`]: besides a queue slot, the
 /// payload needs room in `budget`, and the bytes it reserves travel with the
 /// job until the worker is done with it.
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn ingest_and_send(
     read_file: std::fs::File,
@@ -190,20 +195,51 @@ fn ingest_and_send(
     job_tx: &SyncSender<ClipboardJob>,
     stats: &IngestStats,
     budget: &Arc<ByteBudget>,
-    _permit: Option<ReaderPermit>,
+    permit: Option<ReaderPermit>,
     enqueue_wait: Duration,
     spooler: Option<&dyn PayloadSpooler>,
 ) {
-    let job = match drain_pipe(read_file, &mime_to_get, MAX_PAYLOAD_BYTES, spooler) {
-        Some(Drained::Memory(payload)) => {
+    ingest_and_send_with_timeout(
+        read_file,
+        mime_to_get,
+        job_tx,
+        stats,
+        budget,
+        permit,
+        enqueue_wait,
+        Duration::from_millis(INGEST_READ_TIMEOUT_MS),
+        spooler,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_and_send_with_timeout(
+    read_file: std::fs::File,
+    mime_to_get: String,
+    job_tx: &SyncSender<ClipboardJob>,
+    stats: &IngestStats,
+    budget: &Arc<ByteBudget>,
+    _permit: Option<ReaderPermit>,
+    enqueue_wait: Duration,
+    read_timeout: Duration,
+    spooler: Option<&dyn PayloadSpooler>,
+) {
+    let deadline = Instant::now() + read_timeout;
+    let job = match drain_pipe(read_file, &mime_to_get, MAX_PAYLOAD_BYTES, deadline, spooler) {
+        DrainOutcome::Ready(Drained::Memory(payload)) => {
             let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
             ClipboardJob::new(mime, data)
         }
-        Some(Drained::Spooled { file, head }) => {
+        DrainOutcome::Ready(Drained::Spooled { file, head }) => {
             let mime = relabel_by_magic(mime_to_get, &head);
             ClipboardJob::from_payload(mime, Payload::Spooled(Box::new(file)))
         }
-        None => return,
+        DrainOutcome::TimedOut => {
+            let total = stats.record_shed_timeout();
+            ingest::report_shed("pipe read timed out", total);
+            return;
+        }
+        DrainOutcome::Failed => return,
     };
 
     let bytes = job.accounted_bytes();
@@ -225,6 +261,19 @@ enum Drained {
     Spooled { file: SpooledFile, head: Vec<u8> },
 }
 
+enum DrainOutcome {
+    Ready(Drained),
+    TimedOut,
+    Failed,
+}
+
+fn classify_payload_error(err: PayloadError) -> DrainOutcome {
+    match err {
+        PayloadError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut => DrainOutcome::TimedOut,
+        _ => DrainOutcome::Failed,
+    }
+}
+
 /// Drains `reader` completely, choosing the cheapest bounded way.
 ///
 /// - Text-like MIMEs, and every payload when there is no `spooler`, are read
@@ -238,30 +287,50 @@ enum Drained {
 /// - A spooler that cannot start gives the pipe back, and the payload is read
 ///   into memory after all: spooling is an optimisation, never a requirement.
 fn drain_pipe(
-    mut reader: std::fs::File,
+    reader: std::fs::File,
     mime: &str,
     limit: u64,
+    deadline: Instant,
     spooler: Option<&dyn PayloadSpooler>,
-) -> Option<Drained> {
+) -> DrainOutcome {
+    let Ok(mut deadline_reader) = DeadlineReader::new(reader, deadline) else {
+        return DrainOutcome::Failed;
+    };
     let Some(spooler) = spooler.filter(|_| payload::route_payload(mime, None) == PayloadRoute::Stream) else {
-        return read_pipe_payload(reader, mime, limit).map(Drained::Memory);
+        return match read_pipe_payload(deadline_reader, mime, limit) {
+            Ok(bytes) => DrainOutcome::Ready(Drained::Memory(bytes)),
+            Err(err) => classify_payload_error(err),
+        };
     };
 
     let mut head = Vec::with_capacity(INLINE_PAYLOAD_THRESHOLD_BYTES);
-    if (&mut reader).take(INLINE_PAYLOAD_THRESHOLD_BYTES as u64).read_to_end(&mut head).is_err() {
-        return None;
+    match (&mut deadline_reader).take(INLINE_PAYLOAD_THRESHOLD_BYTES as u64).read_to_end(&mut head) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return DrainOutcome::TimedOut,
+        Err(_) => return DrainOutcome::Failed,
     }
     if head.len() < INLINE_PAYLOAD_THRESHOLD_BYTES {
-        return (!head.is_empty()).then_some(Drained::Memory(head));
+        return if head.is_empty() {
+            DrainOutcome::Failed
+        } else {
+            DrainOutcome::Ready(Drained::Memory(head))
+        };
     }
 
-    match spooler.spool(&head, reader, limit) {
-        SpoolOutcome::Spooled(file) => Some(Drained::Spooled { file, head }),
-        SpoolOutcome::Rejected => None,
+    match spooler.spool_with_deadline(&head, deadline_reader.into_inner(), limit, deadline) {
+        SpoolOutcome::Spooled(file) => DrainOutcome::Ready(Drained::Spooled { file, head }),
+        SpoolOutcome::Rejected => DrainOutcome::Failed,
+        SpoolOutcome::TimedOut => DrainOutcome::TimedOut,
         SpoolOutcome::Unavailable(rest) => {
+            let Ok(rest_reader) = DeadlineReader::new(rest, deadline) else {
+                return DrainOutcome::Failed;
+            };
             // The head is already out of the pipe: read the remainder behind it.
-            let chained = std::io::Cursor::new(head).chain(rest);
-            payload::read_bounded(chained, limit, None).ok().map(Drained::Memory)
+            let chained = std::io::Cursor::new(head).chain(rest_reader);
+            match payload::read_bounded(chained, limit, None) {
+                Ok(bytes) => DrainOutcome::Ready(Drained::Memory(bytes)),
+                Err(err) => classify_payload_error(err),
+            }
         }
     }
 }
@@ -277,22 +346,22 @@ fn relabel_by_magic(announced: String, head: &[u8]) -> String {
 }
 
 /// Reads at most `limit` bytes from an already-`offer.receive()`d pipe, or
-/// `None` on an I/O error, an empty read, or a stream that exceeded `limit`
-/// (the partial bytes are discarded, never persisted as if complete: see
-/// `core::payload::read_bounded` for the probe-byte rule that makes an
-/// over-long stream distinguishable from one that exactly fits).
+/// returns `PayloadError` on an I/O error, timeout, empty read, or an
+/// over-long stream (the partial bytes are discarded, never persisted as if
+/// complete: see `core::payload::read_bounded` for the probe-byte rule that
+/// makes an over-long stream distinguishable from one that exactly fits).
 ///
 /// A Wayland pipe carries no length, so the buffer is pre-sized from the MIME
 /// alone (`core::payload::route_payload`): a text-like payload is almost always
 /// below one page, so reserving a page up front replaces the read loop's
 /// repeated regrowth by one allocation. Anything else starts empty and grows,
 /// since it may be a multi-megabyte image.
-fn read_pipe_payload<R: Read>(reader: R, mime: &str, limit: u64) -> Option<Vec<u8>> {
+fn read_pipe_payload<R: Read>(reader: R, mime: &str, limit: u64) -> Result<Vec<u8>, PayloadError> {
     let capacity_hint = match payload::route_payload(mime, None) {
         PayloadRoute::Inline => Some(INLINE_PAYLOAD_THRESHOLD_BYTES as u64),
         PayloadRoute::Stream => None,
     };
-    payload::read_bounded(reader, limit, capacity_hint).ok()
+    payload::read_bounded(reader, limit, capacity_hint)
 }
 
 /// Normalises a raw payload against the MIME it was requested as, applying
@@ -741,6 +810,31 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_pipe_times_out_releases_the_permit_and_records_a_timeout_shed() {
+        let (gate, permit) = gate_with_one_permit();
+        let (read_pipe, _write_pipe) = std::io::pipe().unwrap();
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+
+        ingest_and_send_with_timeout(
+            std::fs::File::from(std::os::fd::OwnedFd::from(read_pipe)),
+            "text/plain".to_owned(),
+            &tx,
+            &stats,
+            &roomy(),
+            permit,
+            Duration::ZERO,
+            Duration::from_millis(30),
+            None,
+        );
+
+        assert_eq!(stats.shed_timeout(), 1);
+        assert_eq!(stats.shed_queue(), 0);
+        assert_eq!(gate.active(), 0, "timed-out reader must release its ReaderGate slot");
+        assert!(rx.try_recv().is_err(), "partial or timed-out read must not be queued");
+    }
+
+    #[test]
     fn select_mime_requested_match_is_returned_verbatim() {
         let offers = mimes(&["text/plain", "text/html"]);
         assert_eq!(select_mime(&offers, Some("text/html"), true), Some("text/html".to_string()));
@@ -820,7 +914,7 @@ mod tests {
     #[test]
     fn read_pipe_payload_within_limit_returns_payload() {
         let data = b"hello".as_slice();
-        assert_eq!(read_pipe_payload(data, "text/plain", 10), Some(b"hello".to_vec()));
+        assert_eq!(read_pipe_payload(data, "text/plain", 10).ok(), Some(b"hello".to_vec()));
     }
 
     #[test]
@@ -842,13 +936,13 @@ mod tests {
     #[test]
     fn read_pipe_payload_exactly_at_limit_returns_payload() {
         let data = b"abcde".as_slice();
-        assert_eq!(read_pipe_payload(data, "text/plain", 5), Some(b"abcde".to_vec()));
+        assert_eq!(read_pipe_payload(data, "text/plain", 5).ok(), Some(b"abcde".to_vec()));
     }
 
     #[test]
     fn read_pipe_payload_exceeding_limit_by_one_byte_is_discarded() {
         let data = b"abcdef".as_slice();
-        assert_eq!(read_pipe_payload(data, "text/plain", 5), None);
+        assert_eq!(read_pipe_payload(data, "text/plain", 5).ok(), None);
     }
 
     #[test]
@@ -857,13 +951,13 @@ mod tests {
         // than the limit must be rejected outright, never silently cut
         // down to `limit` bytes and handed back as if it were complete.
         let data = vec![b'x'; 1000];
-        assert_eq!(read_pipe_payload(data.as_slice(), "text/plain", 5), None);
+        assert_eq!(read_pipe_payload(data.as_slice(), "text/plain", 5).ok(), None);
     }
 
     #[test]
     fn read_pipe_payload_empty_input_returns_none() {
         let data = b"".as_slice();
-        assert_eq!(read_pipe_payload(data, "text/plain", 10), None);
+        assert_eq!(read_pipe_payload(data, "text/plain", 10).ok(), None);
     }
 
     // --- normalise_payload ---

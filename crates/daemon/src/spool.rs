@@ -31,6 +31,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use sha3::{Digest, Sha3_256};
 
@@ -116,8 +117,11 @@ impl FileSpooler {
     }
 }
 
-impl PayloadSpooler for FileSpooler {
-    fn spool(&self, head: &[u8], mut src: File, limit: u64) -> SpoolOutcome {
+impl FileSpooler {
+    fn spool_bounded(&self, head: &[u8], mut src: File, limit: u64, deadline: Option<Instant>) -> SpoolOutcome {
+        if deadline.is_some() && crate::core::pipe::set_nonblocking(&src).is_err() {
+            return SpoolOutcome::Rejected;
+        }
         let Ok((mut file, path)) = self.create() else { return SpoolOutcome::Unavailable(src) };
         let guard = Unlink(Some(path));
 
@@ -133,14 +137,25 @@ impl PayloadSpooler for FileSpooler {
 
         // The remainder, after the head, within what is left of the limit. An
         // empty remainder is fine: the payload was exactly the head.
-        let rest = match splice::copy_to_file(&mut src, &mut file, limit - head_len, &mut tap) {
+        let rest = match splice::copy_to_file_with_deadline(&mut src, &mut file, limit - head_len, &mut tap, deadline) {
             Ok(copied) => copied.len,
             Err(PayloadError::Empty) => 0,
+            Err(PayloadError::Io(ref e)) if e.kind() == io::ErrorKind::TimedOut => return SpoolOutcome::TimedOut,
             Err(_) => return SpoolOutcome::Rejected,
         };
 
         let (Some(digest), Some(path)) = (tap.finish(), guard.disarm()) else { return SpoolOutcome::Rejected };
         SpoolOutcome::Spooled(SpooledFile::new(path, head_len + rest, digest))
+    }
+}
+
+impl PayloadSpooler for FileSpooler {
+    fn spool(&self, head: &[u8], src: File, limit: u64) -> SpoolOutcome {
+        self.spool_bounded(head, src, limit, None)
+    }
+
+    fn spool_with_deadline(&self, head: &[u8], src: File, limit: u64, deadline: Instant) -> SpoolOutcome {
+        self.spool_bounded(head, src, limit, Some(deadline))
     }
 }
 
@@ -550,6 +565,20 @@ mod tests {
         let _spooler = FileSpooler::open(dir.clone()).unwrap();
         assert!(!dead.exists());
         assert!(sibling.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn spool_with_deadline_times_out_on_stalled_pipe_and_unlinks_partial_file() {
+        let dir = temp_dir("deadline-timeout");
+        let spooler = FileSpooler::open(dir.clone()).unwrap();
+        let (read_pipe, _write_pipe) = io::pipe().unwrap();
+        let src = File::from(std::os::fd::OwnedFd::from(read_pipe));
+        let deadline = Instant::now() + std::time::Duration::from_millis(30);
+
+        let outcome = spooler.spool_with_deadline(b"head-bytes", src, 1 << 20, deadline);
+        assert!(matches!(outcome, SpoolOutcome::TimedOut), "{outcome:?}");
+        assert_eq!(files_in(&dir), 0, "timed-out spool must unlink its partial file");
         fs::remove_dir_all(dir).unwrap();
     }
 }
