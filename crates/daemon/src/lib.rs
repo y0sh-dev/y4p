@@ -246,6 +246,11 @@ fn bind_data_device(
 /// since by construction (see `insert_with_hash`) they're never the
 /// large-payload case this exists for.
 ///
+/// A record whose cache file has vanished cannot be served: `locate_content`
+/// then reports an error, which is logged and ends the attempt before a
+/// provider is reserved or a data source created, so the failure is visible
+/// rather than a paste of nothing.
+///
 /// `read_db` is passed explicitly rather than stored on `WaylandState` (the
 /// wayland sensor layer must not depend on `storage`).
 fn handle_restore_request(
@@ -256,7 +261,15 @@ fn handle_restore_request(
     metrics: &DaemonMetrics,
     read_db: &ClipboardDb,
 ) {
-    let resolved = read_db.locate_content(real_id);
+    let resolved = match read_db.locate_content(real_id) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // Never offer a descriptor that cannot be opened: a record whose
+            // payload is gone is left unserved, and nothing is reserved for it.
+            eprintln!("{}cannot resolve record {} for egress: {}", LOG_ERROR, real_id, e);
+            return;
+        }
+    };
 
     if let Some((mime, location)) = resolved
         && let Some(ref manager) = state.manager {
