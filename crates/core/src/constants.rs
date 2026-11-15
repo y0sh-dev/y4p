@@ -21,11 +21,19 @@ pub const IPC_CMD_EXIT:    u8 = 0x02;
 pub const IPC_CMD_STATUS:  u8 = 0x03;
 pub const IPC_CMD_PAUSE:   u8 = 0x04;
 pub const IPC_CMD_RESUME:  u8 = 0x05;
+pub const IPC_CMD_DELETE:  u8 = 0x06;
+pub const IPC_CMD_WIPE:    u8 = 0x07;
 pub const IPC_DELIMITER:   u8 = b'\n';
 
 // Bounds the CLI's read of a `status` response so a stuck/misbehaving
 // daemon can't hang the client indefinitely.
 pub const IPC_STATUS_TIMEOUT_MS: u64 = 1000;
+
+// Bounds the CLI's wait for a `delete`/`wipe` acknowledgement. Both are
+// synchronous mutations answered by the daemon's single writer connection, and
+// `wipe` (SQLite `VACUUM` plus removal of the cache directory) can take far
+// longer than a status reply, so it gets its own, larger budget.
+pub const IPC_MUTATION_TIMEOUT_MS: u64 = 10_000;
 
 // Filename of the IPC control socket. Resolution of the *directory* it lives
 // in (XDG_RUNTIME_DIR preferred, /tmp as a last-resort fallback) is handled

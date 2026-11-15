@@ -15,6 +15,8 @@ use y4p_wayland as wayland;
 mod ipc;
 pub mod metrics;
 pub mod spool;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod worker;
 
 use crate::storage::{ClipboardDb, ContentLocation};
@@ -82,7 +84,7 @@ fn acquire_start_lock(socket_path: &Path, lock_path: &Path, wait: Duration) -> R
                 if !asked
                     && let Ok(mut stream) = UnixStream::connect(socket_path)
                 {
-                    let _ = stream.write_all(&[IPC_CMD_EXIT]);
+                    let _ = stream.write_all(&[IPC_CMD_EXIT, IPC_DELIMITER]);
                     asked = true;
                 }
                 if started.elapsed() >= wait {
@@ -223,10 +225,12 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> DaemonExit {
         // for `poll(2)` to read from and write `revents` back into.
         if unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, 500) } < 0 { continue; }
 
-        // IPC Ingress Handling: Status replies inline via `accept_and_dispatch`;
-        // Exit/Restore are dispatched here, same as before.
+        // IPC Ingress Handling: Status, Delete and Wipe reply inline via
+        // `accept_and_dispatch` (the mutations on the worker's own writer
+        // connection, so every SQLite write stays serialised); Exit, Restore,
+        // Pause and Resume are dispatched here, same as before.
         if poll_fds[1].revents & libc::POLLIN != 0
-            && let Some(cmd) = ipc::accept_and_dispatch(&listener, || {
+            && let Some(cmd) = ipc::accept_and_dispatch(&listener, &writer, || {
                 metrics.format_status(
                     state.paused,
                     state.ingest_stats.shed_readers(),
@@ -237,7 +241,9 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> DaemonExit {
                 match cmd {
                     Command::Exit => crate::core::request_exit(),
                     Command::Restore(real_id) => handle_restore_request(&mut state, &qh, real_id, &conn, &metrics, &read_db),
-                    Command::Status => {}
+                    // Answered inside `accept_and_dispatch`, on the writer
+                    // connection; nothing left to do here.
+                    Command::Status | Command::Delete(_) | Command::Wipe => {}
                     Command::Pause => {
                         state.paused = true;
                         if state.verbose { println!("{}{}", LOG_INFO, MSG_MONITOR_PAUSED); }
@@ -531,9 +537,13 @@ mod tests {
 
             // It asks over the IPC socket rather than unlinking it...
             let (mut stream, _) = listener.accept().unwrap();
-            let mut command = [0u8; 1];
+            let mut command = [0u8; 2];
             stream.read_exact(&mut command).unwrap();
-            assert_eq!(command[0], IPC_CMD_EXIT, "a replacement daemon must ask the old one to leave");
+            assert_eq!(
+                command,
+                [IPC_CMD_EXIT, IPC_DELIMITER],
+                "a replacement daemon must send a delimited EXIT frame to the old one"
+            );
 
             // ...and only takes the lock once the old daemon's guards have run.
             drop(held);

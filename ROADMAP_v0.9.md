@@ -25,11 +25,11 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
   - Propagate `cache.store` errors prior to database row insertion; never insert a metadata record if the binary payload write fails.
   - Verify file existence in `locate_content` before handing descriptors to egress, returning explicit errors on missing disk files.
 
-- [ ] **v0.8.3: APNG Animation Preservation (P0)**
+- [x] **v0.8.3: APNG Animation Preservation (P0)**
   - Detect `acTL` chunks in incoming PNG payloads (0-allocation header check).
   - Bypass ImageMagick transcoding for APNGs, preventing multi-frame sequences from being flattened into single-frame static PNGs.
 
-- [ ] **v0.8.4: Daemon Lifecycle & Socket Hardening (P0)**
+- [x] **v0.8.4: Daemon Lifecycle & Socket Hardening (P0)**
   - Ensure daemon exits with non-zero status upon compositor disconnect or unrecoverable error.
   - Eliminate socket unlink races during daemon restarts via abstract namespace sockets (`\0y4p.sock`) or advisory locking (`flock`).
   - Bundle standard `systemd` user service unit with `Restart=on-failure`.
