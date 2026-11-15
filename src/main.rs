@@ -92,15 +92,23 @@ fn main() {
     match cli::handle_command(&args, db) {
         CliAction::None => {}
         CliAction::RunDaemon(db, verbose) => {
-            let started = daemon::start_daemon(db, verbose);
-            // BUGFIX: previously this message was printed unconditionally, even
-            // when `start_daemon` failed before ever binding the socket or
-            // reaching the compositor — misleadingly implying a daemon had been
-            // running and then stopped, when in fact it never started.
-            if started {
-                eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_STOP);
-            } else {
-                eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_START_FAILED);
+            // Only an exit the user asked for is a normal one. The other two
+            // leave a non-zero status so `systemd`'s `Restart=on-failure` (see
+            // `contrib/systemd/y4p.service`) can act on them: previously every
+            // path fell through to status 0, so a daemon that never started or
+            // lost its compositor looked like a clean shutdown.
+            match daemon::start_daemon(db, verbose) {
+                daemon::DaemonExit::Clean => {
+                    eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_STOP);
+                }
+                daemon::DaemonExit::StartFailed => {
+                    eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_START_FAILED);
+                    std::process::exit(1);
+                }
+                daemon::DaemonExit::ConnectionLost => {
+                    eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_STOP);
+                    std::process::exit(1);
+                }
             }
         }
         CliAction::PasteFrom(mime) => {
