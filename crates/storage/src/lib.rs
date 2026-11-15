@@ -71,6 +71,7 @@ pub type MetaRow = (i64, i64, String, i64, Option<String>, bool);
 /// `insert_with_hash`), never the large-binary case this exists for, so
 /// that half of the original plan was intentionally not pursued — see
 /// PERFORMANCE.md for the cost/benefit writeup.
+#[derive(Debug, PartialEq, Eq)]
 pub enum ContentLocation {
     InlineBlob(i64),
     CacheFile(PathBuf),
@@ -160,12 +161,34 @@ impl ClipboardDb {
     /// Skipped inserts (empty payload, sensitive MIME) return `Ok(-1)` as an
     /// explicit "nothing to reference" sentinel — there is no record for a
     /// caller to act on in that case.
+    ///
+    /// A cache-class payload is written to `<hash>.cache` *before* its row,
+    /// and a failed write fails the whole call: a row must never exist whose
+    /// bytes the cache does not hold. If the row then fails to commit, a file
+    /// this call placed is taken back out, mirroring `insert_spooled`.
     pub fn insert_with_hash(&mut self, mime: &str, data: &[u8], hash: &str, max_history: usize) -> Result<i64, String> {
-        let outcome = self.store.upsert_record(mime, data, hash, max_history)?;
-        if outcome.real_id == -1 { return Ok(-1); }
+        let cache_class = !db::is_skipped(mime, data.len() as u64) && db::is_cache_class(mime);
+        let placed = if cache_class {
+            Some(self.cache.store(hash, data).map_err(|e| format!("cache write failed: {}", e))?)
+        } else {
+            None
+        };
 
-        if outcome.is_image {
-            let _ = self.cache.store(hash, data);
+        let outcome = match self.store.upsert_record(mime, data, hash, max_history) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if placed == Some(Adoption::Placed) {
+                    self.cache.remove(hash);
+                }
+                return Err(e);
+            }
+        };
+        if outcome.real_id == -1 {
+            // Nothing was stored, so nothing may stay cached for it.
+            if placed == Some(Adoption::Placed) {
+                self.cache.remove(hash);
+            }
+            return Ok(-1);
         }
         self.cache.remove_many(&outcome.expired_hashes);
 
@@ -272,13 +295,23 @@ impl ClipboardDb {
     /// to decide whether a `copy-to` can be served via `sendfile(2)`
     /// directly from the cache file, or must go through the existing
     /// in-memory path (small/inline payloads).
-    pub fn locate_content(&self, id: i64) -> Option<(String, ContentLocation)> {
-        let (mime, has_content, hash) = self.store.get_row_location(id)?;
+    ///
+    /// The cache file is checked to be there before its path is handed out:
+    /// egress would otherwise offer a descriptor that cannot be opened and
+    /// lose the paste silently. A missing file is an `Err` naming the row and
+    /// the expected path, never `Ok(Some(..))`.
+    pub fn locate_content(&self, id: i64) -> Result<Option<(String, ContentLocation)>, String> {
+        let Some((mime, has_content, hash)) = self.store.get_row_location(id) else {
+            return Ok(None);
+        };
         if has_content {
-            Some((mime, ContentLocation::InlineBlob(id)))
-        } else {
-            Some((mime, ContentLocation::CacheFile(self.cache.path(&hash))))
+            return Ok(Some((mime, ContentLocation::InlineBlob(id))));
         }
+        let path = self.cache.path(&hash);
+        if !path.is_file() {
+            return Err(format!("cache file for row {} is missing at {}", id, path.display()));
+        }
+        Ok(Some((mime, ContentLocation::CacheFile(path))))
     }
 
     /// Update record timestamp. Standardized to &mut self for state consistency.
@@ -402,7 +435,7 @@ mod tests {
         let target = f.cache_file(&bytes);
         assert_eq!(inode(&target), ino, "same inode: the spool file was renamed, not copied");
         assert!(f.spool_is_empty());
-        let Some((mime, ContentLocation::CacheFile(path))) = f.db.locate_content(id) else { panic!("an image lives in a cache file") };
+        let Some((mime, ContentLocation::CacheFile(path))) = f.db.locate_content(id).unwrap() else { panic!("an image lives in a cache file") };
         assert_eq!((mime.as_str(), path), ("image/gif", target));
         assert_eq!(f.db.get_content_by_id(id).unwrap().1, bytes);
         let meta = f.db.fetch_metadata(10);
@@ -474,7 +507,7 @@ mod tests {
         let bytes = pattern(400_000, 7);
         let id = f.db.insert_spooled("application/pdf", f.spooled("1-1.part", &bytes), 100).unwrap();
 
-        assert!(matches!(f.db.locate_content(id), Some((_, ContentLocation::InlineBlob(_)))));
+        assert!(matches!(f.db.locate_content(id).unwrap(), Some((_, ContentLocation::InlineBlob(_)))));
         assert_eq!(f.db.get_content_by_id(id).unwrap().1, bytes);
         assert!(f.spool_is_empty());
         assert_eq!(f.cache_files(), 0, "an inline payload is not also cached");
@@ -547,6 +580,64 @@ mod tests {
         assert!(f.spool_is_empty());
     }
 
+    // --- insert_with_hash: the cache write precedes the row ---
+
+    #[test]
+    fn a_memory_image_is_cached_by_the_time_its_row_exists() {
+        let mut f = Fixture::new("store-first");
+        let bytes = pattern(12_000, 16);
+        let id = f.db.insert_raw("image/png", &bytes).unwrap();
+
+        assert_eq!(fs::read(f.cache_file(&bytes)).unwrap(), bytes);
+        let Some((mime, ContentLocation::CacheFile(path))) = f.db.locate_content(id).unwrap() else { panic!("an image lives in a cache file") };
+        assert_eq!((mime.as_str(), path), ("image/png", f.cache_file(&bytes)));
+    }
+
+    #[test]
+    fn a_cache_write_that_fails_leaves_no_row() {
+        let mut f = Fixture::new("store-fail");
+        // Without the cache directory, writing `<hash>.cache` cannot succeed.
+        fs::remove_dir_all(&f.cache).unwrap();
+        let bytes = pattern(4_000, 17);
+
+        let err = f.db.insert_raw("image/png", &bytes).unwrap_err();
+
+        assert!(err.contains("cache write failed"), "{err}");
+        assert_eq!(f.db.get_total_count(), 0, "no row may point at a payload the cache never held");
+    }
+
+    #[test]
+    fn a_row_that_fails_to_commit_takes_the_stored_file_back_out() {
+        let mut f = Fixture::new("store-rollback");
+        // Sabotage from a second connection: the insert then fails after the
+        // file has been written.
+        Connection::open(f.root.join("y4p.db")).unwrap().execute_batch("DROP TABLE clipboard;").unwrap();
+        let bytes = pattern(6_000, 18);
+
+        assert!(f.db.insert_raw("image/png", &bytes).is_err());
+
+        assert!(!f.cache_file(&bytes).exists(), "no cache file without a row");
+    }
+
+    #[test]
+    fn locating_a_record_whose_cache_file_is_missing_is_an_error() {
+        let mut f = Fixture::new("locate-missing");
+        let bytes = pattern(3_000, 19);
+        let id = f.db.insert_raw("image/png", &bytes).unwrap();
+        fs::remove_file(f.cache_file(&bytes)).unwrap();
+
+        let err = f.db.locate_content(id).unwrap_err();
+
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.contains(&id.to_string()), "{err}");
+    }
+
+    #[test]
+    fn locating_a_record_that_does_not_exist_is_none_not_an_error() {
+        let f = Fixture::new("locate-absent");
+        assert!(f.db.locate_content(999_999).unwrap().is_none());
+    }
+
     // --- wipe ---
 
     #[test]
@@ -571,7 +662,7 @@ mod tests {
         let bytes = pattern(500_000, 13);
         let id = f.db.insert_spooled("application/pdf", f.spooled("1-1.part", &bytes), 100).unwrap();
 
-        assert!(matches!(f.db.locate_content(id), Some((_, ContentLocation::InlineBlob(_)))), "still inline: the bytes are in the database");
+        assert!(matches!(f.db.locate_content(id).unwrap(), Some((_, ContentLocation::InlineBlob(_)))), "still inline: the bytes are in the database");
         assert_eq!(f.db.get_content_by_id(id).unwrap(), ("application/pdf".to_owned(), bytes));
         assert_eq!(f.cache_files(), 0);
         assert!(f.spool_is_empty());
