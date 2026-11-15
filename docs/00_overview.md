@@ -181,4 +181,4 @@ Since v0.7.8 the job also carries a `BytePermit`: a reservation of its payload's
 | How ingress filters sensitive and redundant offers, what is and is not modified before storage, and how `y4p.toml` is parsed | [05 — Filter Pipeline & Dynamic Egress](05_filter_pipeline_and_app_rules.md) |
 | How images are sniffed, sandboxed, time-boxed and circuit-broken | [06 — Local Image Pipeline & Defence-in-Depth](06_local_image_pipeline.md) |
 
-Repository governance (not architecture) lives outside this directory: [`.github/AI_POLICY.md`](../.github/AI_POLICY.md).
+Repository governance (not architecture) lives outside this directory: [`.github/POLICY.md`](../.github/POLICY.md).

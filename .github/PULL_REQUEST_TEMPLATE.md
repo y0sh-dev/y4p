@@ -1,17 +1,10 @@
-
 ### Overview
-<!-- What does this PR do in 1-2 sentences? -->
+<!-- What does this PR do, and why is it necessary? Keep it to 1-2 concise sentences. -->
 
 ### Key Changes
 - 
 - 
 
-### Why this is necessary
+### Verification
+<!-- Commands run and observed results (e.g. `bash scripts/check.sh`) -->
 - 
-- 
-
----
-### AI Usage
-<!-- Remove this section if no AI was used for coding/logic -->
-- **Model:** Claude Sonnet / Gemini Flash
-- **Purpose:**
