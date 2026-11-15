@@ -21,7 +21,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
   - Guarantee stalled or malicious sending applications cannot hold `ReaderGate` slots indefinitely (preventing the 8-reader deadlock).
   - Surface read timeouts explicitly as accounted sheds in `y4p status`.
 
-- [ ] **v0.8.2: Cache Integrity & Silent Data Loss Eradication (P0)**
+- [x] **v0.8.2: Cache Integrity & Silent Data Loss Eradication (P0)**
   - Propagate `cache.store` errors prior to database row insertion; never insert a metadata record if the binary payload write fails.
   - Verify file existence in `locate_content` before handing descriptors to egress, returning explicit errors on missing disk files.
 

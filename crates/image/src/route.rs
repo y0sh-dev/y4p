@@ -27,7 +27,7 @@ use crate::core::constants::{
     MSG_IMAGE_TOOL_MISSING, log_image_breaker_closed, log_image_breaker_open,
     log_image_scratch_unavailable, log_image_throttled,
 };
-use crate::core::utils::{detect_image_mime, is_animated_webp};
+use crate::core::utils::{detect_image_mime, is_animated_png, is_animated_webp};
 use crate::breaker::{CircuitBreaker, PermitOutcome};
 use crate::magick;
 use crate::pipeline::{PipelineError, Transfer};
@@ -46,9 +46,9 @@ pub const SNIFF_HEAD_BYTES: usize = 512;
 ///   loss), EXIF orientation baked in, every metadata block removed. PNG is
 ///   the one raster MIME every Wayland paste target requests, so a stored
 ///   `image/webp` could not be pasted into most applications.
-/// - GIF and animated WebP are left alone: transcoding keeps only the first frame
-///   (a safety property for untrusted input), which would silently destroy
-///   animations the user copied.
+/// - GIF, animated WebP and animated PNG are left alone: transcoding keeps only
+///   the first frame (a safety property for untrusted input), which would
+///   silently destroy animations the user copied.
 ///
 /// A JPEG or WebP source grows when re-encoded losslessly (several times for
 /// a photo); that is the price of an encoding every client accepts.
@@ -81,7 +81,8 @@ fn classify(mime: &str, payload: &[u8]) -> Option<InputFormat> {
 /// this is `true`; otherwise it is stored exactly as it arrived and its bytes
 /// never need to enter the heap. `head` must hold at least the first
 /// `SNIFF_HEAD_BYTES` bytes of the payload (or all of it, when shorter), which
-/// also covers the 21 bytes the animated-WebP check inspects.
+/// also covers the 21 bytes the animated-WebP check inspects and the PNG chunk
+/// headers the animated-PNG check walks.
 ///
 /// This is the *classification* half of `route_with`, factored so the two
 /// cannot disagree about what a converter would touch. Whether a conversion then
@@ -104,6 +105,12 @@ fn plan(mime: &str, head: &[u8]) -> Option<Transcode> {
     }
     let input = classify(mime, head)?;
     if input == InputFormat::Webp && is_animated_webp(head) {
+        return None;
+    }
+    // APNG rides on the PNG container, so the format alone cannot tell the two
+    // apart: the chunks must. `magick`'s `png:-[0]` would keep only the first
+    // frame and drop the `acTL` chunk.
+    if input == InputFormat::Png && is_animated_png(head) {
         return None;
     }
     let output = ingest_target(input)?;
@@ -420,6 +427,24 @@ mod tests {
         data
     }
 
+    /// An APNG: PNG signature, then `IHDR`, `acTL`, `IDAT`, `IEND` — the
+    /// shortest chunk list the animation check has to see.
+    fn fake_apng() -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (chunk_type, payload) in [
+            (b"IHDR", &[0u8; 13][..]),
+            (b"acTL", &[0, 0, 0, 2, 0, 0, 0, 2][..]),
+            (b"IDAT", &[0u8; 4][..]),
+            (b"IEND", &[][..]),
+        ] {
+            png.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            png.extend_from_slice(chunk_type);
+            png.extend_from_slice(payload);
+            png.extend_from_slice(&[0; 4]); // CRC: never validated
+        }
+        png
+    }
+
     fn fresh_breaker() -> CircuitBreaker {
         CircuitBreaker::new(3, Duration::from_secs(30))
     }
@@ -522,6 +547,8 @@ mod tests {
             ("image/jpeg", jpeg),
             ("image/webp", fake_webp()),
             ("image/webp", fake_animated_webp()),
+            ("image/png", fake_apng()),
+            ("application/octet-stream", fake_apng()),
             ("image/gif", gif),
             ("image/svg+xml", svg.clone()),
             ("image/png", svg),
@@ -562,6 +589,38 @@ mod tests {
         let (routed, called) = route_recording("image/webp", webp.clone(), Ok(fake_png()));
         assert!(called.is_none(), "animated webp must not be re-encoded");
         assert_eq!(routed, ("image/webp".to_owned(), webp));
+    }
+
+    #[test]
+    fn animated_png_is_left_untouched_by_policy_so_its_animation_survives() {
+        let apng = fake_apng();
+        assert!(!wants_transcode("image/png", &apng));
+        let (routed, called) = route_recording("image/png", apng.clone(), Ok(fake_png()));
+        assert!(called.is_none(), "an APNG must not be flattened by the converter");
+        assert_eq!(routed, ("image/png".to_owned(), apng));
+    }
+
+    #[test]
+    fn animated_png_behind_a_generic_label_is_left_untouched_too() {
+        // Bytes outrank the label: an APNG announced as a generic blob is still
+        // classified as PNG, and still must not be flattened.
+        let apng = fake_apng();
+        assert!(!wants_transcode("application/octet-stream", &apng));
+        let (routed, called) = route_recording("application/octet-stream", apng.clone(), Ok(fake_png()));
+        assert!(called.is_none(), "the label must not turn an APNG into a conversion");
+        assert_eq!(routed, ("application/octet-stream".to_owned(), apng));
+    }
+
+    #[test]
+    fn the_file_road_bypasses_an_apng_without_calling_the_converter() {
+        let apng = fake_apng();
+        let called = Cell::new(false);
+        let route = route_file_with::<(), _>("image/png", &apng, &fresh_breaker(), &roomy_throttle(), |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert_eq!(route, FileRoute::Original);
+        assert!(!called.get(), "the file must be stored as it is");
     }
 
     #[test]

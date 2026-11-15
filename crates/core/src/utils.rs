@@ -134,6 +134,48 @@ pub fn is_animated_webp(data: &[u8]) -> bool {
         && (data[20] & 0x02) != 0
 }
 
+/// Returns whether a byte stream represents an animated PNG (APNG).
+///
+/// APNG reuses the PNG container and marks animation with an `acTL` (animation
+/// control) chunk, which the specification requires to appear before the first
+/// `IDAT`. The walk over the chunk list therefore stops at `IDAT` or `IEND`:
+/// whatever follows, a stream with no `acTL` before its image data is a still
+/// image.
+///
+/// Each chunk contributes a 4-byte big-endian length, a 4-byte type, the
+/// payload and a 4-byte CRC. Only those framing bytes are read, so nothing is
+/// allocated and no payload is decoded. A length that would overflow, or a
+/// stream that ends before the chunk it announces, ends the walk with `false`.
+pub fn is_animated_png(data: &[u8]) -> bool {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    let Some((signature, mut rest)) = data.split_at_checked(SIGNATURE.len()) else {
+        return false;
+    };
+    if signature != SIGNATURE {
+        return false;
+    }
+    while let Some((header, body)) = rest.split_at_checked(8) {
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let chunk_type = &header[4..8];
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            return false;
+        }
+        // `len` excludes the CRC, which must also fit before the next header.
+        let Some(skip) = usize::try_from(len).ok().and_then(|len| len.checked_add(4)) else {
+            return false;
+        };
+        let Some(next) = body.get(skip..) else {
+            return false;
+        };
+        if chunk_type == b"acTL" {
+            return true;
+        }
+        rest = next;
+    }
+    false
+}
+
 /// True when `mime`'s base type (see `mime_base`) is HTML or XHTML markup
 /// (`text/html` or `application/xhtml+xml`) eligible for forced plain-text fallback.
 pub fn is_html_mime(mime: &str) -> bool {
@@ -456,6 +498,103 @@ mod tests {
         assert!(!is_rtf_mime("text/plain"));
         assert!(!is_rtf_mime("text/html"));
         assert!(!is_rtf_mime("image/png"));
+    }
+
+    // --- is_animated_png ---
+
+    /// A PNG signature followed by the given chunks, each framed as
+    /// `[length: u32 BE][type: 4B][payload][crc: 4B]`. The CRC is filled with
+    /// zeroes: the detector never validates it.
+    fn png_with(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (chunk_type, payload) in chunks {
+            png.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            png.extend_from_slice(*chunk_type);
+            png.extend_from_slice(payload);
+            png.extend_from_slice(&[0; 4]);
+        }
+        png
+    }
+
+    const IHDR_PAYLOAD: [u8; 13] = [0; 13];
+    const ACTL_PAYLOAD: [u8; 8] = [0, 0, 0, 2, 0, 0, 0, 2];
+
+    #[test]
+    fn is_animated_png_detects_actl_before_the_image_data() {
+        let apng = png_with(&[
+            (b"IHDR", &IHDR_PAYLOAD),
+            (b"acTL", &ACTL_PAYLOAD),
+            (b"IDAT", &[1, 2, 3]),
+            (b"IEND", &[]),
+        ]);
+        assert!(is_animated_png(&apng));
+    }
+
+    #[test]
+    fn is_animated_png_looks_past_ancillary_chunks_before_actl() {
+        let apng = png_with(&[
+            (b"IHDR", &IHDR_PAYLOAD),
+            (b"gAMA", &[0; 4]),
+            (b"pHYs", &[0; 9]),
+            (b"acTL", &ACTL_PAYLOAD),
+            (b"IDAT", &[1, 2, 3]),
+        ]);
+        assert!(is_animated_png(&apng));
+    }
+
+    #[test]
+    fn is_animated_png_rejects_static_and_other_streams() {
+        let still = png_with(&[(b"IHDR", &IHDR_PAYLOAD), (b"IDAT", &[1, 2, 3]), (b"IEND", &[])]);
+        assert!(!is_animated_png(&still));
+
+        // A signature with no chunks at all, streams that are not PNGs, and a
+        // signature that misses by one byte.
+        assert!(!is_animated_png(b"\x89PNG\r\n\x1a\n"));
+        assert!(!is_animated_png(b"GIF89a"));
+        assert!(!is_animated_png(b"RIFF\x00\x00\x00\x00WEBP"));
+        assert!(!is_animated_png(b""));
+        assert!(!is_animated_png(b"\x89PNG\r\n\x1a\x0b"));
+    }
+
+    #[test]
+    fn is_animated_png_rejects_actl_that_follows_the_image_data() {
+        let late = png_with(&[
+            (b"IHDR", &IHDR_PAYLOAD),
+            (b"IDAT", &[1, 2, 3]),
+            (b"acTL", &ACTL_PAYLOAD),
+            (b"IEND", &[]),
+        ]);
+        assert!(!is_animated_png(&late), "acTL after IDAT does not make an APNG");
+    }
+
+    #[test]
+    fn is_animated_png_ends_quietly_on_truncated_or_malformed_chunks() {
+        let apng = png_with(&[
+            (b"IHDR", &IHDR_PAYLOAD),
+            (b"acTL", &ACTL_PAYLOAD),
+            (b"IDAT", &[1, 2, 3]),
+            (b"IEND", &[]),
+        ]);
+        // The stream only becomes an APNG once the whole acTL chunk has arrived.
+        let actl_end = 8 + (4 + 4 + IHDR_PAYLOAD.len() + 4) + (4 + 4 + ACTL_PAYLOAD.len() + 4);
+        for len in 0..apng.len() {
+            let expected = len >= actl_end;
+            assert_eq!(is_animated_png(&apng[..len]), expected, "truncated at {len}");
+        }
+
+        // A chunk header whose declared length runs past the end of the slice.
+        let mut lying = b"\x89PNG\r\n\x1a\n".to_vec();
+        lying.extend_from_slice(&u32::MAX.to_be_bytes());
+        lying.extend_from_slice(b"acTL");
+        lying.extend_from_slice(&ACTL_PAYLOAD);
+        assert!(!is_animated_png(&lying));
+
+        // A declared length that leaves no room for the CRC that follows it.
+        let mut short = b"\x89PNG\r\n\x1a\n".to_vec();
+        short.extend_from_slice(&u32::try_from(ACTL_PAYLOAD.len()).unwrap().to_be_bytes());
+        short.extend_from_slice(b"acTL");
+        short.extend_from_slice(&ACTL_PAYLOAD);
+        assert!(!is_animated_png(&short), "no room for the CRC");
     }
 
     // --- is_animated_webp ---
