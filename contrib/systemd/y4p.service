@@ -1,0 +1,25 @@
+# Standard systemd user unit for the y4p clipboard daemon.
+#
+# Install for the current user:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/y4p.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now y4p.service
+#
+# `Restart=on-failure` is only meaningful because the daemon reports a failed
+# start and a lost compositor connection as a non-zero exit status; it exits 0
+# only when the stop was requested (see `DaemonExit` in
+# crates/daemon/src/lib.rs).
+[Unit]
+Description=y4p Wayland clipboard manager
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env y4p daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

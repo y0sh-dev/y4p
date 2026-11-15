@@ -23,6 +23,7 @@ use crate::wayland::state::{WaylandState, SourceMetadata};
 use crate::core::constants::*;
 use crate::core::utils::is_html_mime;
 use crate::core::SocketGuard;
+use crate::core::SocketLock;
 use ipc::Command;
 use metrics::DaemonMetrics;
 use worker::DbWorker;
@@ -30,42 +31,121 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::io::{ErrorKind, Write};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 use wayland_client::backend::{ReadEventsGuard, WaylandError};
 
+/// How the daemon's run ended, so the caller can choose an exit status.
+///
+/// `systemd`'s `Restart=on-failure` restarts a unit only on a non-zero exit,
+/// so a compositor that vanished must not be reported as a clean shutdown:
+/// doing so would leave the user with no clipboard manager until the next
+/// login. Only an exit that was actually asked for is clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonExit {
+    /// SIGINT/SIGTERM, or an IPC `Exit` request: the daemon was asked to stop.
+    Clean,
+    /// The daemon never reached its serving state: the start-up lock, the IPC
+    /// socket, the compositor or the database connection failed.
+    StartFailed,
+    /// The compositor connection ended while no exit had been requested.
+    ConnectionLost,
+}
+
+/// How long a starting daemon waits for an already-running one to release the
+/// start-up lock after being asked to exit. It must cover the exiting loop's
+/// attention to the IPC command (its `poll` timeout is 500 ms) plus its guards,
+/// and still be short enough that an unwedged `y4p daemon` does not hang.
+const LOCK_WAIT_MS: u64 = 2000;
+/// How often the start-up lock is retried while that wait runs.
+const LOCK_RETRY_MS: u64 = 25;
+
+/// Takes the daemon start-up lock, asking whoever holds it to exit first.
+///
+/// Starting the daemon while one is running replaces it, as it always has. The
+/// running instance is therefore sent `IPC_CMD_EXIT` once its socket accepts
+/// the connection, and the lock is retried until that instance has dropped its
+/// `SocketGuard` (unlinked the socket) and its lock. The wait is bounded: a
+/// daemon that does not get out of the way within `wait` is reported as a start
+/// failure instead of being left to race on the socket.
+fn acquire_start_lock(socket_path: &Path, lock_path: &Path, wait: Duration) -> Result<SocketLock, String> {
+    let started = Instant::now();
+    let mut asked = false;
+    loop {
+        match SocketLock::try_acquire(lock_path) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // Ask once the socket is reachable: a daemon that is still
+                // binding has no listener yet, so the attempt is retried with
+                // the lock rather than counted as "asked".
+                if !asked
+                    && let Ok(mut stream) = UnixStream::connect(socket_path)
+                {
+                    let _ = stream.write_all(&[IPC_CMD_EXIT]);
+                    asked = true;
+                }
+                if started.elapsed() >= wait {
+                    return Err(format!(
+                        "another daemon still held {} after {} ms; giving up",
+                        lock_path.display(),
+                        wait.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(LOCK_RETRY_MS));
+            }
+            Err(e) => return Err(format!("cannot lock {}: {}", lock_path.display(), e)),
+        }
+    }
+}
+
+/// Maps how the event loop ended to the reported outcome: a loop that stopped
+/// without an exit request was cut short by the compositor connection, and that
+/// is what the caller must be able to see in the exit status.
+fn classify_loop_end(requested_exit: bool) -> DaemonExit {
+    if requested_exit { DaemonExit::Clean } else { DaemonExit::ConnectionLost }
+}
+
 /// Initialise and run the clipboard daemon with a unified, high-performance event loop.
 ///
-/// Returns `true` if the daemon actually reached its serving state (bound
-/// the socket, connected to the compositor, obtained the data-control
-/// manager and a seat) at least once before its loop exited. Returns
-/// `false` if it failed to start at all, so the caller can report an
-/// accurate status instead of the previous unconditional "daemon process
-/// terminated." (which was printed even on a startup failure that never
-/// served a single request).
+/// Returns how the run ended. `DaemonExit::StartFailed` means the daemon never
+/// reached its serving state, and `DaemonExit::ConnectionLost` means the
+/// compositor connection ended without an exit request; only
+/// `DaemonExit::Clean` is a shutdown the user asked for. The caller turns the
+/// first two into a non-zero process status so `systemd`'s
+/// `Restart=on-failure` can act on them.
 // `mut` is unused post-refactor (ownership moves straight into `DbWorker`)
 // but kept to preserve this fn's exact external signature.
 #[allow(unused_mut)]
-pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
+pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> DaemonExit {
     let socket_path = crate::core::get_socket_path();
+    let lock_path = SocketLock::path_for(&socket_path);
 
-    if let Ok(mut stream) = UnixStream::connect(&socket_path) {
-        let _ = stream.write_all(&[IPC_CMD_EXIT]);
-        std::thread::sleep(Duration::from_millis(RECONNECT_DELAY_MS));
-    }
+    // Declared before `_guard` on purpose: locals drop in reverse declaration
+    // order, so the socket file is unlinked by the guard *before* the lock is
+    // released here. A starting daemon that has taken the lock can therefore
+    // never observe a socket that a live daemon still owns.
+    let _lock = match acquire_start_lock(&socket_path, &lock_path, Duration::from_millis(LOCK_WAIT_MS)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{}{}", LOG_ERROR, e);
+            return DaemonExit::StartFailed;
+        }
+    };
 
+    // No other daemon can be serving now, so a socket still at this path is a
+    // leftover from one that is gone.
     let _ = fs::remove_file(&socket_path);
 
     // BUGFIX: was `.expect(...)`, which — combined with `panic = "abort"` in
-    // the release profile — turned an ordinary, recoverable failure (e.g.
-    // another daemon instance genuinely still holding the socket, or a
-    // permissions problem in the runtime directory) into a hard process
-    // abort with a generic panic message instead of a clear diagnostic.
+    // the release profile — turned an ordinary, recoverable failure (e.g. a
+    // permissions problem in the runtime directory) into a hard process abort
+    // with a generic panic message instead of a clear diagnostic.
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{}failed to bind IPC socket at {}: {}", LOG_ERROR, socket_path.display(), e);
-            return false;
+            return DaemonExit::StartFailed;
         }
     };
     let _ = listener.set_nonblocking(true);
@@ -80,7 +160,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
 
     let Some((conn, mut event_queue)) = wayland::create_connection() else {
         eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);
-        return false;
+        return DaemonExit::StartFailed;
     };
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -93,7 +173,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{}failed to open read-side database handle: {}", LOG_ERROR, e);
-            return false;
+            return DaemonExit::StartFailed;
         }
     };
     let mut state = WaylandState::new_daemon(writer.sender(), verbose, config);
@@ -107,11 +187,11 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
 
     if event_queue.roundtrip(&mut state).is_err() {
         eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);
-        return false;
+        return DaemonExit::StartFailed;
     }
     if !bind_data_device(&mut state, &qh, &conn) {
         eprintln!("{}compositor does not advertise {} and/or {}; cannot serve clipboard.", LOG_ERROR, INTERFACE_MANAGER, INTERFACE_SEAT);
-        return false;
+        return DaemonExit::StartFailed;
     }
 
     println!("{}{}", LOG_INFO, MSG_DAEMON_READY);
@@ -169,7 +249,14 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
                 }
         }
 
-        if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }
+        if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // An exit that was already requested is not a lost connection; the
+            // compositor may well be tearing down because the session is.
+            if !crate::core::is_exiting() {
+                eprintln!("{}compositor connection closed (poll reported POLLHUP/POLLERR).", LOG_ERROR);
+            }
+            break;
+        }
         // `POLLHUP` is not the only way a connection ends. The backend stores
         // the first fatal error it meets (end of file, a protocol error, ...)
         // and fails every later read with it at once, whatever the socket
@@ -185,7 +272,7 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         }
     }
 
-    true
+    classify_loop_end(crate::core::is_exiting())
 }
 
 /// Reads what the compositor has sent. `false` means the connection is gone
@@ -377,5 +464,82 @@ mod tests {
         // Readable at once (end of file), and the read has to report it.
         assert_ne!(poll_in(&conn) & libc::POLLIN, 0, "a closed peer makes the socket readable");
         assert!(!read_compositor_events(queue.prepare_read().unwrap()));
+    }
+
+    // --- daemon lifecycle: exit classification and start-up lock ---
+
+    #[test]
+    fn only_a_requested_exit_is_reported_as_clean() {
+        assert_eq!(classify_loop_end(true), DaemonExit::Clean);
+        assert_eq!(classify_loop_end(false), DaemonExit::ConnectionLost);
+        assert_ne!(DaemonExit::StartFailed, DaemonExit::ConnectionLost);
+    }
+
+    #[test]
+    fn a_lock_held_by_a_running_daemon_fails_the_start_at_the_deadline() {
+        let dir = std::env::temp_dir().join(format!("y4p-start-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("y4p.sock");
+        let lock_path = SocketLock::path_for(&socket);
+        let wait = Duration::from_millis(60);
+
+        let held = SocketLock::try_acquire(&lock_path).unwrap();
+        let started = Instant::now();
+        let err = acquire_start_lock(&socket, &lock_path, wait).unwrap_err();
+        assert!(started.elapsed() >= wait, "the start must wait for the deadline before giving up");
+        assert!(err.contains("still held"), "{err}");
+
+        // Once the holder is gone the same call succeeds immediately.
+        drop(held);
+        assert!(acquire_start_lock(&socket, &lock_path, wait).is_ok());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unlocked_socket_starts_without_asking_anyone_to_exit() {
+        let dir = std::env::temp_dir().join(format!("y4p-start-free-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("y4p.sock");
+
+        let started = Instant::now();
+        let lock = acquire_start_lock(&socket, &SocketLock::path_for(&socket), Duration::from_millis(2000)).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500), "the common path must not wait");
+
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_running_daemon_is_asked_to_exit_and_the_lock_is_taken_once_it_goes() {
+        use std::io::Read;
+
+        let dir = std::env::temp_dir().join(format!("y4p-start-handover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("y4p.sock");
+        let lock_path = SocketLock::path_for(&socket);
+
+        // Stand in for the running daemon: it owns the socket and the lock.
+        let listener = UnixListener::bind(&socket).unwrap();
+        let held = SocketLock::try_acquire(&lock_path).unwrap();
+
+        std::thread::scope(|scope| {
+            let starter = scope.spawn(|| acquire_start_lock(&socket, &lock_path, Duration::from_secs(5)).is_ok());
+
+            // It asks over the IPC socket rather than unlinking it...
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut command = [0u8; 1];
+            stream.read_exact(&mut command).unwrap();
+            assert_eq!(command[0], IPC_CMD_EXIT, "a replacement daemon must ask the old one to leave");
+
+            // ...and only takes the lock once the old daemon's guards have run.
+            drop(held);
+            assert!(starter.join().unwrap(), "the lock must be handed over");
+        });
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
