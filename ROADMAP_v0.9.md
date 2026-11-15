@@ -36,7 +36,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
 
 ### Phase 2: Unified IPC, Memory Purge & Ingress Recovery (`v0.8.5` – `v0.8.8`)
 
-- [ ] **v0.8.5: IPC Daemon Unification & Memory Purge (P0)**
+- [x] **v0.8.5: IPC Daemon Unification & Memory Purge (P0)**
   - Route `wipe` and `delete` through daemon IPC to eliminate concurrent CLI SQLite mutations and file cache deletion races.
   - Trigger daemon-side `PRAGMA shrink_memory;` and `malloc_trim(0)` on `wipe`, shrinking idle daemon RSS back to process baseline (~4 MiB).
 
