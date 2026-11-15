@@ -16,7 +16,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
 
 ### Phase 1: Anti-Hang & Data Integrity Hardening (`v0.8.1` – `v0.8.4`)
 
-- [ ] **v0.8.1: Ingestion Read Deadline & Anti-Hang Guard (P0)**
+- [x] **v0.8.1: Ingestion Read Deadline & Anti-Hang Guard (P0)**
   - Enforce non-blocking pipe ingestion with a strict deadline (`poll(2)`).
   - Guarantee stalled or malicious sending applications cannot hold `ReaderGate` slots indefinitely (preventing the 8-reader deadlock).
   - Surface read timeouts explicitly as accounted sheds in `y4p status`.
