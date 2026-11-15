@@ -14,7 +14,7 @@ use sha3::{Digest, Sha3_256};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// Owns the single writer connection and its background thread. All
 /// persistence goes through this one channel, so SQLite only ever sees one
@@ -44,20 +44,36 @@ use std::sync::{mpsc, Arc};
 /// when persistence, image conversion included, falls behind, producers wait
 /// and then shed rather than letting payloads accumulate (see
 /// `y4p_wayland::ingest`).
+///
+/// The connection itself is behind an `Arc<Mutex<..>>` rather than owned by the
+/// thread, because the daemon's event loop must be able to `delete` and `wipe`
+/// on the very same connection: SQLite sees a strictly serialised writer, and a
+/// `wipe` releases memory (`PRAGMA shrink_memory`, `malloc_trim(3)`) in the
+/// process that actually holds the pages. Every mutation therefore waits behind
+/// whatever job the worker is persisting, and vice versa.
 pub struct DbWorker {
     tx: mpsc::SyncSender<ClipboardJob>,
+    db: Arc<Mutex<ClipboardDb>>,
 }
 
 impl DbWorker {
-    pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
+    pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
         let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
+        let db = Arc::new(Mutex::new(db));
+        let writer = Arc::clone(&db);
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 let ClipboardJob { mime, payload, permit } = job;
-                let stored = match payload {
-                    Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
-                    payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+                let stored = match writer.lock() {
+                    Ok(mut db) => match payload {
+                        Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
+                        payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+                    },
+                    // Only reachable if a writer panicked mid-transaction. The
+                    // job is dropped rather than the worker stopped, exactly as
+                    // an unstorable payload is.
+                    Err(_) => Err("database lock poisoned; payload dropped".to_string()),
                 };
                 // Persisted, or discarded: either way the payload no longer
                 // occupies the queue's byte budget (its spool file was renamed
@@ -77,13 +93,34 @@ impl DbWorker {
             }
         });
 
-        Self { tx }
+        Self { tx, db }
     }
 
     /// Clone of the submission channel, handed to the ingestion path so jobs
     /// can be queued without touching the worker thread directly.
     pub fn sender(&self) -> mpsc::SyncSender<ClipboardJob> {
         self.tx.clone()
+    }
+
+    /// Removes one record on the writer connection, used by the IPC `delete`
+    /// command. `Ok(false)` means no such row.
+    pub fn delete_by_id(&self, id: i64) -> Result<bool, String> {
+        self.with_writer(|db| db.delete_by_id(id).map_err(|e| e.to_string()))
+    }
+
+    /// Purges the whole history on the writer connection, used by the IPC
+    /// `wipe` command, so the `VACUUM` and heap release happen in the daemon:
+    /// the process whose memory is actually holding the cache.
+    pub fn wipe(&self) -> Result<(), String> {
+        self.with_writer(|db| db.wipe().map_err(|e| e.to_string()))
+    }
+
+    /// Runs `f` with exclusive access to the writer connection. `Mutex::lock`
+    /// is fallible, and a poisoned lock is reported rather than unwrapped: the
+    /// daemon must not abort because one writer panicked.
+    fn with_writer<T>(&self, f: impl FnOnce(&mut ClipboardDb) -> Result<T, String>) -> Result<T, String> {
+        let mut db = self.db.lock().map_err(|_| "database lock poisoned; mutation not applied".to_string())?;
+        f(&mut db)
     }
 }
 
@@ -510,5 +547,75 @@ mod tests {
         assert_eq!(mime, "image/webp");
         assert_eq!(data, webp);
         assert_eq!(hash, fingerprint(&webp));
+    }
+
+    // --- serialised mutations on the writer connection ---
+
+    use crate::test_support::PrivateStore;
+
+    /// A worker over a private store seeded through `seed`, returning it
+    /// alongside the worker (the store must outlive the worker's paths).
+    fn worker_over(store: &PrivateStore, seed: &[&[u8]]) -> DbWorker {
+        let mut db = store.open();
+        for payload in seed {
+            db.insert_raw("text/plain", payload).unwrap();
+        }
+        DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100)
+    }
+
+    #[test]
+    fn delete_by_id_runs_on_the_workers_own_connection() {
+        let store = PrivateStore::new("worker-delete");
+        let worker = worker_over(&store, &[b"kept", b"removed"]);
+        let (kept, target) = match store.rows().as_slice() {
+            [first, second, ..] => (*first, *second),
+            other => panic!("expected two rows, found {}", other.len()),
+        };
+
+        assert!(worker.delete_by_id(target).unwrap(), "the row was there and is now deleted");
+        assert!(!worker.delete_by_id(target).unwrap(), "and a second delete finds nothing");
+        assert_eq!(store.rows(), vec![kept], "only the other row survives");
+    }
+
+    #[test]
+    fn wipe_empties_the_store_through_the_worker() {
+        let store = PrivateStore::new("worker-wipe");
+        let worker = worker_over(&store, &[b"first", b"second"]);
+        assert_eq!(store.rows().len(), 2);
+
+        worker.wipe().unwrap();
+
+        assert!(store.rows().is_empty(), "every row is gone");
+        // The connection survives the `VACUUM` and stays usable, which is what
+        // lets the daemon keep ingesting after a wipe.
+        let mut db = store.open();
+        assert!(db.insert_raw("text/plain", b"after the wipe").unwrap() > 0);
+    }
+
+    #[test]
+    fn a_queued_job_and_a_mutation_never_interleave_on_the_connection() {
+        let store = PrivateStore::new("worker-serialised");
+        let metrics = Arc::new(DaemonMetrics::new());
+        let worker = DbWorker::spawn(store.open(), Arc::clone(&metrics), false, 100);
+        let tx = worker.sender();
+
+        // The store is empty, so the queued payload will be row 1. Deleting it
+        // concurrently pins down the race: either order is legitimate, but the
+        // mutation must never observe a half-written row, and the connection
+        // must stay usable afterwards.
+        tx.send(ClipboardJob::new("text/plain".to_owned(), b"queued".to_vec())).unwrap();
+        let deleted = worker.delete_by_id(1).unwrap();
+
+        // The worker records the payload only after committing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while metrics.ingress_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "the queued job never completed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let rows = store.rows();
+        assert_eq!(rows.len(), usize::from(!deleted), "the row survives exactly when the delete came first");
+        assert!(rows.iter().all(|id| *id == 1), "the worker assigned one row, not two");
+        drop(tx);
     }
 }
