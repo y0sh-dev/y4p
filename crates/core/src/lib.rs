@@ -13,8 +13,9 @@ pub mod memory;
 pub mod cdc;
 
 use std::path::{Path, PathBuf};
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::DirBuilderExt;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::constants::{DB_DIR_NAME, DB_FILE_NAME, ENV_MAX_HISTORY, SOCKET_FILE_NAME, SPOOL_DIR_NAME};
 
@@ -153,5 +154,119 @@ impl SocketGuard {
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// RAII exclusive advisory lock (`flock(2)`) on the daemon start-up lock file,
+/// `<socket path>.lock`.
+///
+/// Two daemons must never act on the socket file at once: the exiting one
+/// unlinks it from its [`SocketGuard`], and the starting one unlinks a stale
+/// file before binding. Without a lock those two windows overlap, and the new
+/// daemon can bind a socket the old one is about to remove. Taking the lock
+/// before either touches the socket, and releasing it only after both are done
+/// (see `daemon::start_daemon`'s declaration order), closes that race.
+///
+/// The lock is advisory and belongs to the open file description, which is
+/// exactly what is wanted here: a second [`SocketLock::try_acquire`] fails with
+/// [`std::io::ErrorKind::WouldBlock`] while the first value is alive, even
+/// inside the same process. Closing the descriptor releases it, so dropping
+/// this value is enough.
+#[derive(Debug)]
+pub struct SocketLock {
+    // Held only for the descriptor's lifetime; never read.
+    _file: fs::File,
+}
+
+impl SocketLock {
+    /// The companion lock path for `socket_path`: the socket's own file name
+    /// with `.lock` appended, in the same (per-user, mode-0700) directory.
+    pub fn path_for<P: AsRef<Path>>(socket_path: P) -> PathBuf {
+        let mut path = socket_path.as_ref().as_os_str().to_os_string();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
+
+    /// Takes the lock without waiting. An already-locked file reports
+    /// [`std::io::ErrorKind::WouldBlock`]; an interrupted call is retried
+    /// rather than reported, as `flock(2)` documents.
+    ///
+    /// The lock file is created mode 0600: it sits beside the socket in the
+    /// user's private runtime directory, and its existence is nobody else's
+    /// business.
+    pub fn try_acquire(lock_path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // The lock file's contents are irrelevant; truncating on every
+            // start would only be needless churn (and the lint asks for the
+            // choice to be explicit).
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)?;
+        loop {
+            // SAFETY: `file` owns a valid open descriptor for the whole call;
+            // `flock(2)` only reads that descriptor and cannot fail unsafely.
+            let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if acquired == 0 {
+                return Ok(Self { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn lock_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("y4p-socket-lock-{}-{}", std::process::id(), tag));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_lock_path_is_the_socket_path_with_a_lock_suffix() {
+        assert_eq!(
+            SocketLock::path_for("/run/user/1000/y4p/y4p.sock"),
+            PathBuf::from("/run/user/1000/y4p/y4p.sock.lock"),
+        );
+    }
+
+    #[test]
+    fn a_socket_lock_is_exclusive_and_released_on_drop() {
+        let dir = lock_dir("exclusive");
+        let path = SocketLock::path_for(dir.join("y4p.sock"));
+
+        let first = SocketLock::try_acquire(&path).unwrap();
+        let error = SocketLock::try_acquire(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "a second daemon must not get the lock");
+
+        drop(first);
+        let second = SocketLock::try_acquire(&path).unwrap();
+        drop(second);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_socket_lock_file_is_private_to_its_user() {
+        let dir = lock_dir("mode");
+        let path = SocketLock::path_for(dir.join("y4p.sock"));
+
+        drop(SocketLock::try_acquire(&path).unwrap());
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the lock file must not be readable by others");
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
