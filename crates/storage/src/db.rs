@@ -33,6 +33,10 @@ const BODY_TEXT_SQL: &str = "CASE WHEN is_chunked = 1 THEN (SELECT group_concat(
 /// deliberately skipped (empty / sensitive MIME) and no rotation ran.
 pub struct UpsertOutcome {
     pub real_id: i64,
+    /// Whether the row's payload is cache class. The facade decides where to
+    /// write from the MIME itself (the file must exist before the row does),
+    /// so this is only read by tests asserting the two agree.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub is_image: bool,
     pub expired_hashes: Vec<String>,
 }

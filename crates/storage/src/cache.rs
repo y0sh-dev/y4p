@@ -37,14 +37,27 @@ impl FileCache {
         p
     }
 
+    /// Writes `data` to `<hash>.cache`, reporting whether it had to.
+    ///
     /// Callers dedupe by hash before reaching here, so an existing file at
-    /// this path is already the same content — skip the rewrite.
-    pub fn store(&self, hash: &str, data: &[u8]) -> std::io::Result<()> {
+    /// this path is already the same content and is left alone
+    /// ([`Adoption::Present`]); a fresh write reports [`Adoption::Placed`] so
+    /// the caller can take it back out if the matching row then fails to
+    /// commit. A failed write removes whatever it had created, so an `Err`
+    /// never leaves a truncated entry that a later call would mistake for
+    /// the real content.
+    pub fn store(&self, hash: &str, data: &[u8]) -> io::Result<Adoption> {
         let path = self.path(hash);
-        if !path.exists() {
-            fs::write(path, data)?;
+        if path.exists() {
+            return Ok(Adoption::Present);
         }
-        Ok(())
+        match fs::write(&path, data) {
+            Ok(()) => Ok(Adoption::Placed),
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                Err(e)
+            }
+        }
     }
 
     /// Takes over a finished file as the cache entry for `hash`, without
@@ -125,6 +138,29 @@ mod tests {
     fn cache_files_are_named_hash_dot_cache() {
         let cache = FileCache::new(PathBuf::from("/c"));
         assert_eq!(cache.path("abc"), PathBuf::from("/c/abc.cache"));
+    }
+
+    #[test]
+    fn storing_a_payload_reports_placed_once_and_present_afterwards() {
+        let root = dir("store");
+        let cache = FileCache::new(root.clone());
+
+        assert_eq!(cache.store("h1", b"payload").unwrap(), Adoption::Placed);
+        assert_eq!(fs::read(cache.path("h1")).unwrap(), b"payload");
+        assert_eq!(cache.store("h1", b"payload").unwrap(), Adoption::Present, "an existing entry is never rewritten");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_store_that_cannot_write_reports_the_error_and_leaves_no_entry() {
+        let root = dir("store-fail");
+        let cache = FileCache::new(root.join("absent"));
+
+        assert!(cache.store("h1", b"payload").is_err());
+        assert!(!cache.path("h1").exists(), "a failed write must not leave a truncated entry");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

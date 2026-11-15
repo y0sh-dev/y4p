@@ -122,7 +122,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     wait_for("the GIF row", || row_for(&read_db, "image/gif").is_some());
 
     let id = row_for(&read_db, "image/gif").unwrap();
-    let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a GIF must live in a cache file") };
+    let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id).unwrap() else { panic!("a GIF must live in a cache file") };
     assert_eq!(path, cache_file(&gif_hash), "adoption must land exactly where storage looks");
     assert_eq!(fs::read(&path).unwrap(), gif, "the adopted file is the spooled stream, byte for byte");
     assert_eq!(fs::metadata(&path).unwrap().ino(), spool_ino, "the cache file is the spool file renamed, not a copy storage wrote");
@@ -143,7 +143,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
 
     // --- 3. A large non-image: stored in its row, never cached ---
     let id = row_for(&read_db, "application/octet-stream").unwrap();
-    assert!(matches!(read_db.locate_content(id), Some((_, ContentLocation::InlineBlob(_)))));
+    assert!(matches!(read_db.locate_content(id).unwrap(), Some((_, ContentLocation::InlineBlob(_)))));
     assert_eq!(read_db.get_content_by_id(id).unwrap().1, blob);
     assert!(!cache_file(&blob_hash).exists(), "an inline payload must not also be cached");
 
@@ -180,7 +180,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
         wait_for("the converted PNG row", || row_for(&read_db, "image/png").is_some());
 
         let id = row_for(&read_db, "image/png").unwrap();
-        let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
+        let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id).unwrap() else { panic!("a PNG must live in a cache file") };
         assert_eq!(path, cache_file(&converted_hash), "the row is keyed by the digest of the converted bytes");
         assert_eq!(fs::read(&path).unwrap(), converted, "the cache file is the converter's output, byte for byte");
         assert!(!cache_file(&digest_of(&png)).exists(), "the original must not be cached as well");
@@ -195,7 +195,7 @@ fn spooled_payloads_reach_storage_without_the_heap() {
     tx.send(spooled_job(&spooler, "image/png", &corrupt)).unwrap();
     wait_for("the undecodable PNG row", || rows_for(&read_db, "image/png").len() > known_png_rows.len());
     let id = rows_for(&read_db, "image/png").into_iter().find(|id| !known_png_rows.contains(id)).unwrap();
-    let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id) else { panic!("a PNG must live in a cache file") };
+    let Some((_, ContentLocation::CacheFile(path))) = read_db.locate_content(id).unwrap() else { panic!("a PNG must live in a cache file") };
     assert_eq!(path, cache_file(&corrupt_hash), "falling back keys the row by the original's digest");
     assert_eq!(fs::read(&path).unwrap(), corrupt, "no data may be lost when the conversion fails");
     assert_eq!(entries(&spool_dir), Vec::<String>::new(), "a failed conversion leaves no half-written file");

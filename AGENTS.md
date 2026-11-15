@@ -6,6 +6,7 @@
 - **Zero External Dependencies**: Do not add external crates to `Cargo.toml` without human approval.
 - **Strict Panic-Free**: Do not introduce `unwrap()`, `expect()`, or `panic!()`. Keep Clippy warning-free under `-D warnings`.
 - **Language**: Deliverables (code, comments, commits, PRs, docs) strictly in British English.
+- **Exception Clause**: Any prohibition above may be waived only by presenting a rigorous justification of **mathematical superiority** or **logical inevitability** for overriding it, and obtaining **explicit human authorisation** prior to execution.
 
 ## 1. First 5 Minutes (Immediate Verification)
 1. Verify working branch: `git status && git branch --show-current` (Never edit directly on `main`).
