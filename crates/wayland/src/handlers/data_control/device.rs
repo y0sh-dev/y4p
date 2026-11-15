@@ -49,12 +49,15 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 
             if mimes.is_empty() || is_sensitive(&mimes) { return; }
 
-            // Determine which offered MIME to request: a specific one if
-            // `y4p paste-from <mime>` is waiting for it (Action Mode), or the
-            // richest/most-reproducible one by `MIME_PRIORITY_ORDER`
-            // otherwise (daemon ingestion) — see `select_mime`.
+            // Every MIME worth requesting for this selection, best first: the
+            // ones matching an explicit request (Action Mode), or the
+            // allowlisted chain `MIME_PRIORITY_ORDER` → `image/*` → `text/*`
+            // (daemon ingestion). Offers outside that chain
+            // (`application/octet-stream`, `TARGETS`, untyped blobs, ...) never
+            // become candidates at all — see `select_mime_candidates`.
             let drop_rtf = state.config.should_drop_rtf();
-            let Some(mime_to_get) = select_mime(&mimes, state.target_mime.as_deref(), drop_rtf) else { return; };
+            let candidates = select_mime_candidates(&mimes, state.target_mime.as_deref(), drop_rtf);
+            if candidates.is_empty() { return; }
 
             // Daemon mode only: admit this reader *before* any descriptor is
             // allocated. A refusal costs nothing and cannot hit `EMFILE`;
@@ -72,21 +75,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 None
             };
 
-            // Initialise data transfer pipe
-            // `pipe(2)` fails with `EMFILE`/`ENFILE` once descriptors run out. The
-            // selection is lost either way, so it is counted and reported like
-            // every other shed; `permit` is released by the early return.
-            let Some((read_file, write_fd)) = make_pipe() else {
-                shed_unallocatable_pipe(&state.ingest_stats);
-                return;
-            };
-
-            // Request data transmission from the compositor
-            offer.receive(mime_to_get.clone(), write_fd.as_fd());
-            drop(write_fd);
-            let _ = conn.flush();
-
-            // Offload ingestion and persistence to the worker thread
+            // Offload ingestion and persistence to the worker thread, pipe
+            // allocation included: a sender that does not implement a MIME
+            // closes its end without writing a byte, so the next candidate is
+            // tried on the same selection instead of losing the copy.
             if let Some(ref tx) = state.job_tx {
                 let job_tx_clone = tx.clone();
                 let stats = Arc::clone(&state.ingest_stats);
@@ -94,11 +86,26 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 let spooler = state.spooler.clone();
                 let enqueue_wait = Duration::from_millis(INGEST_ENQUEUE_WAIT_MS);
                 let read_timeout = Duration::from_millis(INGEST_READ_TIMEOUT_MS);
+                // `offer` and `conn` are needed per candidate, so the thread
+                // owns them: the proxy moves in, and the connection is cloned
+                // (threads outlive this handler).
+                let conn = conn.clone();
                 // `Builder::spawn` reports a refused thread instead of
                 // panicking like `thread::spawn`; the closure (and with it the
-                // pipe and the permit) is then dropped, which frees everything.
+                // permit and the candidate list) is then dropped, which frees
+                // everything.
                 let spawned = std::thread::Builder::new().name("y4p-ingest".to_owned()).spawn(move || {
-                    ingest_and_send_with_timeout(read_file, mime_to_get, &job_tx_clone, &stats, &budget, permit, enqueue_wait, read_timeout, spooler.as_deref());
+                    ingest_candidates(
+                        &candidates,
+                        &job_tx_clone,
+                        &stats,
+                        &budget,
+                        permit,
+                        enqueue_wait,
+                        read_timeout,
+                        spooler.as_deref(),
+                        |mime| request_pipe(&offer, &conn, mime),
+                    );
                 });
                 if spawned.is_err() {
                     let total = state.ingest_stats.record_shed_reader();
@@ -106,15 +113,15 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
                 }
             } else {
                 // Action Mode: synchronous read for immediate CLI processing.
-                // Applies the same boundary guard and normalisation as the
-                // daemon path (`ingest_and_send`) so `paste-from` returns
-                // exactly the bytes that would otherwise have been persisted.
+                // The same candidate chain, boundary guard and normalisation as
+                // the daemon path, so `paste-from` returns exactly the bytes
+                // that would otherwise have been persisted.
                 let deadline = Instant::now() + Duration::from_millis(INGEST_READ_TIMEOUT_MS);
-                if let Ok(reader) = DeadlineReader::new(read_file, deadline)
-                    && let Ok(payload) = read_pipe_payload(reader, &mime_to_get, MAX_PAYLOAD_BYTES)
-                    && let Some((_, payload)) = normalise_payload(mime_to_get, payload)
+                if let FallbackOutcome::Ready { mime, payload } =
+                    read_first_candidate(&candidates, deadline, None, |mime| request_pipe(&offer, conn, mime))
+                    && let Ok((_, bytes)) = ClipboardJob::from_payload(mime, payload).into_bytes(MAX_PAYLOAD_BYTES)
                 {
-                    state.rx_buf = payload;
+                    state.rx_buf = bytes;
                 }
             }
         }
@@ -137,38 +144,157 @@ fn shed_unallocatable_pipe(stats: &IngestStats) -> u64 {
 /// Chooses which of an offer's `mimes` to request from the compositor.
 ///
 /// `target_mime` is `Some` only in Action Mode (`y4p paste-from <mime>`
-/// waits for one specific MIME): the matching offer is found via
+/// waits for one specific MIME): the matching offers are found via
 /// `core::utils::mime_base_eq` (case- and whitespace-insensitive, parameters
 /// ignored), so a sender announcing e.g. "TEXT/Plain" or
 /// "text/plain; charset=utf-8" still satisfies a request for "text/plain".
-/// `drop_rtf` is not consulted here — an explicit request names exactly the
+/// `drop_rtf` is not consulted there — an explicit request names exactly the
 /// MIME the caller wants, RTF included, and that request is honoured as-is.
 ///
 /// `target_mime` is `None` in daemon ingestion, where no single MIME is
-/// being awaited: the richest/most-reproducible offer is chosen via
-/// `MIME_PRIORITY_ORDER`, falling back through images, then plain text,
-/// then anything at all. `drop_rtf` (`[mime] drop_rtf` in `y4p.toml`) is
-/// applied at every step of this fallback chain, so RTF is never selected
-/// when it's enabled, even as the last-resort catch-all.
-pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf: bool) -> Option<String> {
+/// being awaited. The result is then the **strict allowlist**, in the order it
+/// should be tried:
+///
+/// 1. anything matching an entry of `MIME_PRIORITY_ORDER`, in that order;
+/// 2. the remaining `image/*` offers;
+/// 3. the remaining `text/*` offers (`drop_rtf` removes RTF from this step).
+///
+/// Anything outside those three groups — `application/octet-stream`,
+/// `application/x-*`, `TARGETS`, an untyped blob — is dropped: a sender that
+/// offers nothing y4p can actually use should cost no transfer attempt, and an
+/// opaque binary of unknown meaning must never be persisted as if it were a
+/// clipboard entry. There is deliberately no catch-all after the text step.
+///
+/// Offers are deduplicated by base type, so a sender announcing both
+/// `text/plain` and `text/plain;charset=utf-8` yields one candidate: the same
+/// bytes would otherwise be requested twice, and the second attempt could only
+/// ever fail.
+pub(crate) fn select_mime_candidates(mimes: &[String], target_mime: Option<&str>, drop_rtf: bool) -> Vec<String> {
+    let mut candidates = Vec::new();
+
     if let Some(target) = target_mime {
-        return mimes.iter().find(|m| crate::core::utils::mime_base_eq(m, target)).cloned();
+        for mime in mimes {
+            if crate::core::utils::mime_base_eq(mime, target) {
+                push_candidate(&mut candidates, mime);
+            }
+        }
+        return candidates;
     }
 
-    MIME_PRIORITY_ORDER.iter()
-        .find_map(|&p| mimes.iter().find(|m| crate::core::utils::mime_base_eq(m, p)))
-        .cloned()
-        .or_else(|| mimes.iter().find(|m| crate::core::utils::starts_with_ignore_ascii_case(m, "image/")).cloned())
-        .or_else(|| mimes.iter().find(|m| crate::core::utils::starts_with_ignore_ascii_case(m, "text/") && (!drop_rtf || !crate::core::utils::is_rtf_mime(m))).cloned())
-        .or_else(|| mimes.iter().find(|m| !drop_rtf || !crate::core::utils::is_rtf_mime(m)).cloned())
+    for &preferred in MIME_PRIORITY_ORDER {
+        for mime in mimes {
+            if crate::core::utils::mime_base_eq(mime, preferred) {
+                push_candidate(&mut candidates, mime);
+            }
+        }
+    }
+    for mime in mimes {
+        if crate::core::utils::starts_with_ignore_ascii_case(mime, "image/") {
+            push_candidate(&mut candidates, mime);
+        }
+    }
+    for mime in mimes {
+        if crate::core::utils::starts_with_ignore_ascii_case(mime, "text/")
+            && (!drop_rtf || !crate::core::utils::is_rtf_mime(mime))
+        {
+            push_candidate(&mut candidates, mime);
+        }
+    }
+
+    candidates
 }
 
-/// Reads a MIME payload from an already-`offer.receive()`d pipe, normalises
-/// it (see `normalise_payload`) and forwards it to the daemon's worker.
+/// Appends `mime` unless an offer of the same base type is already listed.
+///
+/// The first offer of a base type wins, so the order of `mimes` decides between
+/// e.g. `text/plain;charset=utf-8` and `text/plain` when both are present.
+fn push_candidate(candidates: &mut Vec<String>, mime: &str) {
+    if !candidates.iter().any(|listed| crate::core::utils::mime_base_eq(listed, mime)) {
+        candidates.push(mime.to_owned());
+    }
+}
+
+/// Allocates a pipe for one candidate and asks the compositor to fill it:
+/// `offer.receive` on the write end, a flush, and the read end back. `None`
+/// means no descriptor could be allocated (`EMFILE`/`ENFILE`).
+fn request_pipe(offer: &ExtDataControlOfferV1, conn: &Connection, mime: &str) -> Option<std::fs::File> {
+    let (read_file, write_fd) = make_pipe()?;
+    offer.receive(mime.to_owned(), write_fd.as_fd());
+    drop(write_fd);
+    let _ = conn.flush();
+    Some(read_file)
+}
+
+/// What trying a selection's candidate array produced.
+enum FallbackOutcome {
+    /// A candidate delivered a payload, under the MIME it should be stored as.
+    Ready {
+        mime: String,
+        payload: Payload,
+    },
+    /// Every candidate failed to deliver anything: an empty transfer, a read
+    /// error, or a payload that normalised away to nothing.
+    Exhausted,
+    /// A candidate's read hit the selection's deadline.
+    TimedOut,
+    /// No pipe could be allocated for the candidate being tried.
+    NoPipe,
+}
+
+/// Tries each candidate in turn until one delivers a usable payload.
+///
+/// `open` produces the read end for one candidate: in production it allocates a
+/// pipe and asks the compositor to transfer into it (`request_pipe`), in tests
+/// it hands back a prepared pipe. That is the only part of the loop that needs
+/// a live Wayland connection, which is what makes the fallback testable without
+/// a compositor.
+///
+/// `deadline` is shared across the whole array: a selection has one patience
+/// budget, not one per candidate, so a sender that stalls on the first MIME
+/// cannot extend the read indefinitely by offering more of them. A `Failed`
+/// candidate — 0-byte EOF included — moves on to the next, because a sender
+/// that does not implement a MIME typically closes its end without writing a
+/// byte; a timed-out one ends the selection, since the sender, not the MIME,
+/// is the problem.
+fn read_first_candidate<F>(
+    candidates: &[String],
+    deadline: Instant,
+    spooler: Option<&dyn PayloadSpooler>,
+    mut open: F,
+) -> FallbackOutcome
+where
+    F: FnMut(&str) -> Option<std::fs::File>,
+{
+    for mime in candidates {
+        let Some(read_file) = open(mime) else { return FallbackOutcome::NoPipe };
+        match drain_pipe(read_file, mime, MAX_PAYLOAD_BYTES, deadline, spooler) {
+            DrainOutcome::Ready(Drained::Memory(bytes)) => {
+                // A payload that normalises away to nothing (an empty URI list,
+                // say) is no better than an empty read: the next candidate may
+                // still have something usable.
+                if let Some((mime, data)) = normalise_payload(mime.clone(), bytes) {
+                    return FallbackOutcome::Ready { mime, payload: Payload::memory(data) };
+                }
+            }
+            DrainOutcome::Ready(Drained::Spooled { file, head }) => {
+                return FallbackOutcome::Ready {
+                    mime: relabel_by_magic(mime.clone(), &head),
+                    payload: Payload::Spooled(Box::new(file)),
+                };
+            }
+            DrainOutcome::TimedOut => return FallbackOutcome::TimedOut,
+            DrainOutcome::Failed => {}
+        }
+    }
+    FallbackOutcome::Exhausted
+}
+
+/// Tries a selection's `candidates` in order and forwards the first usable
+/// payload to the daemon's worker.
 ///
 /// Factored out of the Selection handler so it can be called from the
 /// dedicated per-selection thread the handler spawns. This layer only drains
-/// the pipe and normalises: image transcoding and fingerprinting are the
+/// the pipes and normalises: image transcoding and fingerprinting are the
 /// worker's concern (or the `spooler`'s, which computes the digest while the
 /// bytes stream past), so this thread never spawns `magick` or hashes anything
 /// itself.
@@ -187,35 +313,9 @@ pub(crate) fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf:
 /// The hand-over is [`ingest::enqueue_bounded`]: besides a queue slot, the
 /// payload needs room in `budget`, and the bytes it reserves travel with the
 /// job until the worker is done with it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
-fn ingest_and_send(
-    read_file: std::fs::File,
-    mime_to_get: String,
-    job_tx: &SyncSender<ClipboardJob>,
-    stats: &IngestStats,
-    budget: &Arc<ByteBudget>,
-    permit: Option<ReaderPermit>,
-    enqueue_wait: Duration,
-    spooler: Option<&dyn PayloadSpooler>,
-) {
-    ingest_and_send_with_timeout(
-        read_file,
-        mime_to_get,
-        job_tx,
-        stats,
-        budget,
-        permit,
-        enqueue_wait,
-        Duration::from_millis(INGEST_READ_TIMEOUT_MS),
-        spooler,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_and_send_with_timeout(
-    read_file: std::fs::File,
-    mime_to_get: String,
+fn ingest_candidates<F>(
+    candidates: &[String],
     job_tx: &SyncSender<ClipboardJob>,
     stats: &IngestStats,
     budget: &Arc<ByteBudget>,
@@ -223,23 +323,23 @@ fn ingest_and_send_with_timeout(
     enqueue_wait: Duration,
     read_timeout: Duration,
     spooler: Option<&dyn PayloadSpooler>,
-) {
+    open: F,
+) where
+    F: FnMut(&str) -> Option<std::fs::File>,
+{
     let deadline = Instant::now() + read_timeout;
-    let job = match drain_pipe(read_file, &mime_to_get, MAX_PAYLOAD_BYTES, deadline, spooler) {
-        DrainOutcome::Ready(Drained::Memory(payload)) => {
-            let Some((mime, data)) = normalise_payload(mime_to_get, payload) else { return; };
-            ClipboardJob::new(mime, data)
-        }
-        DrainOutcome::Ready(Drained::Spooled { file, head }) => {
-            let mime = relabel_by_magic(mime_to_get, &head);
-            ClipboardJob::from_payload(mime, Payload::Spooled(Box::new(file)))
-        }
-        DrainOutcome::TimedOut => {
+    let job = match read_first_candidate(candidates, deadline, spooler, open) {
+        FallbackOutcome::Ready { mime, payload } => ClipboardJob::from_payload(mime, payload),
+        FallbackOutcome::TimedOut => {
             let total = stats.record_shed_timeout();
             ingest::report_shed("pipe read timed out", total);
             return;
         }
-        DrainOutcome::Failed => return,
+        FallbackOutcome::NoPipe => {
+            shed_unallocatable_pipe(stats);
+            return;
+        }
+        FallbackOutcome::Exhausted => return,
     };
 
     let bytes = job.accounted_bytes();
@@ -405,7 +505,13 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
-    // --- ingest_and_send: bounded hand-off, shedding and permit lifetime ---
+    /// The best candidate only, for the assertions that are about a single
+    /// choice rather than the whole array.
+    fn select_mime(mimes: &[String], target_mime: Option<&str>, drop_rtf: bool) -> Option<String> {
+        select_mime_candidates(mimes, target_mime, drop_rtf).into_iter().next()
+    }
+
+    // --- one-pipe ingestion: bounded hand-off, shedding and permit lifetime ---
 
     use crate::ingest::ReaderGate;
     use std::io::Write;
@@ -456,13 +562,58 @@ mod tests {
         (gate, permit)
     }
 
+    /// Runs the production ingestion entry point over one already-filled pipe:
+    /// the shape most of these tests use, now that a selection is a candidate
+    /// array rather than a single MIME.
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_one(
+        pipe: std::fs::File,
+        mime: String,
+        job_tx: &SyncSender<ClipboardJob>,
+        stats: &IngestStats,
+        budget: &Arc<ByteBudget>,
+        permit: Option<ReaderPermit>,
+        enqueue_wait: Duration,
+        spooler: Option<&dyn PayloadSpooler>,
+    ) {
+        ingest_one_with_timeout(
+            pipe,
+            mime,
+            job_tx,
+            stats,
+            budget,
+            permit,
+            enqueue_wait,
+            Duration::from_millis(INGEST_READ_TIMEOUT_MS),
+            spooler,
+        );
+    }
+
+    /// The same, with an explicit read deadline (`Duration::ZERO` for a queue
+    /// test that must not wait on the pipe).
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_one_with_timeout(
+        pipe: std::fs::File,
+        mime: String,
+        job_tx: &SyncSender<ClipboardJob>,
+        stats: &IngestStats,
+        budget: &Arc<ByteBudget>,
+        permit: Option<ReaderPermit>,
+        enqueue_wait: Duration,
+        read_timeout: Duration,
+        spooler: Option<&dyn PayloadSpooler>,
+    ) {
+        let mut pipe = Some(pipe);
+        ingest_candidates(&[mime], job_tx, stats, budget, permit, enqueue_wait, read_timeout, spooler, |_| pipe.take());
+    }
+
     #[test]
-    fn ingest_and_send_queues_the_normalised_payload_and_releases_the_permit() {
+    fn ingest_one_queues_the_normalised_payload_and_releases_the_permit() {
         let (tx, rx) = sync_channel::<ClipboardJob>(2);
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
+        ingest_one(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
 
         let queued = rx.try_recv().unwrap();
         assert_eq!((queued.mime.as_str(), queued.payload.as_bytes()), ("text/plain", Some(b"hello".as_slice())));
@@ -471,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_sheds_the_newest_payload_when_the_queue_stays_full() {
+    fn ingest_one_sheds_the_newest_payload_when_the_queue_stays_full() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = IngestStats::default();
         tx.send(ClipboardJob::new("text/plain".to_owned(), b"older".to_vec())).unwrap();
@@ -479,7 +630,7 @@ mod tests {
 
         let wait = Duration::from_millis(30);
         let started = Instant::now();
-        ingest_and_send(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, wait, None);
+        ingest_one(filled_pipe(b"newer"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, wait, None);
 
         assert!(started.elapsed() >= wait, "backpressure: the reader must wait before shedding");
         assert_eq!(stats.shed_queue(), 1);
@@ -489,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_holds_its_permit_while_it_waits_for_queue_room() {
+    fn ingest_one_holds_its_permit_while_it_waits_for_queue_room() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = Arc::new(IngestStats::default());
         tx.send(ClipboardJob::new("text/plain".to_owned(), b"older".to_vec())).unwrap();
@@ -499,7 +650,7 @@ mod tests {
             let stats = Arc::clone(&stats);
             let pipe = filled_pipe(b"newer");
             std::thread::spawn(move || {
-                ingest_and_send(pipe, "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
+                ingest_one(pipe, "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
             })
         };
 
@@ -515,12 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_discards_empty_transfers_without_counting_them_as_shed() {
+    fn ingest_one_discards_empty_transfers_without_counting_them_as_shed() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
+        ingest_one(filled_pipe(b""), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, None);
 
         assert!(rx.try_recv().is_err());
         assert_eq!(stats.shed_queue(), 0, "an empty read is not overload");
@@ -528,23 +679,23 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_with_a_gone_worker_is_not_counted_as_overload() {
+    fn ingest_one_with_a_gone_worker_is_not_counted_as_overload() {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         drop(rx);
         let stats = IngestStats::default();
         let (gate, permit) = gate_with_one_permit();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
+        ingest_one(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &roomy(), permit, Duration::from_secs(10), None);
 
         assert_eq!(stats.shed_queue(), 0, "shutdown is not shedding");
         assert_eq!(gate.active(), 0);
     }
 
     #[test]
-    fn ingest_and_send_charges_the_queued_payload_to_the_byte_budget_until_the_job_is_dropped() {
+    fn ingest_one_charges_the_queued_payload_to_the_byte_budget_until_the_job_is_dropped() {
         let (tx, rx) = sync_channel::<ClipboardJob>(2);
         let budget = Arc::new(ByteBudget::new(1024));
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &IngestStats::default(), &budget, None, Duration::ZERO, None);
+        ingest_one(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &IngestStats::default(), &budget, None, Duration::ZERO, None);
 
         assert_eq!(budget.used(), 5);
         drop(rx.try_recv().unwrap());
@@ -552,13 +703,13 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_sheds_a_payload_that_exceeds_the_whole_budget_and_counts_it() {
+    fn ingest_one_sheds_a_payload_that_exceeds_the_whole_budget_and_counts_it() {
         let (tx, rx) = sync_channel::<ClipboardJob>(2);
         let stats = IngestStats::default();
         let budget = Arc::new(ByteBudget::new(4));
         let started = Instant::now();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_secs(10), None);
+        ingest_one(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_secs(10), None);
 
         assert!(started.elapsed() < Duration::from_secs(5), "an oversized payload must not be waited on");
         assert_eq!(stats.shed_queue(), 1);
@@ -567,13 +718,13 @@ mod tests {
     }
 
     #[test]
-    fn ingest_and_send_sheds_when_the_byte_budget_stays_full() {
+    fn ingest_one_sheds_when_the_byte_budget_stays_full() {
         let (tx, rx) = sync_channel::<ClipboardJob>(2);
         let stats = IngestStats::default();
         let budget = Arc::new(ByteBudget::new(8));
         let held = budget.try_reserve(6).unwrap();
 
-        ingest_and_send(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_millis(30), None);
+        ingest_one(filled_pipe(b"hello"), "text/plain".to_owned(), &tx, &stats, &budget, None, Duration::from_millis(30), None);
 
         assert_eq!(stats.shed_queue(), 1);
         assert!(rx.try_recv().is_err());
@@ -589,12 +740,12 @@ mod tests {
         let budget = Arc::new(ByteBudget::new(150_000));
 
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(budget.used(), 100_000, "a spool file counts as much as a buffer");
 
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &stats, &budget, None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(stats.shed_queue(), 1, "the second file does not fit next to the first");
         assert_eq!(budget.used(), 100_000, "the shed job returned what it had reserved");
@@ -721,7 +872,7 @@ mod tests {
         let spooler = FakeSpooler::new(Behaviour::Spool);
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let (read_file, feeder) = fed_pipe(pattern(300_000));
-        ingest_and_send(read_file, "text/plain".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "text/plain".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert!(spooler.calls().is_empty());
         let job = only_job(&rx);
@@ -733,7 +884,7 @@ mod tests {
         let spooler = FakeSpooler::new(Behaviour::Spool);
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(INLINE_PAYLOAD_THRESHOLD_BYTES - 1);
-        ingest_and_send(filled_pipe(&data), "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
+        ingest_one(filled_pipe(&data), "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         assert!(spooler.calls().is_empty(), "a payload that ends inside the head is never spooled");
         let job = only_job(&rx);
         assert_eq!(job.payload.as_bytes(), Some(data.as_slice()));
@@ -745,7 +896,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(1 << 20);
         let (read_file, feeder) = fed_pipe(data.clone());
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
 
         assert_eq!(spooler.calls(), vec![(INLINE_PAYLOAD_THRESHOLD_BYTES, MAX_PAYLOAD_BYTES)]);
@@ -763,7 +914,7 @@ mod tests {
         let mut data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         data.extend(pattern(100_000));
         let (read_file, feeder) = fed_pipe(data);
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(only_job(&rx).mime, "image/png", "the bytes outrank the announced label");
     }
@@ -774,7 +925,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let data = pattern(200_000);
         let (read_file, feeder) = fed_pipe(data.clone());
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(spooler.calls().len(), 1);
         assert_eq!(only_job(&rx).payload.as_bytes(), Some(data.as_slice()), "no byte lost between head and remainder");
@@ -787,7 +938,7 @@ mod tests {
         let (gate, permit) = gate_with_one_permit();
         let stats = IngestStats::default();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
         let _ = feeder.join();
         assert!(rx.try_recv().is_err());
         assert_eq!(stats.shed_queue(), 0);
@@ -803,7 +954,7 @@ mod tests {
         let (gate, permit) = gate_with_one_permit();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
 
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), permit, Duration::ZERO, Some(&spooler));
         feeder.join().unwrap();
 
         assert_eq!(stats.shed_queue(), 1);
@@ -819,7 +970,7 @@ mod tests {
         drop(rx);
         let stats = IngestStats::default();
         let (read_file, feeder) = fed_pipe(pattern(100_000));
-        ingest_and_send(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), None, Duration::from_secs(10), Some(&spooler));
+        ingest_one(read_file, "application/octet-stream".to_owned(), &tx, &stats, &roomy(), None, Duration::from_secs(10), Some(&spooler));
         feeder.join().unwrap();
         assert_eq!(stats.shed_queue(), 0);
         assert_eq!(spooler.leftovers(), 0);
@@ -832,7 +983,7 @@ mod tests {
         let (tx, rx) = sync_channel::<ClipboardJob>(1);
         let stats = IngestStats::default();
 
-        ingest_and_send_with_timeout(
+        ingest_one_with_timeout(
             std::fs::File::from(std::os::fd::OwnedFd::from(read_pipe)),
             "text/plain".to_owned(),
             &tx,
@@ -893,17 +1044,58 @@ mod tests {
     }
 
     #[test]
-    fn select_mime_daemon_fallback_catch_all_for_unlisted_mime() {
-        // Not in MIME_PRIORITY_ORDER, and neither an "image/" nor "text/"
-        // prefix — only the final unconditional catch-all reaches it.
-        let offers = mimes(&["application/octet-stream"]);
-        assert_eq!(select_mime(&offers, None, true), Some("application/octet-stream".to_string()));
+    fn select_mime_daemon_fallback_rejects_unlisted_blobs() {
+        // Not in MIME_PRIORITY_ORDER, and neither an "image/" nor a "text/"
+        // prefix: the strict allowlist has no catch-all, so an opaque blob is
+        // never requested (and so never persisted).
+        for blob in ["application/octet-stream", "application/x-custom", "TARGETS", "unknown"] {
+            let offers = mimes(&[blob]);
+            assert_eq!(select_mime(&offers, None, true), None, "{blob} must not be selected");
+            assert!(select_mime_candidates(&offers, None, true).is_empty(), "{blob} must not become a candidate");
+        }
+    }
+
+    #[test]
+    fn select_mime_candidates_lists_every_allowlisted_offer_in_priority_order() {
+        // Deliberately announced in the opposite order to the one they must be
+        // tried in. No duplicates, and nothing unlisted leaks in.
+        let offers = mimes(&[
+            "application/octet-stream",
+            "text/markdown",
+            "image/jpeg",
+            "text/plain",
+            "image/png",
+            "application/x-custom",
+        ]);
+        assert_eq!(
+            select_mime_candidates(&offers, None, true),
+            mimes(&["image/png", "image/jpeg", "text/plain", "text/markdown"]),
+            "priority entries first, then the remaining images, then the remaining text"
+        );
+    }
+
+    #[test]
+    fn select_mime_candidates_deduplicates_offers_of_the_same_base_type() {
+        let offers = mimes(&["text/plain;charset=utf-8", "text/plain", "TEXT/Plain"]);
+        let candidates = select_mime_candidates(&offers, None, true);
+        assert_eq!(candidates.len(), 1, "one base type, one attempt: {candidates:?}");
+        assert!(crate::core::utils::mime_base_eq(&candidates[0], "text/plain"));
+    }
+
+    #[test]
+    fn select_mime_candidates_in_action_mode_returns_every_match() {
+        // An explicit request returns the offers that satisfy it — and only
+        // those — without consulting `drop_rtf`.
+        let offers = mimes(&["text/plain;charset=utf-8", "text/html", "text/plain"]);
+        let candidates = select_mime_candidates(&offers, Some("TEXT/PLAIN"), true);
+        assert_eq!(candidates, mimes(&["text/plain;charset=utf-8"]), "the first offer of the base type, then no duplicate");
     }
 
     #[test]
     fn select_mime_drop_rtf_excludes_rtf_from_daemon_fallback() {
         let offers = mimes(&["text/rtf"]);
         assert_eq!(select_mime(&offers, None, true), None);
+        assert!(select_mime_candidates(&offers, None, true).is_empty());
     }
 
     #[test]
@@ -923,6 +1115,90 @@ mod tests {
         let offers: Vec<String> = Vec::new();
         assert_eq!(select_mime(&offers, None, true), None);
         assert_eq!(select_mime(&offers, Some("text/plain"), true), None);
+    }
+
+    // --- candidate fallback loop ---
+
+    #[test]
+    fn a_candidate_that_delivers_nothing_falls_back_to_the_next_one() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let candidates = mimes(&["image/png", "text/plain"]);
+        let mut tried = Vec::new();
+
+        ingest_candidates(&candidates, &tx, &stats, &roomy(), None, Duration::ZERO, Duration::from_secs(5), None, |mime| {
+            tried.push(mime.to_owned());
+            // The sender announces image/png but has nothing to say for it —
+            // the same shape as a Chromium client's empty text/html.
+            Some(filled_pipe(if mime == "image/png" { b"" } else { b"the fallback text" }))
+        });
+
+        assert_eq!(tried, candidates, "the empty candidate is tried, then the next");
+        let job = only_job(&rx);
+        assert_eq!((job.mime.as_str(), job.payload.as_bytes()), ("text/plain", Some(b"the fallback text".as_slice())));
+        assert_eq!((stats.shed_timeout(), stats.shed_queue()), (0, 0), "falling back is not overload");
+    }
+
+    #[test]
+    fn a_candidate_that_times_out_ends_the_selection_and_counts_it() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let candidates = mimes(&["image/png", "text/plain"]);
+        // The write end stays open, so the pipe never reaches EOF: the read can
+        // only end at the selection's deadline.
+        let (stalled, _write_end) = std::io::pipe().unwrap();
+        let mut stalled = Some(std::fs::File::from(std::os::fd::OwnedFd::from(stalled)));
+        let mut tried = Vec::new();
+
+        ingest_candidates(&candidates, &tx, &stats, &roomy(), None, Duration::ZERO, Duration::from_millis(30), None, |mime| {
+            tried.push(mime.to_owned());
+            match stalled.take() {
+                Some(pipe) => Some(pipe),
+                None => Some(filled_pipe(b"never reached")),
+            }
+        });
+
+        assert_eq!(tried, mimes(&["image/png"]), "a stalled sender ends the selection; later candidates are not tried");
+        assert_eq!(stats.shed_timeout(), 1);
+        assert_eq!(stats.shed_queue(), 0);
+        assert!(rx.try_recv().is_err(), "nothing is queued for a timed-out selection");
+    }
+
+    #[test]
+    fn a_candidate_that_normalises_away_falls_back_to_the_next_one() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let candidates = mimes(&["text/uri-list", "text/plain"]);
+
+        ingest_candidates(&candidates, &tx, &IngestStats::default(), &roomy(), None, Duration::ZERO, Duration::from_secs(5), None, |mime| {
+            Some(filled_pipe(if mime == "text/uri-list" { b"# only a comment" } else { b"usable text" }))
+        });
+
+        assert_eq!(only_job(&rx).payload.as_bytes(), Some(b"usable text".as_slice()), "an empty URI list is no payload; the next candidate is");
+    }
+
+    #[test]
+    fn no_allocatable_pipe_ends_the_selection_and_counts_a_shed_reader() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let candidates = mimes(&["image/png", "text/plain"]);
+
+        ingest_candidates(&candidates, &tx, &stats, &roomy(), None, Duration::ZERO, Duration::from_secs(5), None, |_| None);
+
+        assert_eq!(stats.shed_readers(), 1, "EMFILE is a shed reader, as before");
+        assert_eq!(stats.shed_timeout(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_selection_no_candidate_can_satisfy_is_not_counted_as_overload() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let candidates = mimes(&["image/png", "text/plain"]);
+
+        ingest_candidates(&candidates, &tx, &stats, &roomy(), None, Duration::ZERO, Duration::from_secs(5), None, |_| Some(filled_pipe(b"")));
+
+        assert!((stats.shed_readers(), stats.shed_timeout(), stats.shed_queue()) == (0, 0, 0), "an unusable selection is not overload");
+        assert!(rx.try_recv().is_err());
     }
 
     // --- read_pipe_payload ---
