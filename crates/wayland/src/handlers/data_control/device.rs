@@ -663,8 +663,8 @@ mod tests {
         p
     }
 
-    impl PayloadSpooler for FakeSpooler {
-        fn spool(&self, head: &[u8], mut src: std::fs::File, limit: u64) -> SpoolOutcome {
+    impl FakeSpooler {
+        fn spool_inner(&self, head: &[u8], mut src: std::fs::File, limit: u64, deadline: Option<Instant>) -> SpoolOutcome {
             self.calls.lock().unwrap().push((head.len(), limit));
             match self.behaviour {
                 Behaviour::Reject => SpoolOutcome::Rejected,
@@ -673,10 +673,26 @@ mod tests {
                     let path = self.dir.join("payload");
                     let mut file = std::fs::File::create(&path).unwrap();
                     file.write_all(head).unwrap();
-                    let rest = std::io::copy(&mut src, &mut file).unwrap();
+                    let rest = match deadline {
+                        Some(dl) => {
+                            let mut reader = DeadlineReader::new(src, dl).unwrap();
+                            std::io::copy(&mut reader, &mut file).unwrap()
+                        }
+                        None => std::io::copy(&mut src, &mut file).unwrap(),
+                    };
                     SpoolOutcome::Spooled(SpooledFile::new(path, head.len() as u64 + rest, [7; DIGEST_LEN]))
                 }
             }
+        }
+    }
+
+    impl PayloadSpooler for FakeSpooler {
+        fn spool(&self, head: &[u8], src: std::fs::File, limit: u64) -> SpoolOutcome {
+            self.spool_inner(head, src, limit, None)
+        }
+
+        fn spool_with_deadline(&self, head: &[u8], src: std::fs::File, limit: u64, deadline: Instant) -> SpoolOutcome {
+            self.spool_inner(head, src, limit, Some(deadline))
         }
     }
 
