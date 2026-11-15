@@ -17,7 +17,9 @@
 //! exactly as before, only in more rounds. The capacity is a property of the
 //! pipe, not of a descriptor, so either end may be tuned.
 
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use crate::constants::PIPE_TARGET_BYTES;
 
@@ -79,6 +81,103 @@ fn capacity(fd: RawFd) -> Option<usize> {
     // open file description behind `fd`; it fails on anything else.
     let size = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
     usize::try_from(size).ok()
+}
+
+/// Marks `fd` non-blocking (`O_NONBLOCK`).
+pub fn set_nonblocking<F: AsFd>(fd: &F) -> io::Result<()> {
+    let raw = fd.as_fd().as_raw_fd();
+    // SAFETY: `F_GETFL` takes no pointer arguments and only reads the file
+    // status flags of `raw`.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+    // SAFETY: `F_SETFL` sets the file status flags of `raw` to `flags | O_NONBLOCK`.
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Blocks until `fd` is readable (or at EOF/error) or `deadline` expires.
+///
+/// Returns `Err(io::ErrorKind::TimedOut)` if `deadline` elapses before `fd`
+/// becomes ready.
+pub fn wait_readable<F: AsFd>(fd: &F, deadline: Instant) -> io::Result<()> {
+    wait_readable_raw(fd.as_fd().as_raw_fd(), deadline)
+}
+
+pub(crate) fn wait_readable_raw(raw: RawFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe read deadline exceeded"));
+        }
+        // Round sub-millisecond remainders up to 1 ms so `poll` does not busy-spin.
+        let ms = remaining.as_millis();
+        let timeout_ms = if ms == 0 && remaining > Duration::ZERO {
+            1
+        } else {
+            libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
+        };
+        let mut fds = [libc::pollfd { fd: raw, events: libc::POLLIN, revents: 0 }];
+        // SAFETY: `fds` is a valid, stack-allocated 1-element `pollfd` array
+        // for `poll(2)` to inspect and populate `revents` in.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe read deadline exceeded"));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Non-blocking reader wrapper that enforces a wall-clock `deadline` on every
+/// `read` via `poll(2)`.
+pub struct DeadlineReader<F: AsFd + Read> {
+    inner: F,
+    deadline: Instant,
+}
+
+impl<F: AsFd + Read> DeadlineReader<F> {
+    /// Marks `inner` non-blocking and wraps it with `deadline`.
+    pub fn new(inner: F, deadline: Instant) -> io::Result<Self> {
+        set_nonblocking(&inner)?;
+        Ok(Self { inner, deadline })
+    }
+
+    /// Returns the underlying descriptor. Its `O_NONBLOCK` flag remains set.
+    pub fn into_inner(self) -> F {
+        self.inner
+    }
+}
+
+impl<F: AsFd + Read> AsFd for DeadlineReader<F> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+impl<F: AsFd + Read> Read for DeadlineReader<F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    wait_readable(&self.inner, self.deadline)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +292,41 @@ mod tests {
         }
         // Would block forever on a 64 KiB pipe with no reader.
         writer.write_all(&vec![7u8; PIPE_DEFAULT_BYTES + 4096]).unwrap();
+    }
+
+    #[test]
+    fn deadline_reader_times_out_on_stalled_pipe() {
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let mut dr = DeadlineReader::new(reader, deadline).unwrap();
+        let mut buf = [0u8; 64];
+        let err = dr.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn deadline_reader_succeeds_when_data_arrives_within_deadline() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut dr = DeadlineReader::new(reader, deadline).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"delayed-ok").unwrap();
+        });
+
+        let mut got = Vec::new();
+        dr.read_to_end(&mut got).unwrap();
+        handle.join().unwrap();
+        assert_eq!(got, b"delayed-ok");
+    }
+
+    #[test]
+    fn deadline_reader_returns_eof_when_writer_is_closed() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let mut dr = DeadlineReader::new(reader, Instant::now() + Duration::from_millis(200)).unwrap();
+        let mut got = Vec::new();
+        assert_eq!(dr.read_to_end(&mut got).unwrap(), 0);
     }
 }

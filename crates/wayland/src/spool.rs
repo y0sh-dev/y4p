@@ -26,6 +26,9 @@ pub enum SpoolOutcome {
     /// The stream was drained but is not a payload (empty, over the limit, or
     /// the transfer failed). Nothing is left on disk and nothing is to be kept.
     Rejected,
+    /// The stream did not complete before the ingestion read deadline. Nothing
+    /// is left on disk and the timeout is accounted as a shed.
+    TimedOut,
     /// The spooler could not even start (no spool directory, no descriptor to
     /// spare). The pipe has not been touched beyond the head the caller
     /// already read, so it comes back for an in-memory read.
@@ -42,4 +45,9 @@ pub trait PayloadSpooler: Send + Sync {
     /// remainder of `src` after it. The spooled file therefore holds the whole
     /// stream, and `limit` bounds the whole stream.
     fn spool(&self, head: &[u8], src: File, limit: u64) -> SpoolOutcome;
+
+    /// [`Self::spool`] bounded by a wall-clock `deadline`.
+    fn spool_with_deadline(&self, head: &[u8], src: File, limit: u64, _deadline: std::time::Instant) -> SpoolOutcome {
+        self.spool(head, src, limit)
+    }
 }

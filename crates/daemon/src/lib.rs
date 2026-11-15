@@ -147,7 +147,12 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> bool {
         // Exit/Restore are dispatched here, same as before.
         if poll_fds[1].revents & libc::POLLIN != 0
             && let Some(cmd) = ipc::accept_and_dispatch(&listener, || {
-                metrics.format_status(state.paused, state.ingest_stats.shed_readers(), state.ingest_stats.shed_queue())
+                metrics.format_status(
+                    state.paused,
+                    state.ingest_stats.shed_readers(),
+                    state.ingest_stats.shed_queue(),
+                    state.ingest_stats.shed_timeout(),
+                )
             }) {
                 match cmd {
                     Command::Exit => crate::core::request_exit(),

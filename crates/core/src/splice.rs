@@ -43,8 +43,9 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
+use std::time::Instant;
 
 use crate::constants::{PIPELINE_CHUNK_BYTES, SPLICE_CHUNK_BYTES, SPLICE_ROUND_BYTES};
 use crate::payload::PayloadError;
@@ -154,11 +155,32 @@ where
     S: Read + AsFd,
     T: ByteTap,
 {
+    copy_to_file_with_deadline(src, dst, limit, tap, None)
+}
+
+/// [`copy_to_file`] bounded by an optional wall-clock `deadline`.
+///
+/// When `deadline` is `Some` and `src` is non-blocking (`O_NONBLOCK`), `EAGAIN`
+/// / `WouldBlock` on either the kernel path (`tee`/`splice`) or the buffered
+/// fallback path waits with `poll(2)` until `deadline` before failing with
+/// `PayloadError::Io` (`ErrorKind::TimedOut`).
+pub fn copy_to_file_with_deadline<S, T>(
+    src: &mut S,
+    dst: &mut File,
+    limit: u64,
+    tap: &mut T,
+    deadline: Option<Instant>,
+) -> Result<Copied, PayloadError>
+where
+    S: Read + AsFd,
+    T: ByteTap,
+{
     let mut copied = Copied::default();
-    if is_pipe(src)? && kernel_loop(src.as_fd().as_raw_fd(), dst, limit, tap, &mut copied)? == KernelEnd::Eof {
+    if is_pipe(src)? && kernel_loop(src.as_fd(), dst, limit, tap, &mut copied, deadline)? == KernelEnd::Eof {
         return finish(copied);
     }
-    buffered_loop(src, dst, limit, tap, &mut copied)?;
+    let raw_fd = src.as_fd().as_raw_fd();
+    buffered_loop(src, dst, limit, tap, &mut copied, deadline.map(|dl| (raw_fd, dl)))?;
     finish(copied)
 }
 
@@ -171,7 +193,7 @@ where
     T: ByteTap,
 {
     let mut copied = Copied::default();
-    buffered_loop(src, dst, limit, tap, &mut copied)?;
+    buffered_loop(src, dst, limit, tap, &mut copied, None)?;
     finish(copied)
 }
 
@@ -208,12 +230,14 @@ fn allowance(limit: u64) -> u64 {
 }
 
 fn kernel_loop<T: ByteTap>(
-    src: RawFd,
+    src_fd: BorrowedFd<'_>,
     dst: &mut File,
     limit: u64,
     tap: &mut T,
     copied: &mut Copied,
+    deadline: Option<Instant>,
 ) -> Result<KernelEnd, PayloadError> {
+    let src = src_fd.as_raw_fd();
     // The scratch pipe exists only when somebody observes the stream.
     let scratch = if T::OBSERVES {
         match io::pipe() {
@@ -243,6 +267,13 @@ fn kernel_loop<T: ByteTap>(
                 let n = match tee_once(src, scratch_w.as_raw_fd(), want) {
                     Ok(0) => return Ok(KernelEnd::Eof),
                     Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if let Some(dl) = deadline {
+                            crate::pipe::wait_readable(&src_fd, dl)?;
+                            continue;
+                        }
+                        return Err(e.into());
+                    }
                     Err(e) if is_unsupported(&e) => return Ok(KernelEnd::Unsupported),
                     Err(e) => return Err(e.into()),
                 };
@@ -267,6 +298,13 @@ fn kernel_loop<T: ByteTap>(
             None => match splice_once(src, dst_fd, want) {
                 Ok(0) => return Ok(KernelEnd::Eof),
                 Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if let Some(dl) = deadline {
+                        crate::pipe::wait_readable(&src_fd, dl)?;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
                 // A refused `splice` moved nothing, so the buffered path can
                 // resume from the same position even after earlier rounds.
                 Err(e) if is_unsupported(&e) => return Ok(KernelEnd::Unsupported),
@@ -288,6 +326,7 @@ fn buffered_loop<S: Read + ?Sized, T: ByteTap>(
     limit: u64,
     tap: &mut T,
     copied: &mut Copied,
+    deadline: Option<(RawFd, Instant)>,
 ) -> Result<(), PayloadError> {
     let mut buf = [0u8; SPLICE_CHUNK_BYTES];
     let allowed = allowance(limit);
@@ -297,6 +336,13 @@ fn buffered_loop<S: Read + ?Sized, T: ByteTap>(
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some((fd, dl)) = deadline {
+                    crate::pipe::wait_readable_raw(fd, dl)?;
+                    continue;
+                }
+                return Err(e.into());
+            }
             Err(e) => return Err(e.into()),
         };
         let chunk = buf.get(..n).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -837,5 +883,17 @@ mod tests {
         }
         let error = failure.expect("the dead reader was never reported");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn copy_to_file_with_deadline_times_out_on_stalled_pipe() {
+        let (mut reader, _writer) = io::pipe().unwrap();
+        crate::pipe::set_nonblocking(&reader).unwrap();
+        let (mut sink, path) = dest("deadline-timeout");
+        let deadline = Instant::now() + std::time::Duration::from_millis(30);
+
+        let err = copy_to_file_with_deadline(&mut reader, &mut sink, 1024, &mut Checksum::default(), Some(deadline)).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(err, PayloadError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut), "{err:?}");
     }
 }

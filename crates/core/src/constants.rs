@@ -125,12 +125,20 @@ pub const INGEST_MAX_CONCURRENT_READERS: usize = 8;
 pub const INGEST_ENQUEUE_WAIT_MS: u64 = 2000;
 // Polling interval while waiting for queue room (`std` offers no timed send).
 pub const INGEST_ENQUEUE_POLL_MS: u64 = 5;
+// Hard wall-clock deadline for draining a single compositor selection pipe
+// (covering both the initial inline read and any kernel-spliced remainder).
+// A stalled or slow-drip sender that has not finished by this deadline is
+// cut off so it cannot hold a `ReaderGate` slot indefinitely.
+pub const INGEST_READ_TIMEOUT_MS: u64 = 5000;
 // A zero-capacity `sync_channel` is a rendezvous channel: `try_send` succeeds
 // only while the worker is already blocked in `recv`, so nearly every payload
 // would be shed. A zero reader limit would admit nobody. Both are build errors.
 const _: () = assert!(
-    INGEST_QUEUE_CAPACITY >= 1 && INGEST_MAX_CONCURRENT_READERS >= 1 && INGEST_QUEUE_BYTE_BUDGET >= 1,
-    "the ingestion bounds must admit at least one reader and one queued payload",
+    INGEST_QUEUE_CAPACITY >= 1
+        && INGEST_MAX_CONCURRENT_READERS >= 1
+        && INGEST_QUEUE_BYTE_BUDGET >= 1
+        && INGEST_READ_TIMEOUT_MS >= 1,
+    "the ingestion bounds must admit at least one reader, one queued payload, and a non-zero read timeout",
 );
 
 // --- Local Image Pipeline ---

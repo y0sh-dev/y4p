@@ -149,7 +149,7 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 プロジェクトの運営・計画・参照文書:
 
-- [`.github/AI_POLICY.md`](.github/AI_POLICY.md): 生成AI（LLM）の利用に関する方針（英語）。
+- [`.github/POLICY.md`](.github/POLICY.md): コントリビューション方針および品質基準（英語）。
 - [`PERFORMANCE.md`](PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
 - [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md): v0.8.0 へ向かう v0.7.x ゼロコピーのロードマップ（英語）。
 - [`README.md`](README.md): 英語版README。

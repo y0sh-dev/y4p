@@ -141,7 +141,7 @@ The technical architecture lives in [`docs/00_overview.md`](docs/00_overview.md)
 
 Project governance, planning and references:
 
-- [`.github/AI_POLICY.md`](.github/AI_POLICY.md): Shared policies and guidelines on Generative AI (LLMs) usage.
+- [`.github/POLICY.md`](.github/POLICY.md): Shared contribution policy and engineering standards.
 - [`PERFORMANCE.md`](PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
 - [`ROADMAP_v0.8.md`](ROADMAP_v0.8.md): The v0.7.x zero-copy roadmap towards v0.8.0.
 - [`README_ja.md`](README_ja.md): Japanese README (日本語版).
