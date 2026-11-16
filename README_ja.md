@@ -38,6 +38,7 @@ X11向けの互換レイヤーではなく、このプロトコルに直接依�
 - **ゼロロス整合性とPin保護**: Pinを立てたレコードには、履歴のローテーションが決して触れません。スキーマのマイグレーションも段階的かつ冪等に設計されているため、アップデートを挟んでも既存の履歴が書き換わったり失われたりすることはありません。
 - **ローカル画像パイプライン**: 画像はメタデータ（EXIF・GPSなど）を除去して再エンコードされます。分離されたスクラッチディレクトリ、プロセスグループ単位のタイムアウト監視、リソース上限、同時実行数の制限、自己回復型のサーキットブレーカーで保護されています。失敗時は常に元のバイト列をそのまま保存します。
 - **構造的な堅牢性**: パニックしない実行パス（`unwrap`・`expect`・`panic!` はワークスペース全体のlintで禁止）と、意図的に小さく固定された依存関係。
+- **組み込みの可観測性**: `y4p stats` がエントリ数・ディスク占有・デーモンのシェッド回数を、`y4p doctor` が環境・コンポジタ・DB・ソケット・クォータを `[PASS]` / `[WARN]` / `[FAIL]` で点検します。
 
 ---
 
@@ -55,6 +56,8 @@ X11向けの互換レイヤーではなく、このプロトコルに直接依�
 | `pin` / `unpin` | レコードを自動ローテーションから保護・解除します。 |
 | `delete` / `wipe` | 1件を削除する、または履歴を全消去します。 |
 | `status` / `pause` / `resume` | デーモンの監視状態を確認・制御します。 |
+| `stats` | エントリ数、ディスク占有、デーモンのシェッド回数を表示します。 |
+| `doctor` | 環境・コンポジタ・DB・ソケット・クォータを診断します（FAIL時のみ非0で終了）。 |
 
 ---
 
@@ -81,7 +84,24 @@ y4p daemon &
 y4p status
 echo "Wayland native clipboard" | y4p store
 y4p list
+
+# 保存内容と環境の健全性を確認する
+y4p stats
+y4p doctor
 ```
+
+### ユーザーサービスとして常駐させる
+
+`systemd` のユーザーユニットが [`contrib/systemd/y4p.service`](contrib/systemd/y4p.service) にあります。`Restart=on-failure` が機能するのは、`y4p daemon` が起動失敗・コンポジタ切断を非0で、要求された停止だけを `0` で終えるためです。
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/y4p.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now y4p.service
+```
+
+以降は `y4p status` と `y4p doctor` がこのインスタンスを参照し、ログは `journalctl --user -u y4p` で確認できます。
 
 Zsh補完を有効にする場合（任意）。`compinit` の実行前に、補完ディレクトリを `fpath` に追加してください。
 
@@ -107,6 +127,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # 上記2つをまとめた自動検証スクリプト
 bash scripts/check.sh
+
+# 実コンポジタでのマトリクス試験（cage/sway + wl-clipboard + ImageMagick）。
+# ヘッドレスコンポジタが無い環境では [SKIP] を出して exit 0
+bash scripts/e2e_compositor.sh
 ```
 
 </details>
@@ -150,7 +174,7 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 プロジェクトの運営・計画・参照文書:
 
 - [`.github/POLICY.md`](.github/POLICY.md): コントリビューション方針および品質基準（英語）。
-- [`PERFORMANCE.md`](PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
+- [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）とゼロコピー期の目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
 - [`ROADMAP_v0.9.md`](ROADMAP_v0.9.md): v0.9.0 (Trust) へ向かう v0.8.x 信頼性強化ロードマップ（英語）。
 - [`README.md`](README.md): 英語版README。
 

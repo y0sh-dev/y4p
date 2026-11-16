@@ -69,7 +69,7 @@ cargo bench -p y4p-daemon --bench baseline     # full measurement (about 2 minut
 cargo test  --workspace --all-targets          # runs the same harness in smoke mode: one pass, no timing
 ```
 
-The harness ([`crates/daemon/benches/baseline.rs`](crates/daemon/benches/baseline.rs)) uses `std` only (`harness = false`); no benchmarking crate is added to the workspace.
+The harness ([`crates/daemon/benches/baseline.rs`](../../crates/daemon/benches/baseline.rs)) uses `std` only (`harness = false`); no benchmarking crate is added to the workspace.
 
 | Property | Behaviour |
 | :--- | :--- |
@@ -105,7 +105,7 @@ Which code each result was recorded at:
 | 7.5 FastCDC and chunked storage; 7.3 pipe tuning | v0.7.5 - v0.7.7 | 2026-10-21: three full runs plus a fourth after the harness was corrected, and a same-day control, the v0.7.5 tree (`7c9ff52`) built and run with the same payloads (the `chunked` group's cases and the old `baseline` harness) |
 | 7.6 byte budget | v0.7.8 | three full runs, committed 2026-10-23 |
 
-Limits of the method: the counting allocator sees Rust allocations only. SQLite and ImageMagick allocate through C `malloc` and are not counted, so the SQLite rows understate total allocations. Until v0.7.3 the image conversion itself (process spawn plus ImageMagick) was not in this harness; it had been measured separately when the PNG pipeline was introduced (1080p, zlib level 1: about 65 ms for a flat screenshot, about 110-140 ms for photo-like content, about 100 ms for a JPEG source; [`docs/06_local_image_pipeline.md`](docs/06_local_image_pipeline.md) section 2.1) and dominates every image ingest by two to three orders of magnitude. Since v0.7.4 the `transcode` group (section 7.4) runs it, on *incompressible noise* (the worst case for `magick`), so its absolute times are not those of a screenshot; what it compares is the plumbing around a conversion, not the conversion. ImageMagick's own allocations are still invisible to the counting allocator.
+Limits of the method: the counting allocator sees Rust allocations only. SQLite and ImageMagick allocate through C `malloc` and are not counted, so the SQLite rows understate total allocations. Until v0.7.3 the image conversion itself (process spawn plus ImageMagick) was not in this harness; it had been measured separately when the PNG pipeline was introduced (1080p, zlib level 1: about 65 ms for a flat screenshot, about 110-140 ms for photo-like content, about 100 ms for a JPEG source; [`docs/06_local_image_pipeline.md`](../06_local_image_pipeline.md) section 2.1) and dominates every image ingest by two to three orders of magnitude. Since v0.7.4 the `transcode` group (section 7.4) runs it, on *incompressible noise* (the worst case for `magick`), so its absolute times are not those of a screenshot; what it compares is the plumbing around a conversion, not the conversion. ImageMagick's own allocations are still invisible to the counting allocator.
 
 ---
 
@@ -199,7 +199,7 @@ Every classification primitive is allocation-free and negligible. `normalize_uri
 
 #### Payload abstraction (v0.7.2)
 
-`core::payload` ([`crates/core/src/payload.rs`](crates/core/src/payload.rs)) is the shared vocabulary for a payload's bytes: `Payload::{Memory, Stream, File}` (a `Spooled` variant followed in v0.7.3), a `PayloadReader` enum that implements `Read`, `route_payload`, and `read_bounded`. Three full runs, spread under 2 % on every row below.
+`core::payload` ([`crates/core/src/payload.rs`](../../crates/core/src/payload.rs)) is the shared vocabulary for a payload's bytes: `Payload::{Memory, Stream, File}` (a `Spooled` variant followed in v0.7.3), a `PayloadReader` enum that implements `Read`, `route_payload`, and `read_bounded`. Three full runs, spread under 2 % on every row below.
 
 | Case | Median | Allocations |
 | :--- | ---: | :--- |
@@ -224,7 +224,7 @@ Every classification primitive is allocation-free and negligible. `normalize_uri
 
 #### Streaming ingestion (v0.7.3)
 
-`core::splice::copy_to_file` moves a pipe into a file with `splice(2)`, optionally `tee(2)`-ing the stream so a SHA3-256 digest is computed on the way; `FileSpooler` and the worker's `store_spooled` build on it ([`docs/01`](docs/01_wayland_streaming_io.md) section 2.4). Three full runs (the `splice` and `ingest` groups run last), spread under 2 % on every row quoted. Each operation creates a pipe, a feeding thread (above 32 KiB), and a fresh destination file, and unlinks it.
+`core::splice::copy_to_file` moves a pipe into a file with `splice(2)`, optionally `tee(2)`-ing the stream so a SHA3-256 digest is computed on the way; `FileSpooler` and the worker's `store_spooled` build on it ([`../01`](../01_wayland_streaming_io.md) section 2.4). Three full runs (the `splice` and `ingest` groups run last), spread under 2 % on every row quoted. Each operation creates a pipe, a feeding thread (above 32 KiB), and a fresh destination file, and unlinks it.
 
 **Pipe to file** (`splice` group; the digest is SHA3-256 in every row that has one):
 
@@ -302,7 +302,7 @@ Reading the numbers:
 
 ### 7.4 Image Transcoding
 
-*Recorded at v0.7.4 Part 1.* A spooled raster image the converter would rewrite used to be read back into a `Vec`, fed to `magick` through the chunk-buffered relay, collected in a second `Vec` and hashed afterwards. Now `spool::transcode_spooled` hands the spool file to `magick` as its stdin and splices `magick`'s stdout into a new spool file while `tee(2)` feeds SHA3-256 ([`docs/06`](docs/06_local_image_pipeline.md) section 6.4). The `transcode` group runs both from the same spool file and ends both with the SHA3-256 of the converted bytes (the harness first checks that the two roads produce the *same digest*, and fails the run if not). Three full runs; the images are incompressible noise, so the PNG is as large as its pixels.
+*Recorded at v0.7.4 Part 1.* A spooled raster image the converter would rewrite used to be read back into a `Vec`, fed to `magick` through the chunk-buffered relay, collected in a second `Vec` and hashed afterwards. Now `spool::transcode_spooled` hands the spool file to `magick` as its stdin and splices `magick`'s stdout into a new spool file while `tee(2)` feeds SHA3-256 ([`../06`](../06_local_image_pipeline.md) section 6.4). The `transcode` group runs both from the same spool file and ends both with the SHA3-256 of the converted bytes (the harness first checks that the two roads produce the *same digest*, and fails the run if not). Three full runs; the images are incompressible noise, so the PNG is as large as its pixels.
 
 | Image (PNG -> PNG) | Road | Median (3 runs) | Heap bytes / op | Heap calls | Peak heap growth |
 | :--- | :--- | ---: | ---: | ---: | ---: |
@@ -359,7 +359,7 @@ Reading the numbers:
 
 #### Chunked storage in SQLite, Schema v4 (v0.7.6)
 
-A payload above 4 KiB that is not cache class is split, each chunk is stored once under its SHA3-256 digest with a reference count (`chunks`), and a manifest lists a row's chunks in order (`manifest`); [`docs/02`](docs/02_hybrid_storage_and_pin.md) section 7 has the design. The `chunked` group inserts and reads such payloads (text, so the preview and the search path are real). The control is the **v0.7.5 tree run the same day** with the same payloads (inline storage in the row): the "v0.7.5" column. Three runs of each; ranges are min-max.
+A payload above 4 KiB that is not cache class is split, each chunk is stored once under its SHA3-256 digest with a reference count (`chunks`), and a manifest lists a row's chunks in order (`manifest`); [`../02`](../02_hybrid_storage_and_pin.md) section 7 has the design. The `chunked` group inserts and reads such payloads (text, so the preview and the search path are real). The control is the **v0.7.5 tree run the same day** with the same payloads (inline storage in the row): the "v0.7.5" column. Three runs of each; ranges are min-max.
 
 | Case | v0.7.5 (inline) | v0.7.7 (chunked) | Factor |
 | :--- | ---: | ---: | ---: |
