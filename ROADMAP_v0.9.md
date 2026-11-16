@@ -40,7 +40,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
   - Route `wipe` and `delete` through daemon IPC to eliminate concurrent CLI SQLite mutations and file cache deletion races.
   - Trigger daemon-side `PRAGMA shrink_memory;` and `malloc_trim(0)` on `wipe`, shrinking idle daemon RSS back to process baseline (~4 MiB).
 
-- [ ] **v0.8.6: Ingress Fallback Array & Allowlist Selection (P1)**
+- [x] **v0.8.6: Ingress Fallback Array & Allowlist Selection (P1)**
   - Replace single-MIME selection with an ordered candidate array; if a chosen offer returns EOF or fails, fallback to the next available candidate.
   - Replace the permissive catch-all in `select_mime` with a strict MIME allowlist, discarding untyped application blobs.
 

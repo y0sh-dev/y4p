@@ -109,7 +109,6 @@ pub struct WaylandState {
     // the Selection handler falls back to `MIME_PRIORITY_ORDER` instead.
     pub target_mime: Option<String>,
     pub rx_buf: Vec<u8>,
-    pub provider_locks: u32,
     pub selection_received: bool,
     pub current_source: Option<ExtDataControlSourceV1>,
     // Private mode: same single-thread-owned field as the rest of this
@@ -140,7 +139,6 @@ impl WaylandState {
             verbose,
             target_mime: None,
             rx_buf: Vec::new(),
-            provider_locks: 0,
             selection_received: false,
             current_source: None,
             paused: false,
@@ -171,7 +169,6 @@ impl WaylandState {
             verbose,
             target_mime: Some(target_mime),
             rx_buf: Vec::new(),
-            provider_locks: 0,
             selection_received: false,
             current_source: None,
             paused: false,

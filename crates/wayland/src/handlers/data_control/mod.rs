@@ -13,7 +13,6 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
 use crate::state::{WaylandState, OfferData};
-use crate::core::constants::*;
 
 /// Evaluates if the requested MIME type is compatible with the target type.
 /// Supports category-level matching for the text group. Both sides are
@@ -80,17 +79,11 @@ fn mime_is_compatible(requested: &str, target: &str) -> bool {
 
 /// Checks if any offered MIME type matches the sensitive hints blacklist.
 ///
-/// BUGFIX: both the haystack (offered MIME) and the hint now go through
-/// `to_ascii_lowercase()`. Previously only the MIME was lowercased while
-/// `SENSITIVE_MIME_HINTS` mixes case (`x-kde-passwordManagerHint`) — a
-/// lowercased haystack can never contain that hint's own uppercase letters
-/// verbatim, so this specific hint could never actually match anything,
-/// silently defeating the KDE password-manager filter it exists for.
+/// Delegates to `core::utils::is_sensitive_mime`, the same case-insensitive
+/// test the storage backstop applies, so an offer refused here is exactly one
+/// storage would refuse too.
 pub(crate) fn is_sensitive<S: AsRef<str>>(mimes: &[S]) -> bool {
-    SENSITIVE_MIME_HINTS.iter().any(|&hint| {
-        let hint_lower = hint.to_ascii_lowercase();
-        mimes.iter().any(|m| m.as_ref().to_ascii_lowercase().contains(&hint_lower))
-    })
+    mimes.iter().any(|m| crate::core::utils::is_sensitive_mime(m.as_ref()))
 }
 
 /// Creates a Unix pipe and configures it for safe, high-throughput I/O.

@@ -9,7 +9,7 @@ use sha3::{Digest, Sha3_256};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::core::cdc::FastCdc;
-use crate::core::constants::{CDC_MIN_CHUNK_BYTES, LOG_ERROR, MAX_PAYLOAD_BYTES, SENSITIVE_MIME_HINTS, PREVIEW_CHARS};
+use crate::core::constants::{CDC_MIN_CHUNK_BYTES, LOG_ERROR, MAX_PAYLOAD_BYTES, PREVIEW_CHARS};
 use crate::core::utils::{is_html_mime, is_text_like_mime, strip_html_tags};
 use super::MetaRow;
 
@@ -95,8 +95,13 @@ fn is_chunkable(mime: &str, len: usize) -> bool {
 }
 
 /// Payloads that are never stored: empty ones and sensitive MIME types.
+///
+/// The sensitive test is shared with ingress (`core::utils::is_sensitive_mime`),
+/// so a MIME the Wayland layer lets through cannot be stored differently from
+/// one it refused: this backstop is case-insensitive too, and covers the paths
+/// that never go through the selection handler at all (`store`, `copy-to`).
 pub(crate) fn is_skipped(mime: &str, len: u64) -> bool {
-    len == 0 || SENSITIVE_MIME_HINTS.iter().any(|&hint| mime.contains(hint))
+    len == 0 || crate::core::utils::is_sensitive_mime(mime)
 }
 
 /// Pure SQL execution and transaction handling — no filesystem I/O. Binary
@@ -735,6 +740,20 @@ mod tests {
 
         assert_eq!(outcome.real_id, -1);
         assert_eq!(store.get_total_count(), 0);
+    }
+
+    #[test]
+    fn upsert_record_rejects_mixed_case_sensitive_mime_types() {
+        let mut store = test_store();
+        for mime in ["X-KDE-PASSWORDMANAGERHINT", "Application/X-Bitwarden", "CUSTOM/SECRET-PAYLOAD"] {
+            assert!(is_skipped(mime, 10), "{mime} must reach the backstop");
+            let outcome = store.upsert_record(mime, b"a concealed value", "h-sensitive", 100).unwrap();
+            assert_eq!(outcome.real_id, -1, "{mime} must not be stored");
+        }
+        assert_eq!(store.get_total_count(), 0, "nothing sensitive reached a row");
+
+        assert!(!is_skipped("text/plain", 10), "an ordinary MIME is stored");
+        assert!(is_skipped("text/plain", 0), "an empty payload is skipped whatever its MIME");
     }
 
     #[test]
