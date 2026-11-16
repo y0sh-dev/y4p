@@ -189,6 +189,22 @@ pub fn is_rtf_mime(mime: &str) -> bool {
     base.eq_ignore_ascii_case("text/rtf") || base.eq_ignore_ascii_case("application/rtf")
 }
 
+/// True when `mime` names a clipboard type that must never be persisted
+/// (password managers, concealed markers, ...).
+///
+/// Case-insensitive on both sides: each hint is lowercased as well as the MIME.
+/// `SENSITIVE_MIME_HINTS` mixes case (`x-kde-passwordManagerHint`), so a
+/// lowercased haystack could never contain that hint's own uppercase letters
+/// verbatim — the KDE password-manager filter would silently match nothing.
+/// Shared by ingress (`wayland`) and the storage backstop so the two can never
+/// disagree about what is sensitive.
+pub fn is_sensitive_mime(mime: &str) -> bool {
+    let mime_lower = mime.to_ascii_lowercase();
+    crate::constants::SENSITIVE_MIME_HINTS
+        .iter()
+        .any(|&hint| mime_lower.contains(&hint.to_ascii_lowercase()))
+}
+
 /// True when `mime` represents a text-like payload (plain text, rich markup,
 /// JSON, XML, URI lists, or legacy string atoms) eligible for preview generation,
 /// inline text storage, and full-text search indexing.
@@ -248,6 +264,28 @@ mod tests {
         assert!(!is_text_like_mime("application/octet-stream"));
         assert!(!is_text_like_mime("application/pdf"));
         assert!(!is_text_like_mime("application/zip"));
+    }
+
+    #[test]
+    fn is_sensitive_mime_matches_mixed_case_hints() {
+        assert!(is_sensitive_mime("X-KDE-PASSWORDMANAGERHINT"));
+        assert!(is_sensitive_mime("Application/X-Bitwarden"));
+        assert!(is_sensitive_mime("CUSTOM/SECRET-PAYLOAD"));
+        assert!(is_sensitive_mime("x-kde-passwordManagerHint"));
+        assert!(is_sensitive_mime("ORG.NSPASTEBOARD.CONCEALEDTYPE"));
+        assert!(is_sensitive_mime("application/x-keepassxc-selection"));
+        assert!(is_sensitive_mime("APPLICATION/X-VND.1PASSWORD"));
+    }
+
+    #[test]
+    fn is_sensitive_mime_passes_ordinary_mime_types() {
+        assert!(!is_sensitive_mime("text/plain"));
+        assert!(!is_sensitive_mime("text/plain;charset=utf-8"));
+        assert!(!is_sensitive_mime("text/html"));
+        assert!(!is_sensitive_mime("image/png"));
+        assert!(!is_sensitive_mime("text/uri-list"));
+        assert!(!is_sensitive_mime("application/octet-stream"));
+        assert!(!is_sensitive_mime(""));
     }
 
     #[test]
