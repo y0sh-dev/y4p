@@ -44,7 +44,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
   - Replace single-MIME selection with an ordered candidate array; if a chosen offer returns EOF or fails, fallback to the next available candidate.
   - Replace the permissive catch-all in `select_mime` with a strict MIME allowlist, discarding untyped application blobs.
 
-- [ ] **v0.8.7: Self-Ingestion Simplification & Sensitive Case Normalisation (P1)**
+- [x] **v0.8.7: Self-Ingestion Simplification & Sensitive Case Normalisation (P1)**
   - Deprecate fragile `provider_locks` counters; rely on content-hash deduplication for self-copy suppression without dropping user copies.
   - Enforce case-insensitive matching (`to_ascii_lowercase()`) across all sensitive MIME backstops.
 
