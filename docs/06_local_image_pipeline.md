@@ -34,7 +34,8 @@ To address these, `y4p` routes raster images through an isolated pipeline before
                          |                                                  |
                   bypass (original)                                  convert via magick
         text, HTML, uri-list, SVG, AVIF,                  PNG, BMP, JPEG, static WebP
-        GIF, animated WebP, empty, unknown                  -> lossless PNG (zlib level 1)
+        GIF, animated WebP, animated PNG,                   -> lossless PNG (zlib level 1)
+        empty, unknown
         breaker open, throttle saturated,
         magick missing, no scratch dir,
         conversion failed
@@ -62,14 +63,25 @@ The diagram is the in-memory road. A payload that was spooled to a file (v0.7.3)
 | Input | Output | Reason |
 | :--- | :--- | :--- |
 | PNG, BMP, JPEG, static WebP | lossless PNG (`png:compression-level=1`) | Bit-exact pixels (a JPEG or WebP source keeps its decoded pixels, with no further generation loss), metadata removed, EXIF orientation baked in. PNG is the raster MIME every Wayland paste target requests |
-| GIF, animated WebP | untouched | The transcoder keeps only the first frame, which would silently destroy an animation the user copied (animated WebP is detected via the `VP8X` `ANIM` flag) |
+| GIF, animated WebP, animated PNG (APNG) | untouched | The transcoder keeps only the first frame and drops the animation metadata, which would silently destroy an animation the user copied (animated WebP is detected via the `VP8X` `ANIM` flag, APNG via its `acTL` chunk, see below) |
 | SVG, AVIF, anything else | untouched | Vector and scriptable formats never reach a raster decoder; AVIF is not a supported input |
 
 > **Invariant — the stored raster MIME is `image/png`.** Egress offers exactly the stored MIME ([03](03_concurrency_and_memory.md), [05](05_filter_pipeline_and_app_rules.md) section on compatibility), and `image/png` never matches `image/webp`. A stored WebP was reported as not pasteable on Hyprland into applications that request `image/png` (Discord, Slack, Firefox, Chrome, GIMP, LibreOffice); not re-verified against a live compositor here. Ingestion consequently never produces WebP; the WebP encoders (`OutputFormat::WebpLossless`, `WebpLossy`) remain in `transcode.rs` as tested but unused capability.
 
 **Why zlib level 1.** PNG is lossless at every zlib level; the level trades encode time against file size only. Measured with ImageMagick 7.1 on a 1920x1080 image: photo-like content 137 ms at level 1 against 257 ms at level 9; flat screenshot 65 ms against 81 ms; pixels identical in both (`compare -metric AE` = 0). The cost is size on flat content (the screenshot grew from 22 KB to 93 KB), and a JPEG or WebP source grows several times when stored losslessly. The clipboard path is latency-bound, so speed wins. No `-quality` flag is passed for PNG: it would override the level.
 
-**Animation preservation.** GIF and animated WebP (`VP8X` container with the `ANIM` flag set) bypass transcoding entirely so their multi-frame sequences are not flattened into a single frame.
+**Animation preservation.** GIF, animated WebP (`VP8X` container with the `ANIM` flag set) and animated PNG bypass transcoding entirely so their multi-frame sequences are not flattened into a single frame.
+
+APNG needs its own detector because it is not a distinct format: it rides on the PNG container, and `detect_image_mime` correctly reports `image/png` for both a still and an animation. Since v0.8.3 the router reads the leading chunks with `core::utils::is_animated_png(head)` and looks for the `acTL` chunk, which an APNG must place before its first `IDAT`; a stream with no `acTL` before the image data is a still. Without that check, `magick`'s pinned `png:-[0]` would keep the first frame, drop the `acTL` chunk and store a still PNG of a running animation.
+
+```text
+  PNG signature ... IHDR ... acTL (frame count, plays) ... IDAT ...
+                              ^                    ^
+                              animated             first frame data:
+                              (bypass)             the `acTL` must precede it
+```
+
+`is_animated_webp` gets the same treatment one container over: the RIFF `WEBP` form has a `VP8X` extended header, and the `ANIM` bit in its feature flags is what marks an animation.
 
 ---
 
@@ -212,9 +224,9 @@ Unlike the buffered road, `transcode_file` also checks what it produced: the fir
 
 **Routing keeps its guarantees.** `route::route_file_with` is `route_with` for a file: the classification (`plan`) and the guarded attempt (`attempt_guarded`: breaker permit, then throttle slot, then the attempt, then the resolution of the permit) are the *same functions* the in-memory road calls, not copies, and the real entry point, `route_file_for_ingest`, uses the same process-wide breaker and throttle. So the two roads together never run more than `IMAGE_CONCURRENCY_LIMIT` converters, a fault on one opens the circuit for both, and a busy or absent converter is neutral for both (tests: a fault on either road counts against the one breaker; saturation and host-side errors never do; every failure ends in "keep the original"). The daemon wraps it in `worker::convert_if_wanted` over `spool::transcode_spooled`, which creates the new file (`<pid>-<n>-t.part`, `0600`, `O_EXCL`, named after its source so it is unique and still sweepable by the owner's pid) under an unlink guard, so a failed conversion leaves no half-written file and never touches the original.
 
-**Why the input is handed over rather than spliced.** Giving the child the descriptor costs the parent no syscall and no byte of traffic, which is strictly less than `splice(2)` into a stdin pipe; and `magick` takes as long on a file as on a pipe (215-217 ms against 215-216 ms on a 12 MiB PNG, [`PERFORMANCE.md`](../PERFORMANCE.md) section 7.4), so nothing is lost by the choice. The compositor's pipe is *not* handed to `magick`: it is drained into the spool file first, by an ingestion thread that holds a reader permit, precisely so that a slow converter or a full queue can never stall the client application behind it ([01](01_wayland_streaming_io.md) section 2.4).
+**Why the input is handed over rather than spliced.** Giving the child the descriptor costs the parent no syscall and no byte of traffic, which is strictly less than `splice(2)` into a stdin pipe; and `magick` takes as long on a file as on a pipe (215-217 ms against 215-216 ms on a 12 MiB PNG, [`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 7.4), so nothing is lost by the choice. The compositor's pipe is *not* handed to `magick`: it is drained into the spool file first, by an ingestion thread that holds a reader permit, precisely so that a slow converter or a full queue can never stall the client application behind it ([01](01_wayland_streaming_io.md) section 2.4).
 
-**What it buys** (`PERFORMANCE.md` section 7.4, 12 MiB PNG): heap per conversion 50.5 MB to 5.8 KB, peak heap growth 36.1 MiB to 0, wall clock 300-305 ms to 215-217 ms (the converter's own floor: the SHA3 pass now overlaps the encode instead of following it). **What it does not cover:** a raster image under the 4 KiB spool threshold is a `Memory` payload and keeps the buffered road, where the buffers are a few KiB.
+**What it buys** (`history/PERFORMANCE.md` section 7.4, 12 MiB PNG): heap per conversion 50.5 MB to 5.8 KB, peak heap growth 36.1 MiB to 0, wall clock 300-305 ms to 215-217 ms (the converter's own floor: the SHA3 pass now overlaps the encode instead of following it). **What it does not cover:** a raster image under the 4 KiB spool threshold is a `Memory` payload and keeps the buffered road, where the buffers are a few KiB.
 
 ---
 
@@ -264,7 +276,7 @@ A missing `magick` is reported once per process (`MSG_IMAGE_TOOL_MISSING`) and i
 
 | Situation | Result stored | Process spawned? |
 | :--- | :--- | :--- |
-| Text, HTML, uri-list, SVG, AVIF, GIF | original | no |
+| Text, HTML, uri-list, SVG, AVIF, GIF, animated WebP, APNG | original | no |
 | Empty payload | original | no |
 | Breaker open | original | no |
 | Throttle wait expired | original | no |

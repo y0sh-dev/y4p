@@ -13,33 +13,41 @@ SQLite allows exactly one writer at a time. A second connection that tries to wr
 `y4p` avoids the problem structurally rather than defensively: only one thread in the process ever holds a write connection.
 
 ```rust
-// crates/daemon/src/worker.rs:L52-L80
-pub fn spawn(mut db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
+// crates/daemon/src/worker.rs — v0.8.5 shape
+pub struct DbWorker {
+    tx: mpsc::SyncSender<ClipboardJob>,
+    db: Arc<Mutex<ClipboardDb>>,
+}
+
+pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
     let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
+    let db = Arc::new(Mutex::new(db));
+    let writer = Arc::clone(&db);
 
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
             let ClipboardJob { mime, payload, permit } = job;
-            let stored = match payload {
-                Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
-                payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+            let stored = match writer.lock() {
+                Ok(mut db) => match payload {
+                    Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
+                    payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+                },
+                Err(_) => Err("database lock poisoned; payload dropped".to_string()),
             };
             drop(permit); // persisted or discarded: the bytes leave the queue's budget
-            match stored {
-                Ok(Some((mime, len))) => { metrics.record_ingress(); /* ... */ }
-                Ok(None) => {}
-                Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
-            }
+            /* metrics + logging as before */
         }
     });
 
-    Self { tx }
+    Self { tx, db }
 }
 ```
 
-`ClipboardDb` moves *into* the spawned thread and is never shared. Rust's ownership model turns "only this thread can write" into a compile-time fact rather than a convention someone must remember at each call site. Every other part of the daemon that wants something persisted builds a `ClipboardJob` and offers it to a cloned `mpsc::SyncSender` (bounded; see section 2.1).
+The connection is not moved into the thread; it is shared with the event loop through the `DbWorker` (section 2.2). The mutex, not ownership, is what makes "one writer" true now, and the worker takes it once per job: a job is materialised, routed, hashed and persisted without releasing it, so two jobs can never interleave either.
 
-> **Invariant — the channel is the only coupling between "something happened on the clipboard" and "something was written to disk".** There is nothing on the other side of it to conflict with, so it cannot produce a lock conflict.
+Every other part of the daemon that wants something persisted builds a `ClipboardJob` and offers it to a cloned `mpsc::SyncSender` (bounded; see section 2.1). The event loop does not send jobs: for `delete` and `wipe` it calls the worker's own methods, which take the same mutex.
+
+> **Invariant — every SQLite write happens under the writer's mutex.** Ingress jobs, IPC `delete` and IPC `wipe` all lock the one connection, so SQLite never sees a second writer and no write can overtake another. The trade-off is symmetry: a mutation waits behind whatever job is being persisted, and a job waits behind a mutation.
 
 ```text
    Wayland Selection event
@@ -121,7 +129,7 @@ Because conversion runs on the worker, a slow image delays every job behind it. 
 | Bounded channel | `INGEST_QUEUE_CAPACITY` = 64 | `sync_channel`; a full queue hands the job back (`TrySendError::Full`), so retrying never clones the payload |
 | Byte budget | `INGEST_QUEUE_BYTE_BUDGET` = 64 MiB | Total length of the queued payloads, heap buffers and spool files alike (`ClipboardJob::accounted_bytes`, from `Payload::len_hint`; a payload whose length is unknown without I/O counts as zero, and ingestion only produces `Memory` and `Spooled`). A payload larger than the whole budget could never be admitted, so it is shed immediately instead of waited on |
 | Patience | `INGEST_ENQUEUE_WAIT_MS` = 2000 | A reader that finds no room (slot or bytes) waits **while keeping its gate permit**: this is the backpressure, because it makes new selections hit the gate instead of piling payloads up in memory |
-| Shedding | counters `shed_readers`, `shed_queue` | Once patience is spent the payload is dropped. Totals appear in `y4p status` and the first, second, fourth, eighth, ... shed is logged, with a reason: "too many concurrent readers", "could not allocate pipe descriptors (EMFILE)", "payload exceeds the queue byte budget" (retrying cannot help) or "worker queue or byte budget full" |
+| Shedding | counters `shed_readers`, `shed_queue`, `shed_timeout` | Once patience is spent the payload is dropped. Totals appear in `y4p status` and the first, second, fourth, eighth, ... shed is logged, with a reason: "too many concurrent readers", "could not allocate pipe descriptors (EMFILE)", "payload exceeds the queue byte budget" (retrying cannot help) or "worker queue or byte budget full" |
 
 #### The byte budget and its permit
 
@@ -144,7 +152,7 @@ pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
 
 | Property | Why it holds |
 | :--- | :--- |
-| Lock-free, O(1) | One compare-and-swap loop; a reservation never blocks the thread that asks, and a refusal leaves the counter untouched. Next to an ingest that takes milliseconds the cost is about 16 ns and no allocation ([`PERFORMANCE.md`](../PERFORMANCE.md) section 7.6) |
+| Lock-free, O(1) | One compare-and-swap loop; a reservation never blocks the thread that asks, and a refusal leaves the counter untouched. Next to an ingest that takes milliseconds the cost is about 16 ns and no allocation ([`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 7.6) |
 | No overflow | `checked_add` turns an absurd length into a refusal instead of a wrap-around that would admit it (tested with `usize::MAX`) |
 | No leak, no double return | The only way bytes come back is `Drop`, once per permit. The permit lives in `ClipboardJob`, so *wherever* the job ends, the bytes return: the worker finishes it (persisted, duplicate, declined), the queue sheds it, or the receiver is dropped with jobs still inside. A permit held while waiting for a queue slot is released when the patience runs out |
 | Never above the limit | Concurrent producers either win the exchange or retry with the new total; the many-producers test checks that the peak never exceeds the limit |
@@ -159,8 +167,26 @@ The worker drops the permit right after the store call returns, **whatever the r
 Why drop the newest rather than evict the oldest: `std` offers no way to remove from the middle of a channel, and keeping queued work intact preserves arrival order, which the worker guarantees.
 
 > **Known trade-offs — what the budget does not bound.**
-> - A reader is not budgeted until it has finished reading and offers the payload, so the eight readers can each hold up to `MAX_PAYLOAD_BYTES` (256 MiB) beforehand. The ceiling is 64 MiB queued + 8 x 256 MiB in flight, about 2.1 GiB, down from (64 + 8 + 1) x 256 MiB ([`PERFORMANCE.md`](../PERFORMANCE.md) section 5.2).
-> - `MAX_PAYLOAD_BYTES` (256 MiB) is above the budget (64 MiB), so a payload between 64 and 256 MiB is read in full (or spooled in full) and then shed. Reading only up to the budget would shed it earlier but would change the effective maximum payload size ([`PERFORMANCE.md`](../PERFORMANCE.md) section 9, item 8).
+> - A reader is not budgeted until it has finished reading and offers the payload, so the eight readers can each hold up to `MAX_PAYLOAD_BYTES` (256 MiB) beforehand. The ceiling is 64 MiB queued + 8 x 256 MiB in flight, about 2.1 GiB, down from (64 + 8 + 1) x 256 MiB ([`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 5.2).
+> - `MAX_PAYLOAD_BYTES` (256 MiB) is above the budget (64 MiB), so a payload between 64 and 256 MiB is read in full (or spooled in full) and then shed. Reading only up to the budget would shed it earlier but would change the effective maximum payload size ([`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 9, item 8).
+
+### 2.2 IPC Mutations Share the Writer (v0.8.5)
+
+Before v0.8.5 `delete` and `wipe` ran in the CLI process, against its own `ClipboardDb`: two writers (the daemon's worker and the CLI) could point at the same SQLite file, and `wipe` could delete a cache file the daemon was about to serve — or remove one a worker job was about to adopt. Both are now daemon operations ([`crates/daemon/src/worker.rs`](../crates/daemon/src/worker.rs)):
+
+| Piece | Behaviour |
+| :--- | :--- |
+| `DbWorker::delete_by_id(id)` | `Ok(true)` / `Ok(false)` for "removed" / "no such row"; runs `ClipboardDb::delete_by_id` under the writer's mutex |
+| `DbWorker::wipe()` | Runs the whole `ClipboardDb::wipe()` under the same mutex, so `VACUUM`, `PRAGMA shrink_memory;`, the cache clear and `malloc_trim(0)` all happen in the daemon process, on the daemon's connection, with no ingestion job in flight |
+| Poisoned lock | Mapped to `Err(String)` (`database lock poisoned; ...`) and reported as `ERR:<message>`; never `unwrap()`/`expect()` |
+
+The event loop executes a mutation inside `ipc::accept_and_dispatch`, on the poll thread, and writes the reply back on the same `UnixStream` before returning: `OK:true`, `OK:false` or `OK` on success, `ERR:<message>` otherwise (one line, terminated by `IPC_DELIMITER`). The CLI reads exactly one line under `IPC_MUTATION_TIMEOUT_MS` (`10_000` ms, [`crates/core/src/constants.rs`](../crates/core/src/constants.rs)) — much longer than `IPC_STATUS_TIMEOUT_MS` (1000 ms) because a `VACUUM` over a large database legitimately takes seconds.
+
+Only a *failed connect* makes the CLI act on its own handle (`delete_by_id` / `wipe` with no daemon running). Once connected, a timeout or an `ERR:` reply is reported and the command exits non-zero: falling back to a local write while the daemon owns the connection would reintroduce exactly the race this section removes.
+
+> **Invariant — one writer, and its memory is the memory that shrinks.** A mutation either runs in the daemon under the writer's mutex or, when no daemon exists, in the only process that has the file open. `wipe` can never race an ingestion job, and the heap it releases is always the heap that held the pages.
+
+> **Known cost.** The poll thread blocks while a mutation waits for the mutex, and that mutex may be held by a job running `magick` (bounded by `IMAGE_TRANSCODE_TIMEOUT_SECS`, 15 s). Clipboard events queue in the compositor's socket meanwhile; nothing is lost, but a `wipe` issued during a slow conversion is felt as a delay, not as an immediate reply.
 
 ---
 
@@ -170,7 +196,7 @@ The daemon opens a *second* `ClipboardDb` for reads served inside the daemon pro
 
 | Handle | Owner | Used for |
 | :--- | :--- | :--- |
-| Writer `ClipboardDb` | moved into the `DbWorker` thread | `insert_with_hash` only |
+| Writer `ClipboardDb` | owned by `DbWorker`, locked by its thread and by the event loop (section 2.2) | `insert_with_hash`, `delete_by_id`, `wipe` |
 | `read_db` | the daemon's event-loop thread | `locate_content` / `get_content_by_id` for restores |
 | CLI process handle | the short-lived CLI process | `list`, `search`, `show`, `pin`, `delete`, ... |
 
@@ -209,7 +235,7 @@ A long-lived process must not retain what it no longer needs. A payload's buffer
 
 | Step | Owner | Allocation behaviour |
 | :--- | :--- | :--- |
-| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized. A text-like MIME reserves one page up front (one allocation instead of 3-9; [`PERFORMANCE.md`](../PERFORMANCE.md) section 7.1). **A large non-text payload does not get a `Vec` at all (v0.7.3):** one 4 KiB head buffer, then `splice(2)` into a spool file with a 64 KiB stack buffer for the digest ([01](01_wayland_streaming_io.md) section 2.4); steps 2-6 below then concern what happens to a `Memory` payload |
+| 1. Read | per-selection ingestion thread | One `Vec<u8>` filled by `read_to_end`, at most `MAX_PAYLOAD_BYTES + 1` read; discarded outright if oversized. A text-like MIME reserves one page up front (one allocation instead of 3-9; [`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 7.1). **A large non-text payload does not get a `Vec` at all (v0.7.3):** one 4 KiB head buffer, then `splice(2)` into a spool file with a 64 KiB stack buffer for the digest ([01](01_wayland_streaming_io.md) section 2.4); steps 2-6 below then concern what happens to a `Memory` payload |
 | 2. Normalise | same thread | `text/uri-list` produces one new `Vec`; everything else is moved, not copied |
 | 3. Hand-off | bounded channel | The `ClipboardJob` is **moved** with its `BytePermit` and its `Payload::Memory` is handed to the worker without a copy; the bytes are never cloned. A full queue or an exhausted byte budget sheds instead of growing (section 2.1) |
 | 4. Route | `DbWorker` | Text and unsupported types: moved straight through. Images: output buffer pre-sized from the input length (capped at `IMAGE_OUTPUT_HINT_CAP_BYTES`, 16 MiB) to avoid repeated doubling; on success the original `Vec` is dropped |
@@ -226,7 +252,7 @@ During a conversion the original and the converted image coexist briefly (the pe
 
 ## 6. Lock-Free Counters and Exit Coordination
 
-**Metrics.** `DaemonMetrics` ([`crates/daemon/src/metrics.rs`](../crates/daemon/src/metrics.rs)) holds `AtomicU64` ingress/egress counters and an `AtomicI64` last-event timestamp, written with `Ordering::Relaxed` from the worker and read from the event loop when IPC `Status` arrives. No mutex anywhere in the type: the counters are independent statistics, so no ordering between them is required. The status line also carries `shed_readers=` and `shed_queue=`, the overload totals of [section 2.1](#21-bounded-queue-dual-backpressure-and-load-shedding-v071-byte-budget-v078), owned by `y4p-wayland` (`IngestStats`) and passed in by the event loop because the daemon's metrics type cannot see the sensor layer's state.
+**Metrics.** `DaemonMetrics` ([`crates/daemon/src/metrics.rs`](../crates/daemon/src/metrics.rs)) holds `AtomicU64` ingress/egress counters and an `AtomicI64` last-event timestamp, written with `Ordering::Relaxed` from the worker and read from the event loop when IPC `Status` arrives. No mutex anywhere in the type: the counters are independent statistics, so no ordering between them is required. The status line also carries `shed_readers=`, `shed_queue=` and `shed_timeout=`, the overload totals of [section 2.1](#21-bounded-queue-dual-backpressure-and-load-shedding-v071-byte-budget-v078), owned by `y4p-wayland` (`IngestStats`) and passed in by the event loop because the daemon's metrics type cannot see the sensor layer's state.
 
 **Exit.** `SIG_EXIT` is a single `AtomicBool` in `y4p-core` shared by `main.rs`'s `ctrlc` handler and the daemon loop. The handler only sets the flag (a second Ctrl+C force-exits with status 1). The loop re-checks `is_exiting()` at least every 500 ms because of its `poll` timeout, so no socket round-trip is needed to wake it. A non-daemon invocation exits with status 130 on SIGINT and never touches the daemon's socket.
 

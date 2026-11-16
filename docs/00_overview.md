@@ -12,6 +12,9 @@ The [README](../README.md) tells you *what* the tool does and how to run it. Eve
 
 - `y4p daemon` becomes a long-lived background process. It owns the Wayland connection and the SQLite write path, and sits idle until something happens.
 - Anything else (`list`, `copy-to`, `pin`, ...) is a short-lived CLI process. It usually reads the database directly and prints a result. For actions only the daemon can perform, it sends a one-shot command over a Unix socket and exits.
+- Two commands observe the system rather than the history: `y4p stats` reports entry counts, logical and on-disk volume plus the daemon's shed counters, and `y4p doctor` walks environment, compositor, database, socket and quota, printing `[PASS]` / `[WARN]` / `[FAIL]` per check and exiting non-zero only when a check fails ([04](04_strict_cli_and_stable_id.md) section 7).
+
+A user unit ships with the project as `contrib/systemd/y4p.service`. Its `Restart=on-failure` is only meaningful because `y4p daemon` reports a failed start and a lost compositor connection as a non-zero exit status ([01](01_wayland_streaming_io.md) section 1.2); a stop the user asked for is the only clean exit.
 
 ```text
                      y4p daemon  (long-lived background process)
@@ -39,8 +42,8 @@ The [README](../README.md) tells you *what* the tool does and how to run it. Eve
                                            list / search / show)
 
           y4p-cli  --(IPC, one-shot)-->  the daemon above
-                                          (copy-to / store sync /
-                                           status / pause / resume)
+                                          (copy-to / store sync / delete /
+                                           wipe / status / pause / resume)
 ```
 
 ---
@@ -60,23 +63,26 @@ y4p/
 │   ├── wayland/        y4p-wayland  ext-data-control-v1 handlers, streaming clipboard I/O, ingestion backpressure
 │   ├── daemon/         y4p-daemon   event loop, IPC socket, background worker, payload spooler
 │   └── cli/            y4p-cli      strict argument parsing, command handlers, formatting
-├── docs/               this directory
-└── scripts/check.sh    workspace-wide tests + strict clippy
+├── docs/               this directory (`history/` keeps the archived measurements)
+├── contrib/systemd/    `y4p.service`, the user unit bundled with the project
+└── scripts/
+    ├── check.sh        workspace-wide tests + strict clippy
+    └── e2e_compositor.sh   headless compositor matrix (skips when none is installed)
 ```
 
 ### 2.1 Crate responsibility matrix
 
 | Crate | Single responsibility | Workspace dependencies | Third-party dependencies | Tests |
 | :--- | :--- | :--- | :--- | ---: |
-| `y4p-core` | Shared plumbing: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, `splice(2)` / pipe-sizing / FastCDC primitives, exit flag | none | `libc`, `percent-encoding` | 140 |
-| `y4p-storage` | Persistence: SQL store, schema gate (`SCHEMA_VERSION = 4`), chunked content store, blob cache, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 84 |
-| `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 192 |
-| `y4p-wayland` | Compositor I/O: offers, bounded reads, normalisation, egress; ingestion backpressure (reader gate, `ByteBudget`, `enqueue_bounded`) | core | `wayland-client`, `wayland-protocols`, `libc` | 110 |
-| `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `FileSpooler`, `DbWorker` (image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 43 |
-| `y4p-cli` | Argument parsing, validation, output formatting; returns `CliAction` to the root | core, storage | `unicode-width` | 0 |
+| `y4p-core` | Shared plumbing: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, `splice(2)` / pipe-sizing / FastCDC primitives, exit flag | none | `libc`, `percent-encoding` | 154 |
+| `y4p-storage` | Persistence: SQL store, schema gate (`SCHEMA_VERSION = 4`), chunked content store, blob cache, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 92 |
+| `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 195 |
+| `y4p-wayland` | Compositor I/O: offers, MIME candidates, bounded reads, normalisation, egress; ingestion backpressure (reader gate, `ByteBudget`, `enqueue_bounded`) | core | `wayland-client`, `wayland-protocols`, `libc` | 119 |
+| `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `FileSpooler`, `DbWorker` (image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 58 |
+| `y4p-cli` | Argument parsing, validation, output formatting, `stats` and `doctor` reports; returns `CliAction` to the root | core, storage | `unicode-width` | 11 |
 | `y4p` (root) | Wiring only | all of the above | `libc`, `ctrlc` | 0 |
 
-Total: 569 tests (568 unit tests and one integration test, `crates/daemon/tests/spooled_persist.rs`), plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. `y4p-cli` and the root have no tests of their own, and nothing runs against a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), and the rest by black-box comparison and manual runs.
+Total: 630 tests (629 unit tests across the six crates, plus one integration test, `crates/daemon/tests/spooled_persist.rs`), plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. The root has no tests of its own. Nothing in the test suite talks to a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), ingestion through real pipes and a real database, and the live matrix is a separate script (`scripts/e2e_compositor.sh`) that skips when no headless compositor is installed.
 
 ### 2.2 Dependency direction
 
@@ -104,13 +110,25 @@ Total: 569 tests (568 unit tests and one integration test, `crates/daemon/tests/
 
 > **Invariant — the daemon is the only translator.** `y4p-daemon` is the one crate allowed to see both `storage::ContentLocation` and `core::payload::Payload`, and it is where one is re-expressed as the other (see section 4).
 
+### 2.3 Frozen core invariants (v0.8.9)
+
+These are the properties the rest of the documentation assumes. They are deliberate design commitments, not incidental behaviour, and changing one is an architecture change rather than a patch.
+
+| # | Invariant | Enforced by |
+| :--- | :--- | :--- |
+| 1 | **Inward-only topology.** Every crate dependency points towards `y4p-core`; no crate sees a layer above it (`wayland` knows neither `storage` nor `image`). | Cargo manifests; a cycle is a build error |
+| 2 | **`crates/storage/` keeps its two stores apart.** `db.rs` is pure SQL, `cache.rs` is files only, and `ClipboardDb` is the sole coordinator; a cache file is placed before the row that names it, and a failed commit removes it again. | [02](02_hybrid_storage_and_pin.md) sections 1 and 6 |
+| 3 | **Panic-free resident layers.** `daemon`, `wayland`, `storage` (and `image`, `core`) build with `clippy::unwrap_used` / `expect_used` / `panic` denied; `panic = "abort"` in the release profile makes an unwrap a whole-process abort, so there are none. Only `#[cfg(test)]` code and the CLI's exit-on-error paths carve out an exception. | `[workspace.lints.clippy]` in the root manifest, `bash scripts/check.sh` |
+| 4 | **Bounded ingestion and spooling.** At most `INGEST_MAX_CONCURRENT_READERS` readers, at most `INGEST_QUEUE_CAPACITY` queued jobs and `INGEST_QUEUE_BYTE_BUDGET` queued bytes, and no payload above `MAX_PAYLOAD_BYTES`; overload is shed, counted and reported, never absorbed. | [03](03_concurrency_and_memory.md) section 2.1 |
+| 5 | **One writer, serialised over IPC.** All writes, ingress jobs and IPC `delete` / `wipe` alike, run on the single `DbWorker` connection (`Arc<Mutex<ClipboardDb>>`), so SQLite never sees two writers and `wipe` releases memory in the process that holds it. | [03](03_concurrency_and_memory.md) sections 1 and 2.2 |
+
 ---
 
 ## 3. Runtime Layers
 
 | Layer | Crate | Job | Document |
 | :--- | :--- | :--- | :--- |
-| Frontend | `y4p-cli` | Parse and validate arguments, print results. Never touches Wayland. Reads storage directly; uses IPC for daemon-owned actions. | [04](04_strict_cli_and_stable_id.md) |
+| Frontend | `y4p-cli` | Parse and validate arguments, print results (`stats`, `doctor` included). Never touches Wayland itself: the compositor handshake `doctor` needs is performed by the composition root. Reads storage directly; uses IPC for daemon-owned actions. | [04](04_strict_cli_and_stable_id.md) |
 | Process | `y4p-daemon` | Lifecycle, IPC socket, `DbWorker`: the one thread allowed to hold a write connection. | [03](03_concurrency_and_memory.md) |
 | Sensor | `y4p-wayland` | `ext-data-control-v1`: ingest offers, serve history back out, pipe plumbing. | [01](01_wayland_streaming_io.md), [05](05_filter_pipeline_and_app_rules.md) |
 | Persistence | `y4p-storage` | `ClipboardDb` facade over `db.rs` (pure SQL) and `cache.rs` (files only). | [02](02_hybrid_storage_and_pin.md) |
@@ -156,7 +174,7 @@ Since v0.7.8 the job also carries a `BytePermit`: a reservation of its payload's
 | Stage | Where | What happens |
 | :--- | :--- | :--- |
 | 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened. A pipe that still cannot be allocated (`EMFILE`) is shed, counted and logged (v0.7.8) |
-| 2. Select | `y4p-wayland` | Richest MIME chosen by `MIME_PRIORITY_ORDER` |
+| 2. Select | `y4p-wayland` | Allowlisted candidate array (`select_mime_candidates`: `MIME_PRIORITY_ORDER`, then `image/*`, then `text/*`), tried in order until one delivers (v0.8.6) |
 | 3. Read | `y4p-wayland` | Bounded read (`MAX_PAYLOAD_BYTES`, one probe byte). Large non-text payloads are spooled to a file with `splice(2)` and fingerprinted on the way (v0.7.3) |
 | 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
 | 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload, permit }` over a bounded `sync_channel` (64 slots) and a 64 MiB byte budget (`enqueue_bounded`); overload is shed and counted. A payload above the whole budget is shed at once |
@@ -170,11 +188,25 @@ Since v0.7.8 the job also carries a `BytePermit`: a reservation of its payload's
 
 ---
 
-## 6. What to Read Next
+## 6. What y4p Is Not
+
+Stating the boundaries is part of stating the design: several plausible features are deliberately absent, and a patch that adds one is an architecture change, not an enhancement.
+
+| Not this | Why not, and what happens instead |
+| :--- | :--- |
+| **An image converter or editor** | The local pipeline exists to strip metadata from untrusted rasters, not to transcode on demand. Every raster becomes `image/png`; egress never re-encodes and never matches one image format against another ([06](06_local_image_pipeline.md), [05](05_filter_pipeline_and_app_rules.md) section 2.1) |
+| **A forensic or auditing archive** | History is bounded by `max_history` (256 by default) and rotation evicts the oldest unpinned rows; `delete` and `wipe --force` remove records outright. There is no append-only mode, no WORM guarantee and no tamper-evident log ([02](02_hybrid_storage_and_pin.md) sections 3 and 4) |
+| **A cross-device sync daemon** | Nothing leaves the machine: no network code, no sync protocol, no remote store. The IPC socket is a per-user Unix socket on the local filesystem ([04](04_strict_cli_and_stable_id.md) section 6) |
+| **A secret manager** | Sensitive MIME types are *excluded* from storage rather than encrypted and retained. `SENSITIVE_MIME_HINTS` is a filter, not a vault; there is no master password, no per-entry encryption and no unlock state ([05](05_filter_pipeline_and_app_rules.md) section 1.1) |
+| **A clipboard *history* of everything, forever** | Pin protects records from automatic rotation, but it is not an unlimited quota: pinned rows are exempt from the count, unpinned ones are not, and disk usage follows what is actually copied ([02](02_hybrid_storage_and_pin.md) section 3) |
+
+---
+
+## 7. What to Read Next
 
 | What you want to know | File |
 | :--- | :--- |
-| Why one thread multiplexes Wayland and IPC, how bounded reads avoid silent truncation, how `provider_locks` prevents self-ingestion, and how egress uses `sendfile(2)` | [01 — Wayland Protocol & Streaming I/O](01_wayland_streaming_io.md) |
+| Why one thread multiplexes Wayland and IPC, how the start-up lock hands over from one daemon to the next, how the MIME allowlist and per-selection fallback work, why self-ingestion needs no counter, and how egress uses `sendfile(2)` | [01 — Wayland Protocol & Streaming I/O](01_wayland_streaming_io.md) |
 | Why text and large images live in different stores, how migrations stay safe, how rotation became near-O(1), and how pinned records are carved out of the quota | [02 — Hybrid Storage & Pin Protection](02_hybrid_storage_and_pin.md) |
 | Why every write funnels through one worker, how WAL lets readers run alongside it, and what `open_read_only` enforces | [03 — Concurrency & Memory Reclamation](03_concurrency_and_memory.md) |
 | Why display position (MRU) and identity (stable ID) are different numbers, why search avoids a window function, what the `--raw` contract promises, and why the CLI rejects unknown flags | [04 — Stable IDs & the Strict CLI](04_strict_cli_and_stable_id.md) |

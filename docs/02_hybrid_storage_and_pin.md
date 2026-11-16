@@ -51,7 +51,11 @@ Keeping images out of SQLite leaves its page cache full of exactly what `list` a
 
 Every payload carries a SHA3-256 fingerprint. That hash is both the SQLite `UNIQUE` key and the cache filename. Copy the same image twice and you update one row's timestamp; no second copy is written to either store (`FileCache::store` skips an existing path). Since v0.7.4 Part 2 a streamed image is placed by storage itself: `ClipboardDb::insert_spooled` takes the finished spool file and `FileCache::adopt` renames it to `<hash>.cache` (never over an existing file), then writes a row built from the length alone, so the image's bytes are never read ([01](01_wayland_streaming_io.md) section 2.4). Placing the file first and the row second means a row never points at a missing file, and a failed commit takes the placed file out again.
 
-`wipe` also gives memory back: after `VACUUM` and the cache clear, `PRAGMA shrink_memory` empties the connection's page cache and `core::memory::release_unused_heap` (`malloc_trim(0)` on Linux with glibc, a no-op elsewhere) returns the allocator's free pages to the kernel. Measured on 40,000 rows after a full listing and search: resident memory 233.5 MiB before the wipe, 74.5 MiB after `VACUUM` alone, 4.2 MiB with the trim; the pragma by itself changed nothing at this scale (`PERFORMANCE.md` section 7.5).
+> **Invariant — a row never outlives (or precedes) its bytes (v0.8.2).** On the in-memory road, `insert_with_hash` calls `FileCache::store` **before** `upsert_record` and propagates its error (`cache write failed: ...`) to the caller, so a failed cache write stores nothing at all rather than a row whose payload is missing. On the spooled road, `insert_spooled` adopts the file (or finds an identical one already present) before touching SQLite, and returns `-1` for a payload it declines — in which case the adopted file is removed again. The mirror image holds on the way out: `locate_content` (section 6) checks that `<hash>.cache` is a real file before egress offers it, so a cache directory cleaned behind `y4p`'s back surfaces as an error naming the row and expected path instead of a silent paste of nothing.
+
+`wipe` also gives memory back: after `VACUUM` and the cache clear, `PRAGMA shrink_memory` empties the connection's page cache and `core::memory::release_unused_heap` (`malloc_trim(0)` on Linux with glibc, a no-op elsewhere) returns the allocator's free pages to the kernel. Measured on 40,000 rows after a full listing and search: resident memory 233.5 MiB before the wipe, 74.5 MiB after `VACUUM` alone, 4.2 MiB with the trim; the pragma by itself changed nothing at this scale (`history/PERFORMANCE.md` section 7.5).
+
+Since v0.8.5 that work runs in the **daemon**, not in the CLI process. `y4p wipe --force` sends `IPC_CMD_WIPE` (0x07) over the socket and waits for a one-line `OK` / `ERR:<message>` reply, bounded by `IPC_MUTATION_TIMEOUT_MS` (10 000 ms), and the daemon executes `ClipboardDb::wipe()` on its single writer connection ([03](03_concurrency_and_memory.md) section 2.2). This is what makes the memory numbers above meaningful: `PRAGMA shrink_memory;` drops *that connection's* page cache and `malloc_trim(0)` trims *that process's* heap, and while the daemon is running the rows, the pages and the heap all belong to it — a CLI process trimming its own few megabytes would release nothing. When no daemon is listening, the CLI falls back to `ClipboardDb::wipe()` on its own handle, which is correct precisely because nothing else is writing ([04](04_strict_cli_and_stable_id.md) section 6).
 
 The daemon computes the hash **after** image routing (see [00](00_overview.md) section 5), so the key always describes the bytes actually stored. `ClipboardDb::insert_raw` (used by `y4p store`) computes the same digest itself.
 
@@ -178,7 +182,7 @@ There is now one source of truth, `TEXT_LIKE_MIME_HINTS` ([`crates/core/src/cons
 
 ## 6. The Egress Handle: `ContentLocation`
 
-`locate_content` ([`lib.rs:L201`](../crates/storage/src/lib.rs)) answers "where does this record's payload live?" without materialising it:
+`locate_content` ([`crates/storage/src/lib.rs`](../crates/storage/src/lib.rs)) answers "where does this record's payload live?" without materialising it. A cache-class record is only reported once its file is confirmed on disk (`Path::is_file`): a missing `<hash>.cache` is an `Err` naming the row and the path it expected, so the daemon logs it and serves nothing instead of offering a descriptor that cannot be opened:
 
 | Variant | Meaning | Served by |
 | :--- | :--- | :--- |
@@ -213,7 +217,7 @@ There are no foreign keys: SQLite enforces them per connection and only when ask
 | Average | `CDC_AVG_CHUNK_BYTES` | 16 KiB | |
 | Maximum | `CDC_MAX_CHUNK_BYTES` | 64 KiB | The default pipe capacity (`SPLICE_CHUNK_BYTES`): a chunk always moves in a single pipe round |
 
-Because boundaries follow content, an edit disturbs only the chunks around it. After a one-byte insert in a 16 MiB text, the copy adds 19,030 bytes (0.113 %) to the store; at the front of the file, 22,197 bytes (0.132 %); a 4 KiB insert mid-way, 23,125 bytes (0.138 %) ([`PERFORMANCE.md`](../PERFORMANCE.md) section 7.5). The storage tests assert that an edit adds at most three maximal chunks.
+Because boundaries follow content, an edit disturbs only the chunks around it. After a one-byte insert in a 16 MiB text, the copy adds 19,030 bytes (0.113 %) to the store; at the front of the file, 22,197 bytes (0.132 %); a 4 KiB insert mid-way, 23,125 bytes (0.138 %) ([`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 7.5). The storage tests assert that an edit adds at most three maximal chunks.
 
 ### 7.3 Writing, reading, searching
 
@@ -229,4 +233,4 @@ Because boundaries follow content, an edit disturbs only the chunks around it. A
 
 ### 7.5 What it costs
 
-Deduplication here saves space, not time. A fresh 1 MiB text inserts in about 7.4 ms against 0.9 ms inline, because the payload is now hashed twice (the row's fingerprint, then each chunk), and an edited copy still hashes every chunk to learn that it is shared. Reads cost 1.35-1.45x. The measurements and the levers considered are in [`PERFORMANCE.md`](../PERFORMANCE.md) section 7.5 and open question 5; none is applied.
+Deduplication here saves space, not time. A fresh 1 MiB text inserts in about 7.4 ms against 0.9 ms inline, because the payload is now hashed twice (the row's fingerprint, then each chunk), and an edited copy still hashes every chunk to learn that it is shared. Reads cost 1.35-1.45x. The measurements and the levers considered are in [`history/PERFORMANCE.md`](history/PERFORMANCE.md) section 7.5 and open question 5; none is applied.

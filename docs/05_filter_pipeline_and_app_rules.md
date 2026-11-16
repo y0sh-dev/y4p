@@ -16,13 +16,13 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
  Compositor Offer (MIME list)
              |
              v
- [Stage 1: Gate]  --------------------> sensitive hint? self-restore? paused?  -> discard silently
+ [Stage 1: Gate]  --------------------> sensitive hint? paused?                  -> discard silently
              |                          reader limit (8) reached?                 -> shed, counted
              |                          (all checked before any pipe is opened)
              v
- [Stage 2: MIME Priority & Filtering]
-             |-- drop RTF if [mime] drop_rtf is enabled
-             |-- select the richest format (MIME_PRIORITY_ORDER)
+ [Stage 2: MIME Allowlist]              strict: no catch-all
+             |-- drop RTF in the text step if [mime] drop_rtf is enabled
+             |-- candidates: MIME_PRIORITY_ORDER -> image/* -> text/*
              v
  [Stage 3: Payload Acquisition]         crates/wayland
              \-- bounded read: read_to_end, capped at MAX_PAYLOAD_BYTES (256 MiB), +1 probe byte
@@ -53,28 +53,33 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 
 | Check | Source | Effect |
 | :--- | :--- | :--- |
-| `provider_locks > 0` | the daemon's own restore ([01](01_wayland_streaming_io.md) section 3) | decrement and return |
 | `paused` | IPC `pause` (private mode) | return; no `offer.receive`, no job |
-| `is_sensitive(mimes)` | `SENSITIVE_MIME_HINTS` | return |
+| `is_sensitive(mimes)` | `core::utils::is_sensitive_mime` | return |
 | empty offer list | | return |
 
-`is_sensitive` lowercases **both** the offered MIME and the hint before comparing. Hints mix case (`x-kde-passwordManagerHint`); lowercasing only the haystack would make that hint impossible to match, silently defeating the KDE password-manager filter it exists for. The hint list covers KDE and GNOME markers plus `keepass`, `1password`, `bitwarden`, `concealed`, `password`, `secret`. The storage layer applies the same hints once more as a backstop (`upsert_record` returns `-1` for them).
+A restore of the daemon's own does **not** appear here: since v0.8.7 there is no `provider_locks` counter, and a re-offer of what was just served is deduplicated by content hash in storage ([01](01_wayland_streaming_io.md) section 3).
+
+`is_sensitive` now delegates to `core::utils::is_sensitive_mime(mime)`, which lowercases **both** the MIME and the hint before the substring test. Hints mix case (`x-kde-passwordManagerHint`); lowercasing only the haystack would make that hint impossible to match, silently defeating the KDE password-manager filter it exists for. The hint list covers KDE and GNOME markers plus `keepass`, `1password`, `bitwarden`, `concealed`, `password`, `secret`.
+
+> **Invariant — one sensitive test, two layers.** The storage backstop is the *same* function: `is_skipped` in [`crates/storage/src/db.rs`](../crates/storage/src/db.rs) is `len == 0 || crate::core::utils::is_sensitive_mime(mime)`, so a MIME the Wayland layer lets through cannot be classified differently once it reaches `upsert_record`. That matters for paths that never pass through a selection at all (`y4p store`, `y4p copy-to`), which the storage check covers on its own. A manually stored `X-KDE-PASSWORDMANAGERHINT` payload is skipped (`upsert_record` returns `-1`) just like an ingested one.
 
 ### 1.2 Stage 2: MIME selection
 
-`select_mime` ([`crates/wayland/src/handlers/data_control/device.rs:L137`](../crates/wayland/src/handlers/data_control/device.rs)):
+`select_mime_candidates` ([`crates/wayland/src/handlers/data_control/device.rs`](../crates/wayland/src/handlers/data_control/device.rs)) returns an ordered candidate array, not a single choice; the fallback loop that walks it is described in [01](01_wayland_streaming_io.md) section 2.5:
 
 | Mode | `target_mime` | Rule |
 | :--- | :--- | :--- |
-| Action Mode (`y4p paste-from <mime>`) | `Some` | The offer matching by `mime_base_eq` (case, whitespace and parameters ignored). `drop_rtf` is **not** consulted: an explicit request is honoured, RTF included |
-| Daemon ingestion | `None` | First hit in `MIME_PRIORITY_ORDER`, else any `image/*`, else any `text/*`, else anything. `drop_rtf` is applied at **every** step, so RTF is never selected when enabled, even as the last-resort catch-all |
+| Action Mode (`y4p paste-from <mime>`) | `Some` | Every offer matching by `mime_base_eq` (case, whitespace and parameters ignored). `drop_rtf` is **not** consulted: an explicit request is honoured, RTF included |
+| Daemon ingestion | `None` | The **strict allowlist**, in this order: every match in `MIME_PRIORITY_ORDER` (in that order), then the remaining `image/*`, then the remaining `text/*` (`drop_rtf` removes RTF from this last step). Offers are deduplicated by base type |
 
-`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs:L218`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
+`MIME_PRIORITY_ORDER` ([`crates/core/src/constants.rs`](../crates/core/src/constants.rs)) ranks images first (PNG, WebP, JPEG, GIF, SVG, AVIF, BMP), then `text/uri-list`, then plain text and the legacy string atoms, and rich markup (`text/html`, XHTML, Markdown, JSON, XML) last. `text/rtf` deliberately has no entry.
+
+> **Invariant — there is no catch-all (v0.8.6).** An offer outside `MIME_PRIORITY_ORDER`, `image/*` and `text/*` — `application/octet-stream`, `application/x-*`, `TARGETS`, an untyped blob — never becomes a candidate: it is neither requested nor stored. Until v0.8.6 the chain ended in "else anything", which meant every opaque binary a sender announced was read and persisted as a history entry of unknown meaning. The strict list is also why an app that offers only a blob is now silently ignored rather than half-supported.
 
 ### 1.3 Why the order matters
 
 1. **Discard before allocation.** Sensitive hints are checked before opening pipes or allocating buffers. An offer from a password manager is dropped at zero I/O cost.
-2. **Plain text outranks rich markup.** Electron and Chromium applications routinely announce `text/html` next to `text/plain` but synthesise HTML only on request; a non-rich selection returns an empty transfer for `text/html`. Trying plain text first makes that failure structurally impossible, while `text/html` stays reachable when no plain-text alternative exists.
+2. **Plain text outranks rich markup, and an empty attempt costs only one candidate.** Electron and Chromium applications routinely announce `text/html` next to `text/plain` but synthesise HTML only on request; a non-rich selection returns an empty transfer for `text/html`. Trying plain text first makes that failure structurally impossible, while `text/html` stays reachable when no plain-text alternative exists. Since v0.8.6 a 0-byte transfer is not the end of the selection either: the fallback loop moves to the next candidate ([01](01_wayland_streaming_io.md) section 2.5).
 3. **Hash after every transformation.** Normalisation and image routing may change bytes; the fingerprint is computed last so the persisted hash always matches the persisted bytes.
 
 > **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are the only payloads rewritten**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); GIF, SVG, AVIF and non-image types pass through untouched; PNG, BMP, JPEG and WebP leave as `image/png`.

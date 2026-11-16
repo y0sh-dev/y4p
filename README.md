@@ -35,6 +35,7 @@ Engineered with strict zero-loss integrity and defence-in-depth resource control
 - **Zero-Loss Integrity**: Pinned entries are strictly immune to ring buffer rotation; zero schema corruption across migrations.
 - **Local Image Pipeline**: Privacy-stripping image transcoding with isolated scratch directories, a process-group timeout watchdog, resource limits, bounded concurrency and a self-healing circuit breaker.
 - **Robust by Construction**: Panic-free execution path (`unwrap`, `expect` and `panic!` are denied workspace-wide by lints) and a deliberately small, pinned dependency set.
+- **Built-in Observability**: `y4p stats` reports entry, on-disk and daemon shed figures; `y4p doctor` walks environment, compositor, database, socket and quota with `[PASS]` / `[WARN]` / `[FAIL]` per check.
 
 ---
 
@@ -52,6 +53,8 @@ A quick look at what's available. Full flags and examples live in `y4p help`.
 | `pin` / `unpin` | Protect or release a record from automatic rotation. |
 | `delete` / `wipe` | Remove one record, or clear all history. |
 | `status` / `pause` / `resume` | Check or control the daemon's monitoring state. |
+| `stats` | Report entry counts, on-disk footprint and the daemon's shed counters. |
+| `doctor` | Diagnose environment, compositor, database, socket and quota; exits non-zero only on a failed check. |
 
 ---
 
@@ -75,7 +78,24 @@ y4p daemon &
 y4p status
 echo "Wayland native clipboard" | y4p store
 y4p list
+
+# What is stored, and is the setup healthy?
+y4p stats
+y4p doctor
 ```
+
+### Run as a user service
+
+A `systemd` user unit ships in [`contrib/systemd/y4p.service`](contrib/systemd/y4p.service). It uses `Restart=on-failure`, which only works because `y4p daemon` reports a failed start or a lost compositor connection as a non-zero exit and a requested stop as `0`:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/y4p.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now y4p.service
+```
+
+`y4p status` and `y4p doctor` then talk to that instance, and `journalctl --user -u y4p` carries its log.
 
 Enable Zsh completions (optional). Add the completions directory to your `fpath` before `compinit`:
 
@@ -101,6 +121,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Full automated verification suite (both of the above)
 bash scripts/check.sh
+
+# Live compositor matrix (cage or sway + wl-clipboard + ImageMagick);
+# prints [SKIP] and exits 0 when no headless compositor is installed
+bash scripts/e2e_compositor.sh
 ```
 
 </details>
@@ -142,7 +166,7 @@ The technical architecture lives in [`docs/00_overview.md`](docs/00_overview.md)
 Project governance, planning and references:
 
 - [`.github/POLICY.md`](.github/POLICY.md): Shared contribution policy and engineering standards.
-- [`PERFORMANCE.md`](PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
+- [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
 - [`ROADMAP_v0.9.md`](ROADMAP_v0.9.md): The v0.8.x hardening roadmap towards v0.9.0 (Trust).
 - [`README_ja.md`](README_ja.md): Japanese README (日本語版).
 
