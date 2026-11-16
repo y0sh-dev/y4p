@@ -27,11 +27,12 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
             // Update synchronisation status
             state.selection_received = true;
 
-            // Prevent self-ingestion by checking active provider locks
-            if state.provider_locks > 0 {
-                state.provider_locks -= 1;
-                return;
-            }
+            // A selection caused by our own restore is deliberately *not*
+            // suppressed here: storage deduplicates by content hash, so
+            // re-ingesting it merely touches the existing row (timestamp/MRU)
+            // and never adds a duplicate, whereas a counter could not tell that
+            // apart from a genuine copy taken right after a restore — which it
+            // would drop.
 
             // Private mode: bypass ingestion entirely (no offer.receive, no DB Worker job).
             if state.paused {

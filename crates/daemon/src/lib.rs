@@ -366,8 +366,6 @@ fn handle_restore_request(
 
     if let Some((mime, location)) = resolved
         && let Some(ref manager) = state.manager {
-        state.provider_locks += 1;
-
         let payload = match location {
             ContentLocation::InlineBlob(id) => {
                 let data = read_db.get_content_by_id(id)
