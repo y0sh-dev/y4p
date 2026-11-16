@@ -36,6 +36,13 @@ pub fn print_help() {
     println!("    status             - Query the running daemon and print its status.");
     println!("                         No flags or arguments.");
 
+    println!("    stats              - Report entry, on-disk and daemon shed statistics.");
+    println!("                         No flags or arguments.");
+
+    println!("    doctor             - Diagnose environment, compositor, database, socket and quota.");
+    println!("                         Prints [PASS]/[WARN]/[FAIL]; exits 1 if any check fails.");
+    println!("                         No flags or arguments.");
+
     println!("    pause              - Suspend clipboard monitoring (private mode).");
     println!("                         No flags or arguments.");
 

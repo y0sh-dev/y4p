@@ -29,6 +29,8 @@ mod help;
 mod status;
 mod pause;
 mod resume;
+mod stats;
+pub mod doctor;
 pub mod formatter;
 mod utils;
 
@@ -44,6 +46,9 @@ pub enum CliAction {
     None,
     RunDaemon(ClipboardDb, bool),
     PasteFrom(String),
+    /// `y4p doctor`: only the Wayland handshake needs the composition root, so
+    /// the rest of the diagnostics run in `cli::doctor` with this handle.
+    Doctor(ClipboardDb),
 }
 
 /// Central command dispatcher. Standardised to use mutable references for database
@@ -98,6 +103,13 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) -> CliAction {
             None => CliAction::None,
         },
         "status"     => status::run(args),
+        "stats"      => stats::run(args, &db),
+        // Only the argument validation happens here; the diagnostics need a
+        // compositor handshake, so `main` runs them via `CliAction::Doctor`.
+        "doctor"     => return match doctor::parse(args) {
+            Some(()) => CliAction::Doctor(db),
+            None => CliAction::None,
+        },
         "pause"      => pause::run(args),
         "resume"     => resume::run(args),
         "help"       => help::print_help(),

@@ -81,6 +81,12 @@ fn main() {
     let db = match storage::ClipboardDb::open() {
         Ok(database) => database,
         Err(e) => {
+            // `doctor` exists to explain exactly this kind of failure, so it
+            // reports the check rather than bailing out with a bare fatal error.
+            if args.get(1).map(String::as_str) == Some("doctor") {
+                cli::doctor::report_unopenable_database(&e);
+                std::process::exit(1);
+            }
             eprintln!("{}critical: {}", LOG_ERROR, e);
             std::process::exit(1);
         }
@@ -109,6 +115,15 @@ fn main() {
                     eprintln!("{}{}", LOG_ERROR, MSG_DAEMON_STOP);
                     std::process::exit(1);
                 }
+            }
+        }
+        CliAction::Doctor(db) => {
+            // The compositor handshake is the one check that needs the Wayland
+            // backend; probing it here and handing the outcome over keeps every
+            // line of the report in one place, in a fixed order.
+            let compositor = wayland::create_connection().is_some();
+            if cli::doctor::report(&db, compositor) {
+                std::process::exit(1);
             }
         }
         CliAction::PasteFrom(mime) => {

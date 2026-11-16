@@ -88,3 +88,20 @@ pub fn get_label(mime: &str) -> &'static str {
         LABEL_DATA
     }
 }
+
+/// Human-readable byte count, base 1024, for the reporting commands (`stats`,
+/// `doctor`). Kept here so both spell sizes the same way.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
