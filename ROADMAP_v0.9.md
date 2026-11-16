@@ -48,7 +48,7 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
   - Deprecate fragile `provider_locks` counters; rely on content-hash deduplication for self-copy suppression without dropping user copies.
   - Enforce case-insensitive matching (`to_ascii_lowercase()`) across all sensitive MIME backstops.
 
-- [ ] **v0.8.8: Live Compositor E2E Suite & System Observability (P1/P2)**
+- [x] **v0.8.8: Live Compositor E2E Suite & System Observability (P1/P2)**
   - Establish a headless compositor (Sway / Cage) integration test matrix verifying real Chromium (plain/rich), Firefox, GIMP, and large payload copies.
   - Implement `y4p doctor` (environment, compositor, DB, socket, quota checks) and `y4p stats` (cache byte volume, entry breakdown, shed counts).
 
