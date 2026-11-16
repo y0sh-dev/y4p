@@ -54,14 +54,14 @@ y4p returns to its founding promise: **what is copied is stored verbatim, never 
 
 ### Phase 3: Documentation Distillation & Architecture Freeze (`v0.8.9`)
 
-- [ ] **v0.8.9: Documentation Distillation & Protocol Freeze**
+- [x] **v0.8.9: Documentation Distillation & Protocol Freeze**
   - Synchronise `docs/00`–`06` with deadline, IPC, and cache integrity guarantees.
   - Explicitly document operational boundaries ("What y4p is NOT": not an arbitrary image converter, not a forensic archive).
   - Archive deep performance experiments to `docs/history/` and freeze core invariants.
 
 ### Phase 4: Formal Release (`v0.9.0`)
 
-- [ ] **v0.9.0: Official Major Release: Trust**
+- [x] **v0.9.0: Official Major Release: Trust**
   - Bump workspace version across all crates to `0.9.0`.
   - Update version badges, verify 100% test pass on live compositor suite with 0 compiler/clippy warnings.
   - Cut release branch `release/v0.9.0`, publish tag and GitHub Release.
