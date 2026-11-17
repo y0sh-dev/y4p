@@ -122,7 +122,8 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Content-defined chunk storage (see `db::SqliteStore::store_chunks`).
+    /// Legacy content-defined chunk storage (the retired chunk writer; rows are
+    /// still read by `db::SqliteStore::reassemble`).
     ///
     /// Purely additive, so every v1-v3 row stays exactly as it is:
     /// - `clipboard.is_chunked` (default 0) marks a row whose bytes live in

@@ -3,13 +3,11 @@
 
 // crates/storage/src/db.rs
 
-use rusqlite::{params, Connection, Result, Transaction};
+use rusqlite::{params, Connection, Result};
 use rusqlite::types::ValueRef;
-use sha3::{Digest, Sha3_256};
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::core::cdc::FastCdc;
-use crate::core::constants::{CDC_MIN_CHUNK_BYTES, LOG_ERROR, MAX_PAYLOAD_BYTES, PREVIEW_CHARS};
+use crate::core::constants::{LOG_ERROR, MAX_PAYLOAD_BYTES, PREVIEW_CHARS};
 use crate::core::utils::{is_html_mime, is_text_like_mime, strip_html_tags};
 use super::MetaRow;
 
@@ -69,8 +67,6 @@ impl Body<'_> {
 enum Content<'a> {
     Text(&'a str),
     Blob(&'a [u8]),
-    /// `content` stays NULL; the bytes are split into `chunks` (see `store_chunks`).
-    Chunked(&'a [u8]),
     None,
 }
 
@@ -85,13 +81,6 @@ pub fn is_cache_class(mime: &str) -> bool {
 /// "text/x-gif" does not, and is stored from its bytes like any other.
 pub fn is_detachable(mime: &str) -> bool {
     is_cache_class(mime) && !is_text_like_mime(mime)
-}
-
-/// Whether a payload is stored as deduplicated chunks rather than inline: not
-/// cache class, and long enough that splitting it is worth a manifest. At or
-/// below one minimum chunk the row keeps its bytes inline (no extra lookups).
-fn is_chunkable(mime: &str, len: usize) -> bool {
-    !is_cache_class(mime) && len > CDC_MIN_CHUNK_BYTES
 }
 
 /// Payloads that are never stored: empty ones and sensitive MIME types.
@@ -170,19 +159,13 @@ impl SqliteStore {
                     "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![ts, mime, size, preview, blob, hash],
                 ),
-                Content::None | Content::Chunked(_) => tx.execute(
-                    "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash, is_chunked) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-                    params![ts, mime, size, preview, hash, matches!(content, Content::Chunked(_))],
+                Content::None => tx.execute(
+                    "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash, is_chunked) VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0)",
+                    params![ts, mime, size, preview, hash],
                 ),
             }.map_err(|e| e.to_string())?;
 
-            let id = tx.last_insert_rowid();
-            // Same transaction as the row: a crash can never leave a chunked
-            // row without its manifest, or chunks whose count is wrong.
-            if let Content::Chunked(data) = content {
-                Self::store_chunks(&tx, id, data)?;
-            }
-            id
+            tx.last_insert_rowid()
         };
 
         // G-10: rotation only ever counts/evicts unpinned rows, so both
@@ -261,38 +244,15 @@ impl SqliteStore {
         // claiming a text MIME but not actually valid UTF-8 fall through to the
         // ordinary BLOB path rather than being rejected or corrupted.
         //
-        // A payload long enough to chunk is not validated or bound whole: its
-        // bytes go to `chunks` verbatim, and search reassembles them (see
-        // `BODY_TEXT_SQL`), so the TEXT/BLOB class no longer matters for it.
+        // Every payload that is not cache class is bound whole here, whatever
+        // its size: chunk writes are retired (see `BODY_TEXT_SQL` for how a
+        // legacy `is_chunked = 1` row is still read).
         let content = match std::str::from_utf8(data) {
-            _ if is_chunkable(mime, data.len()) => Content::Chunked(data),
             Ok(text) if is_text_like => Content::Text(text),
             _ if is_image => Content::None,
             _ => Content::Blob(data),
         };
         (preview, content)
-    }
-
-    /// Splits `data` with FastCDC and records it as the chunks of row `id`.
-    ///
-    /// A chunk already present is only counted again (`refcount + 1`); its bytes
-    /// are neither re-bound nor re-written. Only a first occurrence inserts the
-    /// data. The same chunk may recur inside one payload (and, for uniform
-    /// data, usually does), so the count is per manifest entry, not per row.
-    fn store_chunks(tx: &Transaction<'_>, id: i64, data: &[u8]) -> Result<(), String> {
-        let mut reuse = tx.prepare("UPDATE chunks SET refcount = refcount + 1 WHERE hash = ?1").map_err(|e| e.to_string())?;
-        let mut add = tx.prepare("INSERT INTO chunks (hash, data, refcount) VALUES (?1, ?2, 1)").map_err(|e| e.to_string())?;
-        let mut link = tx.prepare("INSERT INTO manifest (clipboard_id, seq, chunk_hash) VALUES (?1, ?2, ?3)").map_err(|e| e.to_string())?;
-
-        for (seq, chunk) in FastCdc::new(data).enumerate() {
-            let digest = Sha3_256::digest(chunk);
-            let digest = digest.as_slice();
-            if reuse.execute(params![digest]).map_err(|e| e.to_string())? == 0 {
-                add.execute(params![digest, chunk]).map_err(|e| e.to_string())?;
-            }
-            link.execute(params![id, seq as i64, digest]).map_err(|e| e.to_string())?;
-        }
-        Ok(())
     }
 
     /// Drops row `id`'s manifest and gives back its chunk references; a chunk
@@ -1023,7 +983,11 @@ mod tests {
         assert!(!store.set_pinned(999_999, true).unwrap());
     }
 
-    // --- content-defined chunk storage ---
+    // --- inline storage: whole-payload writes ---
+
+    use crate::core::cdc::FastCdc;
+    use crate::core::constants::{CDC_MAX_CHUNK_BYTES, CDC_MIN_CHUNK_BYTES};
+    use sha3::{Digest, Sha3_256};
 
     /// Deterministic bytes (xorshift64*): incompressible, so chunk boundaries
     /// fall where the content puts them.
@@ -1053,6 +1017,31 @@ mod tests {
         store.conn.query_row("SELECT content IS NULL FROM clipboard WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
     }
 
+    /// Inserts a row exactly as the retired chunk writer did: `is_chunked = 1`,
+    /// the payload split by FastCDC, each chunk deduplicated by SHA3-256 and
+    /// referenced from the manifest in order. This is the only producer of
+    /// legacy chunked rows now, and it keeps the read, search, delete, rotation
+    /// and wipe paths under test.
+    fn insert_legacy_chunked(store: &mut SqliteStore, mime: &str, data: &[u8], hash: &str, ts: i64) -> i64 {
+        let tx = store.conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash, is_chunked) VALUES (?1, ?2, ?3, NULL, NULL, ?4, 1)",
+            params![ts, mime, data.len() as i64, hash],
+        ).unwrap();
+        let id = tx.last_insert_rowid();
+        for (seq, chunk) in FastCdc::new(data).enumerate() {
+            let digest = Sha3_256::digest(chunk);
+            let digest = digest.as_slice();
+            let reused = tx.execute("UPDATE chunks SET refcount = refcount + 1 WHERE hash = ?1", params![digest]).unwrap();
+            if reused == 0 {
+                tx.execute("INSERT INTO chunks (hash, data, refcount) VALUES (?1, ?2, 1)", params![digest, chunk]).unwrap();
+            }
+            tx.execute("INSERT INTO manifest (clipboard_id, seq, chunk_hash) VALUES (?1, ?2, ?3)", params![id, seq as i64, digest]).unwrap();
+        }
+        tx.commit().unwrap();
+        id
+    }
+
     #[test]
     fn a_payload_of_at_most_one_minimum_chunk_stays_inline() {
         let mut store = test_store();
@@ -1061,24 +1050,23 @@ mod tests {
 
         assert!(!is_chunked(&store, id));
         assert_eq!(store.get_row_content(id).unwrap().1, Some(at_limit));
-        let usage = store.chunk_usage();
-        assert_eq!((usage.chunks, usage.manifest), (0, 0));
+        assert_eq!((store.chunk_usage().chunks, store.chunk_usage().manifest), (0, 0));
     }
 
     #[test]
-    fn a_payload_one_byte_over_the_minimum_is_chunked_and_restored_exactly() {
+    fn a_payload_one_byte_over_the_minimum_is_stored_inline_too() {
         let mut store = test_store();
         let data = noise(CDC_MIN_CHUNK_BYTES + 1, 2);
         let id = store.upsert_record("application/octet-stream", &data, "h-4k1", 100).unwrap().real_id;
 
-        assert!(is_chunked(&store, id));
-        assert!(content_is_null(&store, id), "the bytes live in `chunks`, not in the row");
+        assert!(!is_chunked(&store, id), "chunk writes are retired, whatever the size");
+        assert!(!content_is_null(&store, id), "the bytes live in `content`");
         assert_eq!(store.get_row_content(id).unwrap().1, Some(data));
-        store.chunk_usage();
+        assert_eq!((store.chunk_usage().chunks, store.chunk_usage().manifest), (0, 0));
     }
 
     #[test]
-    fn a_large_binary_payload_round_trips_through_chunks() {
+    fn a_large_binary_payload_round_trips_inline() {
         let mut store = test_store();
         let data = noise(700_000, 3);
         let id = store.upsert_record("application/pdf", &data, "h-pdf", 100).unwrap().real_id;
@@ -1086,16 +1074,16 @@ mod tests {
         let (mime, content, hash) = store.get_row_content(id).unwrap();
         assert_eq!((mime.as_str(), hash.as_str()), ("application/pdf", "h-pdf"));
         assert_eq!(content, Some(data.clone()));
+        assert!(!is_chunked(&store, id));
 
         let usage = store.chunk_usage();
-        assert_eq!(usage.manifest, FastCdc::new(&data).count());
-        assert_eq!(usage.bytes, data.len(), "no repeated chunk in noise: stored once, in full");
+        assert_eq!((usage.chunks, usage.bytes, usage.manifest), (0, 0, 0), "nothing is split or manifested");
         let size: i64 = store.conn.query_row("SELECT size FROM clipboard WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
         assert_eq!(size, data.len() as i64);
     }
 
     #[test]
-    fn a_chunked_row_is_located_as_inline_not_as_a_cache_file() {
+    fn a_large_inline_row_is_located_as_inline_not_as_a_cache_file() {
         let mut store = test_store();
         let id = store.upsert_record("application/octet-stream", &noise(100_000, 4), "h-loc", 100).unwrap().real_id;
 
@@ -1104,28 +1092,29 @@ mod tests {
     }
 
     #[test]
-    fn a_chunked_text_payload_keeps_its_preview_and_round_trips() {
+    fn a_large_text_payload_keeps_its_preview_and_round_trips() {
         let mut store = test_store();
         let text = prose(250_000, 5);
         let id = store.upsert_record("text/plain", text.as_bytes(), "h-text", 100).unwrap().real_id;
 
-        assert!(is_chunked(&store, id));
+        assert!(!is_chunked(&store, id));
         let meta = store.fetch_metadata(10);
         assert_eq!(meta[0].4.as_deref(), Some(&text[..PREVIEW_CHARS]), "the preview is still the first PREVIEW_CHARS characters");
         assert_eq!(store.get_row_content(id).unwrap().1, Some(text.into_bytes()));
     }
 
     #[test]
-    fn cache_class_payloads_are_never_chunked() {
+    fn cache_class_payloads_stay_out_of_the_row_and_odd_text_ones_stay_inline() {
         let mut store = test_store();
         let image = store.upsert_record("image/png", &noise(100_000, 6), "h-img", 100).unwrap().real_id;
         assert!(!is_chunked(&store, image));
         assert!(content_is_null(&store, image), "an image's bytes belong to the file cache");
 
-        // Cache class by name, text by type: stored whole, as before.
+        // Cache class by name, text by type: stored whole, inline.
         let quirk = prose(50_000, 7);
         let odd = store.upsert_record("text/x-gif", quirk.as_bytes(), "h-quirk", 100).unwrap().real_id;
         assert!(!is_chunked(&store, odd));
+        assert!(!content_is_null(&store, odd));
         assert_eq!(store.get_row_content(odd).unwrap().1, Some(quirk.into_bytes()));
 
         let usage = store.chunk_usage();
@@ -1133,65 +1122,183 @@ mod tests {
     }
 
     #[test]
-    fn an_edited_payload_shares_almost_all_of_its_chunks_with_the_original() {
+    fn re_inserting_the_same_hash_touches_the_row_instead_of_adding_one() {
+        let mut store = test_store();
+        let data = noise(200_000, 10);
+        let first = store.upsert_record("application/octet-stream", &data, "h-same", 100).unwrap().real_id;
+        let second = store.upsert_record("application/octet-stream", &data, "h-same", 100).unwrap().real_id;
+
+        assert_eq!(first, second);
+        assert_eq!(store.get_total_count(), 1);
+        assert_eq!(store.get_row_content(first).unwrap().1, Some(data));
+        assert_eq!((store.chunk_usage().chunks, store.chunk_usage().manifest), (0, 0));
+    }
+
+    #[test]
+    fn the_same_bytes_under_two_hashes_are_two_inline_rows() {
+        let mut store = test_store();
+        let data = noise(300_000, 9);
+        let a = store.upsert_record("application/octet-stream", &data, "h-one", 100).unwrap().real_id;
+        let b = store.upsert_record("application/octet-stream", &data, "h-two", 100).unwrap().real_id;
+
+        assert_ne!(a, b, "deduplication is by hash, and these hashes differ");
+        assert_eq!(store.get_total_count(), 2);
+        assert_eq!(store.get_row_content(b).unwrap().1, Some(data));
+        assert_eq!((store.chunk_usage().chunks, store.chunk_usage().manifest), (0, 0), "no cross-row chunk sharing");
+    }
+
+    #[test]
+    fn an_edited_payload_is_stored_inline_under_its_own_hash() {
         let mut store = test_store();
         let original = prose(512 * 1024, 8);
         let mut edited = original.clone();
         edited.insert(200_000, '#');
 
         let a = store.upsert_record("text/plain", original.as_bytes(), "h-orig", 100).unwrap().real_id;
-        let after_first = store.chunk_usage();
         let b = store.upsert_record("text/plain", edited.as_bytes(), "h-edit", 100).unwrap().real_id;
-        let after_second = store.chunk_usage();
 
-        // Boundaries re-synchronise after the edit, so only the chunks around it are new.
-        let added = after_second.bytes - after_first.bytes;
-        assert!(added <= 3 * crate::core::constants::CDC_MAX_CHUNK_BYTES, "edit added {added} bytes of chunks");
-        assert!(after_second.bytes < original.len() * 3 / 2, "{} stored for two {}-byte payloads", after_second.bytes, original.len());
-        assert!(after_second.shared + 4 >= after_first.chunks, "{} shared of {} chunks", after_second.shared, after_first.chunks);
+        assert_ne!(a, b);
         assert_eq!(store.get_row_content(a).unwrap().1, Some(original.into_bytes()));
         assert_eq!(store.get_row_content(b).unwrap().1, Some(edited.into_bytes()));
+        assert_eq!((store.chunk_usage().chunks, store.chunk_usage().manifest), (0, 0));
     }
 
+    // --- legacy `is_chunked = 1` rows ---
+
     #[test]
-    fn the_same_bytes_under_two_hashes_are_written_once() {
+    fn a_legacy_chunked_row_is_read_and_located_as_inline() {
         let mut store = test_store();
-        let data = noise(300_000, 9);
-        store.upsert_record("application/octet-stream", &data, "h-one", 100).unwrap();
-        let once = store.chunk_usage();
-        store.upsert_record("application/octet-stream", &data, "h-two", 100).unwrap();
-        let twice = store.chunk_usage();
+        let data = noise(300_000, 27);
+        let id = insert_legacy_chunked(&mut store, "application/octet-stream", &data, "h-legacy-read", 1);
 
-        assert_eq!(twice.bytes, once.bytes, "no chunk data is written a second time");
-        assert_eq!(twice.chunks, once.chunks);
-        assert_eq!(twice.manifest, 2 * once.manifest);
-        assert_eq!(twice.shared, twice.chunks, "every chunk is referenced by both rows");
+        assert!(is_chunked(&store, id));
+        assert_eq!(store.get_row_content(id).unwrap().1, Some(data));
+        assert!(store.get_row_location(id).unwrap().1, "its bytes are in the database, not a cache file");
+        store.chunk_usage();
     }
 
     #[test]
-    fn re_inserting_the_same_hash_touches_the_row_and_adds_no_references() {
+    fn search_finds_a_keyword_far_beyond_the_preview_in_an_inline_row() {
         let mut store = test_store();
-        let data = noise(200_000, 10);
-        let first = store.upsert_record("application/octet-stream", &data, "h-same", 100).unwrap().real_id;
-        let before = store.chunk_usage();
-        let second = store.upsert_record("application/octet-stream", &data, "h-same", 100).unwrap().real_id;
+        let mut text = prose(300_000, 22);
+        text.replace_range(150_000..150_010, "deepneedle");
+        let id = store.upsert_record("text/plain", text.as_bytes(), "h-deep", 100).unwrap().real_id;
+        assert!(!is_chunked(&store, id));
+        store.upsert_record("text/plain", b"unrelated small note", "h-small", 100).unwrap();
 
-        assert_eq!(first, second);
-        assert_eq!(store.chunk_usage().manifest, before.manifest);
+        let hits = store.search_metadata(&["deepneedle".to_string()], 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.0, id);
+
+        let (valid, invalid) = store.validate_keywords(&["deepneedle".to_string(), "absent-term-xyz".to_string()]);
+        assert_eq!(valid, vec!["deepneedle".to_string()]);
+        assert_eq!(invalid, vec!["absent-term-xyz".to_string()]);
     }
 
     #[test]
-    fn a_chunk_repeated_inside_one_payload_is_counted_per_occurrence() {
+    fn search_reassembles_a_legacy_chunked_row_across_a_chunk_boundary() {
+        let mut store = test_store();
+        // Uniform padding is cut exactly at the maximum chunk size; the keyword
+        // is placed across that cut.
+        let cut = CDC_MAX_CHUNK_BYTES;
+        let mut text = vec![b'a'; cut + 5_000];
+        text[cut - 3..cut + 3].copy_from_slice(b"SPLITK");
+        let first_chunk = FastCdc::new(&text).next().unwrap().len();
+        assert_eq!(first_chunk, cut, "the setup must put the cut inside the keyword");
+        let id = insert_legacy_chunked(&mut store, "text/plain", &text, "h-straddle", 1);
+
+        let hits = store.search_metadata(&["splitk".to_string()], 10);
+        assert_eq!(hits.iter().map(|h| h.1.0).collect::<Vec<_>>(), vec![id], "LIKE is case-insensitive, as for inline rows");
+        assert_eq!(store.validate_keywords(&["SPLITK".to_string()]).0, vec!["SPLITK".to_string()]);
+    }
+
+    #[test]
+    fn search_reassembles_multibyte_legacy_chunks_and_returns_exact_bytes() {
+        let mut store = test_store();
+        let cut = CDC_MAX_CHUNK_BYTES;
+        let mut text = vec![b'a'; cut - 1];
+        text.extend_from_slice("日本語のテキスト".as_bytes());
+        text.extend(std::iter::repeat_n(b'a', 4_000));
+        let first_chunk = FastCdc::new(&text).next().unwrap();
+        assert_eq!(first_chunk.len(), cut);
+        assert!(std::str::from_utf8(first_chunk).is_err(), "the cut falls inside a UTF-8 sequence");
+        let id = insert_legacy_chunked(&mut store, "text/plain", &text, "h-jp", 1);
+
+        assert_eq!(store.get_row_content(id).unwrap().1, Some(text), "bytes survive reassembly exactly");
+        for keyword in ["日本語", "テキスト", "本語の"] {
+            assert_eq!(store.search_metadata(&[keyword.to_string()], 10).len(), 1, "{keyword}");
+        }
+    }
+
+    #[test]
+    fn search_ignores_a_binary_payload_and_a_term_absent_from_legacy_chunked_text() {
+        let mut store = test_store();
+        let mut bin = noise(200_000, 23);
+        bin[100_000..100_006].copy_from_slice(b"needle");
+        store.upsert_record("application/octet-stream", &bin, "h-bin", 100).unwrap();
+        insert_legacy_chunked(&mut store, "text/plain", prose(200_000, 24).as_bytes(), "h-txt", 1);
+
+        assert!(store.search_metadata(&["needle".to_string()], 10).is_empty(), "binary mime is out of scope, inline or not");
+        assert!(store.search_metadata(&["0123456789".to_string()], 10).is_empty());
+    }
+
+    #[test]
+    fn search_covers_legacy_inline_legacy_chunked_and_fresh_inline_rows_together() {
+        let mut store = test_store();
+        // A row as v3 wrote it: large, inline, not chunked.
+        let legacy = format!("{} legacyneedle", prose(20_000, 25));
+        store.conn.execute(
+            "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (1, 'text/plain', ?1, 'p', ?2, 'h-legacy')",
+            params![legacy.len() as i64, legacy],
+        ).unwrap();
+        let legacy_id: i64 = store.conn.query_row("SELECT id FROM clipboard WHERE hash = 'h-legacy'", [], |r| r.get(0)).unwrap();
+        // A row as the retired chunk writer left it.
+        let chunked_text = format!("{} legacyneedle", prose(100_000, 26));
+        let chunked_id = insert_legacy_chunked(&mut store, "text/plain", chunked_text.as_bytes(), "h-chunked", 2);
+        // A row as this version writes it: large and inline.
+        let fresh = format!("{} legacyneedle", prose(100_000, 27));
+        let fresh_id = store.upsert_record("text/plain", fresh.as_bytes(), "h-fresh", 100).unwrap().real_id;
+
+        let mut ids: Vec<i64> = store.search_metadata(&["legacyneedle".to_string()], 10).iter().map(|h| h.1.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![legacy_id, chunked_id, fresh_id]);
+        assert_eq!(store.get_row_content(legacy_id).unwrap().1, Some(legacy.into_bytes()), "an inline row is read as before");
+        assert_eq!(store.get_row_content(chunked_id).unwrap().1, Some(chunked_text.into_bytes()), "a chunked row still reassembles");
+        assert!(!is_chunked(&store, fresh_id));
+    }
+
+    #[test]
+    fn a_legacy_row_with_a_missing_chunk_is_not_served_as_a_shorter_payload() {
+        let mut store = test_store();
+        let id = insert_legacy_chunked(&mut store, "application/octet-stream", &noise(300_000, 28), "h-broken", 1);
+        store.conn.execute("DELETE FROM chunks WHERE rowid = (SELECT MIN(rowid) FROM chunks)", []).unwrap();
+
+        assert!(store.get_row_content(id).is_none());
+    }
+
+    #[test]
+    fn a_legacy_manifest_that_disagrees_with_the_recorded_size_is_refused() {
+        let mut store = test_store();
+        let id = insert_legacy_chunked(&mut store, "application/octet-stream", &noise(300_000, 29), "h-size", 1);
+        store.conn.execute("UPDATE clipboard SET size = size - 1 WHERE id = ?1", params![id]).unwrap();
+        assert!(store.get_row_content(id).is_none(), "longer than recorded");
+
+        store.conn.execute("UPDATE clipboard SET size = size + 2 WHERE id = ?1", params![id]).unwrap();
+        assert!(store.get_row_content(id).is_none(), "shorter than recorded");
+    }
+
+    #[test]
+    fn a_legacy_chunk_repeated_inside_one_payload_is_released_fully() {
         let mut store = test_store();
         // Uniform data has no content boundary: it is cut at the maximum, so the
         // same 64 KiB chunk recurs.
-        let data = vec![0u8; 5 * crate::core::constants::CDC_MAX_CHUNK_BYTES + 100];
-        let id = store.upsert_record("application/octet-stream", &data, "h-zero", 100).unwrap().real_id;
+        let data = vec![0u8; 5 * CDC_MAX_CHUNK_BYTES + 100];
+        let id = insert_legacy_chunked(&mut store, "application/octet-stream", &data, "h-zero", 1);
 
         let usage = store.chunk_usage();
         assert_eq!(usage.manifest, 6);
         assert_eq!(usage.chunks, 2, "one full chunk (x5) and the 100-byte tail");
-        assert_eq!(usage.bytes, crate::core::constants::CDC_MAX_CHUNK_BYTES + 100);
+        assert_eq!(usage.bytes, CDC_MAX_CHUNK_BYTES + 100);
         assert_eq!(store.get_row_content(id).unwrap().1, Some(data));
 
         store.delete_by_id(id).unwrap();
@@ -1200,13 +1307,13 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_row_keeps_chunks_another_row_still_uses_and_drops_the_rest() {
+    fn deleting_a_legacy_row_keeps_chunks_another_legacy_row_still_uses() {
         let mut store = test_store();
         let original = prose(400_000, 11);
         let mut edited = original.clone();
         edited.insert(100_000, '#');
-        let a = store.upsert_record("text/plain", original.as_bytes(), "h-a", 100).unwrap().real_id;
-        let b = store.upsert_record("text/plain", edited.as_bytes(), "h-b", 100).unwrap().real_id;
+        let a = insert_legacy_chunked(&mut store, "text/plain", original.as_bytes(), "h-a", 1);
+        let b = insert_legacy_chunked(&mut store, "text/plain", edited.as_bytes(), "h-b", 2);
         let both = store.chunk_usage();
 
         let (deleted, hash) = store.delete_by_id(a).unwrap();
@@ -1223,9 +1330,9 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_missing_id_leaves_chunks_alone() {
+    fn deleting_a_missing_id_leaves_legacy_chunks_alone() {
         let mut store = test_store();
-        store.upsert_record("application/octet-stream", &noise(100_000, 12), "h-keep", 100).unwrap();
+        insert_legacy_chunked(&mut store, "application/octet-stream", &noise(100_000, 12), "h-keep", 1);
         let before = store.chunk_usage();
 
         assert!(!store.delete_by_id(999_999).unwrap().0);
@@ -1233,46 +1340,44 @@ mod tests {
     }
 
     #[test]
-    fn rotation_releases_the_chunks_of_the_rows_it_evicts() {
+    fn rotation_releases_the_chunks_of_the_legacy_row_it_evicts() {
         let mut store = test_store();
         let first = noise(200_000, 13);
         let second = noise(200_000, 14);
-        let a = store.upsert_record("application/octet-stream", &first, "h-1", 100).unwrap().real_id;
-        set_timestamp(&mut store, "h-1", 1000);
+        let a = insert_legacy_chunked(&mut store, "application/octet-stream", &first, "h-1", 1000);
 
         let outcome = store.upsert_record("application/octet-stream", &second, "h-2", 1).unwrap();
 
         assert_eq!(outcome.expired_hashes, vec!["h-1".to_owned()]);
         assert!(store.get_row_content(a).is_none());
         let usage = store.chunk_usage();
-        assert_eq!(usage.bytes, second.len(), "only the survivor's chunks remain");
-        assert_eq!(usage.manifest, FastCdc::new(&second).count());
+        assert_eq!((usage.chunks, usage.manifest), (0, 0), "the evicted row's chunks are released");
         assert_eq!(store.get_row_content(outcome.real_id).unwrap().1, Some(second));
     }
 
     #[test]
-    fn rotation_keeps_chunks_shared_with_a_surviving_row() {
+    fn rotation_keeps_legacy_chunks_shared_with_a_surviving_legacy_row() {
         let mut store = test_store();
         let original = prose(400_000, 15);
         let mut edited = original.clone();
         edited.insert(50_000, '#');
-        store.upsert_record("text/plain", original.as_bytes(), "h-old", 100).unwrap();
-        set_timestamp(&mut store, "h-old", 1000);
+        let evicted = insert_legacy_chunked(&mut store, "text/plain", original.as_bytes(), "h-old", 1000);
+        let survivor = insert_legacy_chunked(&mut store, "text/plain", edited.as_bytes(), "h-survivor", 2000);
 
-        let outcome = store.upsert_record("text/plain", edited.as_bytes(), "h-new", 1).unwrap();
+        // One more row past the two-row limit evicts only the oldest.
+        let outcome = store.upsert_record("text/plain", b"a note", "h-new", 2).unwrap();
 
         assert_eq!(outcome.expired_hashes, vec!["h-old".to_owned()]);
-        let usage = store.chunk_usage();
-        assert_eq!(usage.manifest, FastCdc::new(edited.as_bytes()).count());
-        assert_eq!(store.get_row_content(outcome.real_id).unwrap().1, Some(edited.into_bytes()));
+        assert!(store.get_row_content(evicted).is_none());
+        assert_eq!(store.get_row_content(survivor).unwrap().1, Some(edited.into_bytes()), "the survivor still reassembles");
+        assert!(store.chunk_usage().manifest > 0, "chunks the survivor needs are kept");
     }
 
     #[test]
-    fn rotation_never_releases_the_chunks_of_a_pinned_row() {
+    fn rotation_never_releases_the_chunks_of_a_pinned_legacy_row() {
         let mut store = test_store();
         let pinned_data = noise(150_000, 16);
-        let pinned = store.upsert_record("application/octet-stream", &pinned_data, "h-pin", 100).unwrap().real_id;
-        set_timestamp(&mut store, "h-pin", 1);
+        let pinned = insert_legacy_chunked(&mut store, "application/octet-stream", &pinned_data, "h-pin", 1);
         store.set_pinned(pinned, true).unwrap();
         store.upsert_record("application/octet-stream", &noise(150_000, 17), "h-b", 1).unwrap();
         set_timestamp(&mut store, "h-b", 2);
@@ -1283,10 +1388,10 @@ mod tests {
     }
 
     #[test]
-    fn wipe_removes_every_chunk_and_manifest_entry() {
+    fn wipe_removes_every_legacy_chunk_and_manifest_entry() {
         let mut store = test_store();
-        store.upsert_record("application/octet-stream", &noise(300_000, 19), "h-1", 100).unwrap();
-        let pinned = store.upsert_record("text/plain", prose(300_000, 20).as_bytes(), "h-2", 100).unwrap().real_id;
+        insert_legacy_chunked(&mut store, "application/octet-stream", &noise(300_000, 19), "h-1", 1);
+        let pinned = insert_legacy_chunked(&mut store, "text/plain", prose(300_000, 20).as_bytes(), "h-2", 2);
         store.set_pinned(pinned, true).unwrap();
 
         store.wipe().unwrap();
@@ -1296,110 +1401,5 @@ mod tests {
         assert_eq!(store.get_total_count(), 0);
         let again = store.upsert_record("application/octet-stream", &noise(100_000, 21), "h-3", 100).unwrap().real_id;
         assert!(store.get_row_content(again).is_some(), "the store works after a wipe");
-    }
-
-    #[test]
-    fn search_finds_a_keyword_far_beyond_the_preview() {
-        let mut store = test_store();
-        let mut text = prose(300_000, 22);
-        text.replace_range(150_000..150_010, "deepneedle");
-        let id = store.upsert_record("text/plain", text.as_bytes(), "h-deep", 100).unwrap().real_id;
-        assert!(is_chunked(&store, id));
-        store.upsert_record("text/plain", b"unrelated small note", "h-small", 100).unwrap();
-
-        let hits = store.search_metadata(&["deepneedle".to_string()], 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.0, id);
-
-        let (valid, invalid) = store.validate_keywords(&["deepneedle".to_string(), "absent-term-xyz".to_string()]);
-        assert_eq!(valid, vec!["deepneedle".to_string()]);
-        assert_eq!(invalid, vec!["absent-term-xyz".to_string()]);
-    }
-
-    #[test]
-    fn search_finds_a_keyword_that_straddles_a_chunk_boundary() {
-        let mut store = test_store();
-        // Uniform padding is cut exactly at the maximum chunk size; the keyword
-        // is placed across that cut.
-        let cut = crate::core::constants::CDC_MAX_CHUNK_BYTES;
-        let mut text = vec![b'a'; cut + 5_000];
-        text[cut - 3..cut + 3].copy_from_slice(b"SPLITK");
-        let first_chunk = FastCdc::new(&text).next().unwrap().len();
-        assert_eq!(first_chunk, cut, "the setup must put the cut inside the keyword");
-        let id = store.upsert_record("text/plain", &text, "h-straddle", 100).unwrap().real_id;
-
-        let hits = store.search_metadata(&["splitk".to_string()], 10);
-        assert_eq!(hits.iter().map(|h| h.1.0).collect::<Vec<_>>(), vec![id], "LIKE is case-insensitive, as for inline rows");
-        assert_eq!(store.validate_keywords(&["SPLITK".to_string()]).0, vec!["SPLITK".to_string()]);
-    }
-
-    #[test]
-    fn search_finds_multibyte_text_whose_character_is_split_by_a_chunk_boundary() {
-        let mut store = test_store();
-        let cut = crate::core::constants::CDC_MAX_CHUNK_BYTES;
-        let mut text = vec![b'a'; cut - 1];
-        text.extend_from_slice("日本語のテキスト".as_bytes());
-        text.extend(std::iter::repeat_n(b'a', 4_000));
-        let first_chunk = FastCdc::new(&text).next().unwrap();
-        assert_eq!(first_chunk.len(), cut);
-        assert!(std::str::from_utf8(first_chunk).is_err(), "the cut falls inside a UTF-8 sequence");
-        let id = store.upsert_record("text/plain", &text, "h-jp", 100).unwrap().real_id;
-
-        assert_eq!(store.get_row_content(id).unwrap().1, Some(text), "bytes survive reassembly exactly");
-        for keyword in ["日本語", "テキスト", "本語の"] {
-            assert_eq!(store.search_metadata(&[keyword.to_string()], 10).len(), 1, "{keyword}");
-        }
-    }
-
-    #[test]
-    fn search_ignores_a_chunked_binary_payload_and_a_term_absent_from_chunked_text() {
-        let mut store = test_store();
-        let mut bin = noise(200_000, 23);
-        bin[100_000..100_006].copy_from_slice(b"needle");
-        store.upsert_record("application/octet-stream", &bin, "h-bin", 100).unwrap();
-        store.upsert_record("text/plain", prose(200_000, 24).as_bytes(), "h-txt", 100).unwrap();
-
-        assert!(store.search_metadata(&["needle".to_string()], 10).is_empty(), "binary mime is out of scope, chunked or not");
-        assert!(store.search_metadata(&["0123456789".to_string()], 10).is_empty());
-    }
-
-    #[test]
-    fn search_covers_legacy_inline_rows_and_chunked_rows_together() {
-        let mut store = test_store();
-        // A row as v3 wrote it: large, inline, not chunked.
-        let legacy = format!("{} legacyneedle", prose(20_000, 25));
-        store.conn.execute(
-            "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (1, 'text/plain', ?1, 'p', ?2, 'h-legacy')",
-            params![legacy.len() as i64, legacy],
-        ).unwrap();
-        let legacy_id: i64 = store.conn.query_row("SELECT id FROM clipboard WHERE hash = 'h-legacy'", [], |r| r.get(0)).unwrap();
-        let fresh = format!("{} legacyneedle", prose(100_000, 26));
-        let fresh_id = store.upsert_record("text/plain", fresh.as_bytes(), "h-fresh", 100).unwrap().real_id;
-
-        let mut ids: Vec<i64> = store.search_metadata(&["legacyneedle".to_string()], 10).iter().map(|h| h.1.0).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![legacy_id, fresh_id]);
-        assert_eq!(store.get_row_content(legacy_id).unwrap().1, Some(legacy.into_bytes()), "an inline row is read as before");
-        assert!(!is_chunked(&store, legacy_id));
-    }
-
-    #[test]
-    fn a_row_with_a_missing_chunk_is_not_served_as_a_shorter_payload() {
-        let mut store = test_store();
-        let id = store.upsert_record("application/octet-stream", &noise(300_000, 27), "h-broken", 100).unwrap().real_id;
-        store.conn.execute("DELETE FROM chunks WHERE rowid = (SELECT MIN(rowid) FROM chunks)", []).unwrap();
-
-        assert!(store.get_row_content(id).is_none());
-    }
-
-    #[test]
-    fn a_manifest_that_disagrees_with_the_recorded_size_is_refused() {
-        let mut store = test_store();
-        let id = store.upsert_record("application/octet-stream", &noise(300_000, 28), "h-size", 100).unwrap().real_id;
-        store.conn.execute("UPDATE clipboard SET size = size - 1 WHERE id = ?1", params![id]).unwrap();
-        assert!(store.get_row_content(id).is_none(), "longer than recorded");
-
-        store.conn.execute("UPDATE clipboard SET size = size + 2 WHERE id = ?1", params![id]).unwrap();
-        assert!(store.get_row_content(id).is_none(), "shorter than recorded");
     }
 }
