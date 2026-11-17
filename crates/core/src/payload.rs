@@ -8,8 +8,6 @@
 //! `y4p-wayland`).
 //!
 //! - [`Payload`]: the places bytes can be -- a heap buffer or a file on disk.
-//!   ([`SpooledFile`] remains as the owned spool-file handle the storage layer
-//!   still accepts.)
 //! - [`PayloadReader`]: an `enum` implementing [`Read`] over the file- and
 //!   memory-backed variants, so a consumer reads any payload without a
 //!   `Box<dyn Read>` allocation and can still ask for the underlying
@@ -26,9 +24,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::constants::{DIGEST_LEN, INLINE_PAYLOAD_THRESHOLD_BYTES, PAYLOAD_PREALLOC_CAP_BYTES};
+use crate::constants::{INLINE_PAYLOAD_THRESHOLD_BYTES, PAYLOAD_PREALLOC_CAP_BYTES};
 use crate::utils::is_text_like_mime;
 
 // --- Payload ---
@@ -113,70 +111,6 @@ impl Payload {
                 }
                 read_bounded(file, limit, len)
             }
-        }
-    }
-}
-
-// --- SpooledFile ---
-
-/// A complete payload on disk in the spool directory, with its fingerprint,
-/// owned by this value: dropping it unlinks the file.
-///
-/// The ingestion path no longer produces one (every payload is read into
-/// memory under [`MAX_PAYLOAD_BYTES`](crate::constants::MAX_PAYLOAD_BYTES)),
-/// but the storage layer still accepts it (`ClipboardDb::insert_spooled`) and
-/// adopts the file into the content cache with a `rename(2)`
-/// ([`SpooledFile::into_path`] disarms the unlink). Keeping the type public is
-/// what lets that API stay available without a second vocabulary.
-#[derive(Debug)]
-pub struct SpooledFile {
-    path: PathBuf,
-    len: u64,
-    digest: [u8; DIGEST_LEN],
-    owned: bool,
-}
-
-impl SpooledFile {
-    /// Takes ownership of the file at `path`, which must already hold exactly
-    /// `len` bytes whose SHA3-256 is `digest`.
-    pub fn new(path: PathBuf, len: u64, digest: [u8; DIGEST_LEN]) -> Self {
-        Self { path, len, digest, owned: true }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn digest(&self) -> &[u8; DIGEST_LEN] {
-        &self.digest
-    }
-
-    /// The fingerprint as the lowercase hexadecimal string the database keys on.
-    pub fn hex_digest(&self) -> String {
-        to_hex(&self.digest)
-    }
-
-    /// Gives up ownership: the file is no longer deleted on drop, and the
-    /// caller is responsible for it (typically by renaming it into the cache).
-    pub fn into_path(mut self) -> PathBuf {
-        self.owned = false;
-        std::mem::take(&mut self.path)
-    }
-}
-
-impl Drop for SpooledFile {
-    fn drop(&mut self) {
-        if self.owned {
-            // Best effort: the file may already be gone (a cache wipe, a sweep).
-            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -548,40 +482,12 @@ mod tests {
         assert_eq!(INLINE_PAYLOAD_THRESHOLD_BYTES, 4096);
     }
 
-    // --- SpooledFile (retained for the storage layer) ---
-
-    fn spooled(tag: &str, bytes: &[u8]) -> SpooledFile {
-        SpooledFile::new(temp_file(tag, bytes), bytes.len() as u64, [0xab; DIGEST_LEN])
-    }
+    // --- to_hex ---
 
     #[test]
-    fn dropping_a_spooled_file_unlinks_it() {
-        let spool = spooled("drop", b"spooled");
-        let path = spool.path().to_path_buf();
-        assert!(path.exists());
-        drop(spool);
-        assert!(!path.exists(), "a dropped (shed or abandoned) spool file must not linger");
-    }
-
-    #[test]
-    fn into_path_hands_the_file_over_and_disarms_the_unlink() {
-        let spool = spooled("adopt", b"adopt me");
-        let path = spool.into_path();
-        assert!(path.exists(), "an adopted file must survive the guard");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn the_hex_digest_is_lowercase_and_full_width() {
-        let mut digest = [0u8; DIGEST_LEN];
-        digest[0] = 0x0f;
-        digest[1] = 0xa0;
-        digest[31] = 0xff;
-        let spool = SpooledFile::new(PathBuf::from("/nonexistent/y4p"), 1, digest);
-        let hex = spool.hex_digest();
-        assert_eq!(hex.len(), 64);
-        assert!(hex.starts_with("0fa0") && hex.ends_with("ff"));
+    fn to_hex_is_lowercase_and_full_width() {
         assert_eq!(to_hex(&[]), "");
         assert_eq!(to_hex(&[0x00, 0x7f, 0x80]), "007f80");
+        assert_eq!(to_hex(&[0x0f, 0xa0]).len(), 4);
     }
 }
