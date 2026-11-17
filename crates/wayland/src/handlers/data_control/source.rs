@@ -103,7 +103,7 @@ fn write_bytes(dest: OwnedFd, data: &[u8]) {
     let _ = file.flush();
 }
 
-/// Serves a `Stream` or `File` payload to `dest`.
+/// Serves a `File` payload to `dest`.
 ///
 /// The plain path hands the open descriptor to `transfer`, which moves the
 /// bytes kernel-side. Only the markup-as-plain-text request must see the bytes,
@@ -204,7 +204,6 @@ fn copy_remaining(src: &mut PayloadReader, dest: &mut std::fs::File, already_sen
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::core::payload::StreamDescriptor;
     use std::io::Read;
     use std::path::PathBuf;
 
@@ -228,15 +227,6 @@ mod tests {
         path.push(format!("y4p-source-test-{}-{tag}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
-    }
-
-    fn stream_of(bytes: &[u8], hint: Option<u64>) -> Payload {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        let bytes = bytes.to_vec();
-        std::thread::spawn(move || {
-            let _ = writer.write_all(&bytes);
-        });
-        Payload::Stream(StreamDescriptor::new(OwnedFd::from(reader), hint))
     }
 
     #[test]
@@ -267,33 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_payload_falls_back_to_a_userspace_copy_and_arrives_intact() {
-        // A pipe cannot be addressed by offset, so `sendfile(2)` refuses it
-        // (`ESPIPE`) and the fallback has to carry every byte.
-        let data = pattern(200_000);
-        let payload = stream_of(&data, Some(data.len() as u64));
-        let got = received_from(move |dest| serve_descriptor_payload(payload, false, dest));
-        assert!(got == data);
-    }
-
-    #[test]
-    fn a_wrong_length_hint_neither_truncates_nor_extends_a_stream() {
-        let data = pattern(10_000);
-        let short = received_from({
-            let payload = stream_of(&data, Some(10));
-            move |dest| serve_descriptor_payload(payload, false, dest)
-        });
-        assert!(short == data, "an under-stated hint must not cap the transfer");
-
-        let long = received_from({
-            let payload = stream_of(&data, Some(u64::MAX));
-            move |dest| serve_descriptor_payload(payload, false, dest)
-        });
-        assert!(long == data, "an over-stated hint must not pad or hang the transfer");
-    }
-
-    #[test]
-    fn an_empty_file_and_an_empty_stream_send_nothing_and_do_not_hang() {
+    fn an_empty_file_sends_nothing_and_does_not_hang() {
         let path = temp_file("empty", b"");
         let got = received_from({
             let path = path.clone();
@@ -301,9 +265,6 @@ mod tests {
         });
         assert!(got.is_empty());
         std::fs::remove_file(path).unwrap();
-
-        let payload = stream_of(b"", None);
-        assert!(received_from(move |dest| serve_descriptor_payload(payload, false, dest)).is_empty());
     }
 
     #[test]
@@ -406,9 +367,7 @@ mod tests {
 
     #[test]
     fn the_copy_fallback_survives_a_receiver_that_left() {
-        // A stream source forces the userspace copy (`ESPIPE` from sendfile).
         let data = pattern(1024 * 1024);
-        serve_descriptor_payload(stream_of(&data, None), false, pipe_without_reader());
         let reader = Payload::memory(data).into_reader().unwrap();
         transfer(reader, pipe_without_reader());
     }
