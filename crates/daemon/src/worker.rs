@@ -4,16 +4,11 @@
 // crates/daemon/src/worker.rs
 
 use crate::core::constants::*;
-use crate::core::payload::{to_hex, Payload, SpooledFile};
-use crate::image::route::{route_file_for_ingest, FileRoute, SNIFF_HEAD_BYTES};
+use crate::core::payload::to_hex;
 use crate::metrics::DaemonMetrics;
-use crate::spool;
 use crate::storage::ClipboardDb;
 use crate::wayland::state::ClipboardJob;
 use sha3::{Digest, Sha3_256};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 
 /// Owns the single writer connection and its background thread. All
@@ -27,23 +22,14 @@ use std::sync::{mpsc, Arc, Mutex};
 ///
 /// A job's payload is materialised on this thread, just before `process_job`,
 /// by `ClipboardJob::into_bytes` under the same `MAX_PAYLOAD_BYTES` bound as
-/// ingestion. An in-memory payload is handed over without a copy; a descriptor-
-/// or file-backed one is read here, where blocking is expected. A payload that
-/// cannot be materialised is logged and dropped; it never stops the worker.
+/// ingestion. An in-memory payload is handed over without a copy; a
+/// file-backed one (egress or a synthetic job, never the ingestion path) is
+/// read here, where blocking is expected. A payload that cannot be materialised
+/// is logged and dropped; it never stops the worker.
 ///
-/// A *spooled* payload (a large one the ingestion thread already drained to a
-/// file, fingerprinting it on the way) takes a different road, `store_spooled`:
-/// an image's bytes never enter the heap at all, not even one the image
-/// pipeline rewrites (`magick` reads the spool file directly and writes a new
-/// one, fingerprinted as it goes), and storage then renames the file into the
-/// cache. Only a payload that belongs in a database row is read, once, by
-/// storage.
-///
-/// The queue is bounded twice over (`INGEST_QUEUE_CAPACITY` payloads and
-/// `INGEST_QUEUE_BYTE_BUDGET` bytes, the latter held by each job's `permit`):
-/// when persistence, image conversion included, falls behind, producers wait
-/// and then shed rather than letting payloads accumulate (see
-/// `y4p_wayland::ingest`).
+/// The queue is bounded by `INGEST_QUEUE_CAPACITY` payloads: when persistence,
+/// image conversion included, falls behind, producers wait and then shed
+/// rather than letting payloads accumulate (see `y4p_wayland::ingest`).
 ///
 /// The connection itself is behind an `Arc<Mutex<..>>` rather than owned by the
 /// thread, because the daemon's event loop must be able to `delete` and `wipe`
@@ -64,22 +50,14 @@ impl DbWorker {
 
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                let ClipboardJob { mime, payload, permit } = job;
+                let ClipboardJob { mime, payload } = job;
                 let stored = match writer.lock() {
-                    Ok(mut db) => match payload {
-                        Payload::Spooled(spooled) => store_spooled(&mut db, mime, *spooled, max_history),
-                        payload => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
-                    },
+                    Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
                     // Only reachable if a writer panicked mid-transaction. The
                     // job is dropped rather than the worker stopped, exactly as
                     // an unstorable payload is.
                     Err(_) => Err("database lock poisoned; payload dropped".to_string()),
                 };
-                // Persisted, or discarded: either way the payload no longer
-                // occupies the queue's byte budget (its spool file was renamed
-                // into the cache or unlinked, its buffer dropped). Releasing it
-                // here, whatever `stored` says, is what lets a blocked reader in.
-                drop(permit);
                 match stored {
                     Ok(Some((mime, len))) => {
                         metrics.record_ingress();
@@ -136,59 +114,6 @@ fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usiz
     Ok(Some((mime, data.len())))
 }
 
-/// The streaming road, for a payload already on disk with its fingerprint.
-///
-/// 1. The image pipeline gets its say first ([`convert_if_wanted`]): a raster
-///    image it would rewrite is converted file to file, and the converted
-///    spool file (with the digest of *its* bytes) replaces the original, which
-///    is deleted. Anything else, and any conversion that is skipped or fails,
-///    carries on with the original untouched.
-/// 2. The file is then handed to storage whole ([`ClipboardDb::insert_spooled`]),
-///    which keys the row by the digest computed while the file streamed in
-///    (nothing is hashed again) and decides what the file becomes: an image is
-///    renamed into the cache, anything else is read into its row and the spool
-///    file unlinked. Where a cache entry lives and which MIME types get one are
-///    storage's business alone; the worker holds no copy of those rules and no
-///    memory mapping of the file.
-fn store_spooled(db: &mut ClipboardDb, mime: String, spooled: SpooledFile, max_history: usize) -> Result<Option<Saved>, String> {
-    let (mime, spooled) = convert_if_wanted(mime, spooled);
-    let len = usize::try_from(spooled.len()).map_err(|e| e.to_string())?;
-    db.insert_spooled(&mime, spooled, max_history)?;
-    Ok(Some((mime, len)))
-}
-
-/// Runs a spooled payload through the image pipeline without reading it into
-/// memory: the file-backed twin of `process_job`'s routing step.
-///
-/// The decision is made from the first bytes alone. If a conversion is due and
-/// the breaker and the throttle allow it, `magick` reads the spool file as its
-/// stdin and writes a new spool file, hashed on the way (`spool::transcode_spooled`);
-/// the payload then *is* that new file, under the converter's MIME, and the
-/// original is unlinked here. In every other case (nothing to convert, circuit
-/// open, no free slot, `magick` missing, a decode failure, a timeout) the pair
-/// comes back unchanged and the original file is stored as it arrived: the same
-/// "never lose data, never make things worse" contract as the in-memory road,
-/// with the same breaker, throttle and limits (`y4p_image::route`).
-fn convert_if_wanted(mime: String, spooled: SpooledFile) -> (String, SpooledFile) {
-    let head = read_head(spooled.path());
-    let routed = route_file_for_ingest(&mime, &head, |job| spool::transcode_spooled(&spooled, job, MAX_PAYLOAD_BYTES));
-    match routed {
-        // `spooled` is dropped on return, which unlinks the superseded original.
-        FileRoute::Converted { mime: converted, output } => (converted.to_owned(), output),
-        FileRoute::Original => (mime, spooled),
-    }
-}
-
-/// The first bytes of a spool file, enough for the image router to classify it.
-/// Empty if the file cannot be read, which classifies as "nothing to convert".
-fn read_head(path: &Path) -> Vec<u8> {
-    let mut head = Vec::with_capacity(SNIFF_HEAD_BYTES);
-    if let Ok(file) = File::open(path) {
-        let _ = file.take(SNIFF_HEAD_BYTES as u64).read_to_end(&mut head);
-    }
-    head
-}
-
 /// Reads a job's payload into memory under the ingestion bound, or logs why it
 /// cannot and yields `None` so the worker moves on to the next job.
 fn materialise(job: ClipboardJob) -> Option<(String, Vec<u8>)> {
@@ -234,18 +159,7 @@ mod tests {
 
     // --- materialise (payload -> bytes) ---
 
-    use crate::core::payload::{Payload, StreamDescriptor};
-    use std::fs;
-    use std::io::Write;
-    use std::path::PathBuf;
-    use std::os::fd::OwnedFd;
-
-    fn stream_job(mime: &str, bytes: &[u8], hint: Option<u64>) -> ClipboardJob {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(bytes).unwrap();
-        drop(writer);
-        ClipboardJob::from_payload(mime.to_owned(), Payload::Stream(StreamDescriptor::new(OwnedFd::from(reader), hint)))
-    }
+    use crate::core::payload::Payload;
 
     #[test]
     fn an_in_memory_job_is_handed_over_without_a_copy() {
@@ -254,14 +168,6 @@ mod tests {
         let (mime, out) = materialise(ClipboardJob::new("text/plain".to_owned(), data)).unwrap();
         assert_eq!(mime, "text/plain");
         assert_eq!(out.as_ptr(), ptr, "the worker must not copy an in-memory payload");
-    }
-
-    #[test]
-    fn a_streamed_job_is_read_in_full_then_processed_like_any_other() {
-        let (mime, data) = materialise(stream_job("text/plain", b"streamed text", Some(13))).unwrap();
-        let (mime2, data2, hash) = process_job(mime, data);
-        assert_eq!((mime2.as_str(), data2.as_slice()), ("text/plain", b"streamed text".as_slice()));
-        assert_eq!(hash, fingerprint(b"streamed text"));
     }
 
     #[test]
@@ -276,138 +182,9 @@ mod tests {
 
     #[test]
     fn a_job_that_cannot_be_read_is_dropped_so_the_worker_carries_on() {
-        assert!(materialise(stream_job("text/plain", b"", None)).is_none(), "an empty stream is not a payload");
-        assert!(materialise(ClipboardJob::new("text/plain".to_owned(), Vec::new())).is_none());
+        assert!(materialise(ClipboardJob::new("text/plain".to_owned(), Vec::new())).is_none(), "an empty buffer is not a payload");
         let missing = ClipboardJob::from_payload("image/png".to_owned(), Payload::File("/definitely/not/there".into()));
         assert!(materialise(missing).is_none());
-    }
-
-    // --- spooled road: head sniffing ---
-
-    fn scratch(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("y4p-worker-spool-{}-{}", std::process::id(), tag));
-        let _ = fs::remove_file(&p);
-        p
-    }
-
-    #[test]
-    fn the_sniffed_head_is_bounded_and_a_missing_file_is_empty() {
-        let path = scratch("head");
-        fs::write(&path, vec![9u8; 10_000]).unwrap();
-        assert_eq!(read_head(&path).len(), SNIFF_HEAD_BYTES);
-        fs::write(&path, b"short").unwrap();
-        assert_eq!(read_head(&path), b"short");
-        fs::remove_file(&path).unwrap();
-        assert!(read_head(&path).is_empty());
-    }
-
-    // --- convert_if_wanted: the image pipeline over a spool file ---
-    //
-    // These go through the process-wide breaker and throttle like the
-    // `process_job` tests below. At most two tests here fail a conversion on
-    // purpose, and the breaker needs three failures in a row, so none of them can
-    // open the circuit under another test.
-
-    fn spool_dir(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("y4p-worker-convert-{}-{}", std::process::id(), tag));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    fn spooled_at(dir: &Path, name: &str, bytes: &[u8]) -> SpooledFile {
-        let path = dir.join(name);
-        fs::write(&path, bytes).unwrap();
-        let digest = <[u8; DIGEST_LEN]>::try_from(Sha3_256::digest(bytes).as_slice()).unwrap();
-        SpooledFile::new(path, bytes.len() as u64, digest)
-    }
-
-    fn entries_in(dir: &Path) -> usize {
-        fs::read_dir(dir).unwrap().count()
-    }
-
-    #[test]
-    fn a_spooled_png_is_converted_in_place_of_the_original_which_is_deleted() {
-        if !magick_available() { return; }
-        let dir = spool_dir("png");
-        let png = generated(&["-size", "64x64", "plasma:fractal", "-depth", "8", "-set", "comment", "SECRETCOMMENT", "png:-"]);
-        let original = spooled_at(&dir, &format!("{}-1.part", std::process::id()), &png);
-        let original_path = original.path().to_path_buf();
-
-        let (mime, converted) = convert_if_wanted("image/png".to_owned(), original);
-
-        assert_eq!(mime, "image/png");
-        assert_ne!(converted.path(), original_path);
-        assert!(!original_path.exists(), "the superseded original must be unlinked");
-        let stored = fs::read(converted.path()).unwrap();
-        assert_ne!(stored, png);
-        assert!(!stored.windows(13).any(|w| w == b"SECRETCOMMENT"));
-        assert_eq!(converted.hex_digest(), fingerprint(&stored), "the key must describe the stored bytes");
-        // The in-memory road must agree to the byte, so a payload keys the same row on either.
-        let (memory_mime, memory_bytes, memory_hash) = process_job("image/png".to_owned(), png);
-        assert_eq!((mime.as_str(), stored.as_slice()), (memory_mime.as_str(), memory_bytes.as_slice()));
-        assert_eq!(converted.hex_digest(), memory_hash);
-        assert_eq!(entries_in(&dir), 1, "exactly the converted file remains");
-        drop(converted);
-        assert_eq!(entries_in(&dir), 0);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_converted_jpeg_is_stored_under_the_png_mime() {
-        if !magick_available() { return; }
-        let dir = spool_dir("jpeg");
-        let jpeg = generated(&["-size", "64x64", "plasma:fractal", "jpg:-"]);
-        let (mime, converted) = convert_if_wanted("image/jpeg".to_owned(), spooled_at(&dir, &format!("{}-2.part", std::process::id()), &jpeg));
-        assert_eq!(mime, "image/png");
-        assert_eq!(&fs::read(converted.path()).unwrap()[..4], b"\x89PNG");
-        drop(converted);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn what_the_pipeline_does_not_rewrite_is_returned_untouched() {
-        let dir = spool_dir("bypass");
-        let mut gif = b"GIF89a".to_vec();
-        gif.extend((0..5000u32).map(|i| (i % 251) as u8));
-        let cases: [(&str, &[u8]); 3] = [
-            ("image/gif", &gif),
-            ("text/plain", b"plain text that happens to be spooled"),
-            ("application/octet-stream", b"\x00\x01\x02\x03 not an image at all"),
-        ];
-        for (n, (mime, bytes)) in cases.into_iter().enumerate() {
-            let original = spooled_at(&dir, &format!("{}-{}.part", std::process::id(), 10 + n), bytes);
-            let path = original.path().to_path_buf();
-            let (out_mime, out) = convert_if_wanted(mime.to_owned(), original);
-            assert_eq!(out_mime, mime);
-            assert_eq!(out.path(), path, "{mime}: the very same file");
-            assert_eq!(fs::read(out.path()).unwrap(), bytes);
-            drop(out);
-        }
-        assert_eq!(entries_in(&dir), 0);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_image_that_does_not_decode_keeps_its_original_file_and_leaves_nothing_else() {
-        if !magick_available() { return; }
-        let dir = spool_dir("corrupt");
-        let mut corrupt = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        corrupt.extend_from_slice(&[0xA5; 4096]);
-        let original = spooled_at(&dir, &format!("{}-20.part", std::process::id()), &corrupt);
-        let path = original.path().to_path_buf();
-
-        let (mime, out) = convert_if_wanted("image/png".to_owned(), original);
-
-        assert_eq!(mime, "image/png");
-        assert_eq!(out.path(), path, "the original is stored as it arrived");
-        assert_eq!(fs::read(out.path()).unwrap(), corrupt);
-        assert_eq!(out.hex_digest(), fingerprint(&corrupt), "and keeps its own digest");
-        assert_eq!(entries_in(&dir), 1, "no half-written converted file");
-        drop(out);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
