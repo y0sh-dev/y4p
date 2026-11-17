@@ -65,14 +65,9 @@ impl PrivateStore {
         ClipboardDb::open().unwrap()
     }
 
-    /// A second, read-only handle, to observe what the writer committed.
-    pub(crate) fn open_read_only(&self) -> ClipboardDb {
-        ClipboardDb::open_read_only().unwrap()
-    }
-
     /// IDs currently stored, most recent first.
     pub(crate) fn rows(&self) -> Vec<i64> {
-        self.open_read_only().fetch_metadata(100).into_iter().map(|row| row.0).collect()
+        self.open().fetch_metadata(100).into_iter().map(|row| row.0).collect()
     }
 
     /// Where the daemon's control socket lives inside this tree.

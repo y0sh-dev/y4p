@@ -45,23 +45,6 @@ impl UpsertOutcome {
     }
 }
 
-/// A payload as the row builder sees it.
-enum Body<'a> {
-    /// The bytes themselves.
-    Bytes(&'a [u8]),
-    /// Only the length: the bytes are in a cache file and never touch the row.
-    Detached(u64),
-}
-
-impl Body<'_> {
-    fn len(&self) -> i64 {
-        match self {
-            Body::Bytes(data) => data.len() as i64,
-            Body::Detached(len) => *len as i64,
-        }
-    }
-}
-
 /// What goes into the `content` column.
 #[derive(Clone, Copy)]
 enum Content<'a> {
@@ -74,13 +57,6 @@ enum Content<'a> {
 /// rather than in the row: images, and anything GIF-like.
 pub fn is_cache_class(mime: &str) -> bool {
     mime.starts_with("image/") || mime.contains("gif")
-}
-
-/// Whether the row of a cache-class payload can be built without its bytes:
-/// no text preview and no text content. Every real image qualifies; an odd
-/// "text/x-gif" does not, and is stored from its bytes like any other.
-pub fn is_detachable(mime: &str) -> bool {
-    is_cache_class(mime) && !is_text_like_mime(mime)
 }
 
 /// Payloads that are never stored: empty ones and sensitive MIME types.
@@ -111,23 +87,12 @@ impl SqliteStore {
         if is_skipped(mime, data.len() as u64) {
             return Ok(UpsertOutcome::skipped());
         }
-        self.upsert(mime, Body::Bytes(data), hash, max_history)
+        self.upsert(mime, data, hash, max_history)
     }
 
-    /// `upsert_record` for a payload whose bytes live (or are about to live) in
-    /// a cache file and are not needed to build the row: an image has no
-    /// preview, no text and no inline content, only a size. The caller must have
-    /// checked `is_detachable`, so no byte of the payload ever enters memory.
-    pub fn upsert_detached(&mut self, mime: &str, len: u64, hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
-        if is_skipped(mime, len) {
-            return Ok(UpsertOutcome::skipped());
-        }
-        self.upsert(mime, Body::Detached(len), hash, max_history)
-    }
-
-    fn upsert(&mut self, mime: &str, body: Body<'_>, hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
+    fn upsert(&mut self, mime: &str, data: &[u8], hash: &str, max_history: usize) -> Result<UpsertOutcome, String> {
         let is_image = is_cache_class(mime);
-        let size = body.len();
+        let size = data.len() as i64;
 
         // Was `.unwrap()`: a monotonic clock read before UNIX_EPOCH should
         // never happen on a real system, but `panic = "abort"` in the release
@@ -146,10 +111,7 @@ impl SqliteStore {
                 .map_err(|e| e.to_string())?;
             id
         } else {
-            let (preview, content) = match body {
-                Body::Detached(_) => (None, Content::None),
-                Body::Bytes(data) => Self::row_parts(mime, data, is_image),
-            };
+            let (preview, content) = Self::row_parts(mime, data, is_image);
             match content {
                 Content::Text(text) => tx.execute(
                     "INSERT INTO clipboard (timestamp, mime, size, preview, content, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -581,59 +543,6 @@ mod tests {
     /// `ORDER BY timestamp DESC` non-deterministic.
     fn set_timestamp(store: &mut SqliteStore, hash: &str, ts: i64) {
         store.conn.execute("UPDATE clipboard SET timestamp = ?1 WHERE hash = ?2", params![ts, hash]).unwrap();
-    }
-
-    // --- upsert_detached: a row built from a length alone ---
-
-    #[test]
-    fn upsert_detached_builds_the_row_upsert_record_builds_for_an_image() {
-        let mut detached = test_store();
-        let mut from_bytes = test_store();
-        let data = vec![7u8; 4321];
-
-        let a = detached.upsert_detached("image/png", data.len() as u64, "h-img", 100).unwrap();
-        let b = from_bytes.upsert_record("image/png", &data, "h-img", 100).unwrap();
-
-        assert_eq!((a.real_id, a.is_image), (b.real_id, b.is_image));
-        let row = |s: &SqliteStore| s.conn.query_row(
-            "SELECT mime, size, preview, content, hash FROM clipboard", [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, String>(4)?)),
-        ).unwrap();
-        assert_eq!(row(&detached), row(&from_bytes));
-        assert_eq!(row(&detached).1, 4321);
-    }
-
-    #[test]
-    fn upsert_detached_skips_what_upsert_record_skips() {
-        let mut store = test_store();
-        assert_eq!(store.upsert_detached("image/png", 0, "h-empty", 100).unwrap().real_id, -1);
-        assert_eq!(store.upsert_detached("image/x-secret", 10, "h-secret", 100).unwrap().real_id, -1);
-        assert_eq!(store.get_total_count(), 0);
-    }
-
-    #[test]
-    fn upsert_detached_touches_an_existing_row_and_rotates_like_any_insert() {
-        let mut store = test_store();
-        let first = store.upsert_detached("image/png", 10, "h1", 1).unwrap();
-        let again = store.upsert_detached("image/png", 10, "h1", 1).unwrap();
-        assert_eq!(first.real_id, again.real_id, "same hash, same row");
-
-        set_timestamp(&mut store, "h1", 1);
-        let second = store.upsert_detached("image/gif", 20, "h2", 1).unwrap();
-        assert_ne!(second.real_id, first.real_id);
-        assert_eq!(second.expired_hashes, vec!["h1".to_owned()], "the older image rotates out");
-        assert_eq!(store.get_total_count(), 1);
-    }
-
-    #[test]
-    fn only_images_without_text_are_detachable() {
-        for mime in ["image/png", "image/gif", "image/svg+xml", "application/x-gif"] {
-            assert!(is_detachable(mime), "{mime}");
-        }
-        for mime in ["text/x-gif", "text/plain", "application/pdf", ""] {
-            assert!(!is_detachable(mime), "{mime}");
-        }
-        assert!(is_cache_class("text/x-gif"), "still cache class: its bytes are cached too");
     }
 
     #[test]

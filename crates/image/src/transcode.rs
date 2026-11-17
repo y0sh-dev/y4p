@@ -19,8 +19,7 @@ use std::time::Duration;
 
 use crate::core::constants::{
     IMAGE_LIMIT_DISK, IMAGE_LIMIT_HEIGHT_PX, IMAGE_LIMIT_MAP, IMAGE_LIMIT_MEMORY,
-    IMAGE_LIMIT_TIME_SECS, IMAGE_LIMIT_WIDTH_PX, IMAGE_QUALITY_DEFAULT, IMAGE_QUALITY_MAX,
-    IMAGE_QUALITY_MIN, IMAGE_TRANSCODE_TIMEOUT_SECS,
+    IMAGE_LIMIT_TIME_SECS, IMAGE_LIMIT_WIDTH_PX, IMAGE_TRANSCODE_TIMEOUT_SECS,
 };
 use crate::core::splice::ByteTap;
 use crate::core::utils::{detect_image_mime, mime_base};
@@ -84,55 +83,22 @@ impl InputFormat {
     }
 }
 
-/// Encoder quality, always within `IMAGE_QUALITY_MIN..=IMAGE_QUALITY_MAX`.
-/// Construction clamps instead of failing: a caller passing 0 or 255 gets
-/// the nearest valid value, so no input can make `magick` reject the option.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Quality(u8);
-
-impl Quality {
-    pub fn new(raw: u8) -> Self {
-        Self(raw.clamp(IMAGE_QUALITY_MIN, IMAGE_QUALITY_MAX))
-    }
-
-    pub fn get(self) -> u8 {
-        self.0
-    }
-}
-
-impl Default for Quality {
-    fn default() -> Self {
-        Self::new(IMAGE_QUALITY_DEFAULT)
-    }
-}
-
-/// Target encodings. Quality exists only where it means something: the two
-/// lossless variants carry none, so "lossless at quality 40" is not a state
-/// the type can express.
+/// Target encodings. Only PNG is produced: it is the ingestion target, every
+/// paste target accepts it, and the output is a pure function of the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Lossless PNG at the fastest zlib effort (`PNG_COMPRESSION_ARG`): the
-    /// ingestion target. Pixels are bit-exact at every level; only the file
-    /// size and encode time differ, and a clipboard copy is latency-bound.
-    /// PNG is also the one raster encoding every paste target accepts. The
-    /// output is a pure function of the input (no `tIME` stamp, see
-    /// `PNG_EXCLUDE_TIME_ARG`), which deduplication by digest relies on.
+    /// Lossless PNG at the fastest zlib effort (`PNG_COMPRESSION_ARG`). Pixels
+    /// are bit-exact at every level; only the file size and encode time differ,
+    /// and a clipboard copy is latency-bound. The output is a pure function of
+    /// the input (no `tIME` stamp, see `PNG_EXCLUDE_TIME_ARG`), which
+    /// deduplication by digest relies on.
     Png,
-    /// Lossless WebP: bit-exact pixels, typically smaller than PNG on
-    /// screenshots. Always encoded at ImageMagick quality 100, because in
-    /// lossless mode ImageMagick maps any lower quality onto libwebp's
-    /// near-lossless pre-processing, which *does* alter pixels (measured:
-    /// 59 of 16384 pixels differ at quality 75, 118 at 50). Only 100 is exact.
-    WebpLossless,
-    /// Lossy WebP: the "small and good enough" choice, tuned by `Quality`.
-    WebpLossy(Quality),
 }
 
 impl OutputFormat {
     pub fn mime(self) -> &'static str {
         match self {
             Self::Png => "image/png",
-            Self::WebpLossless | Self::WebpLossy(_) => "image/webp",
         }
     }
 }
@@ -203,10 +169,6 @@ const PNG_COMPRESSION_ARG: &str = "png:compression-level=1";
 /// makes the conversion a pure function of its input.
 const PNG_EXCLUDE_TIME_ARG: &str = "png:exclude-chunk=tIME";
 
-/// `IMAGE_QUALITY_MAX` as an argument, spelled out so the lossless path
-/// borrows it instead of formatting it per run (a test ties the two together).
-const LOSSLESS_QUALITY_ARG: &str = "100";
-
 impl Transcode {
     /// The complete `magick` argument vector, in the one order that is safe:
     ///
@@ -221,9 +183,8 @@ impl Transcode {
     ///    camera/timestamp tags, XMP, IPTC, ICC, text chunks).
     /// 5. Encoder settings, then the output `fmt:-`.
     ///
-    /// Every token is a borrowed `'static` string except the quality of a
-    /// lossy encode, the one value computed at run time: the vector is the
-    /// only allocation besides it (sized up front, never regrown).
+    /// Every token is a borrowed `'static` string: the vector is the only
+    /// allocation (sized up front, never regrown).
     fn args(&self) -> Vec<Cow<'static, str>> {
         let mut args: Vec<Cow<'static, str>> = Vec::with_capacity(ARGS_CAPACITY);
         for (name, value) in LIMITS {
@@ -237,16 +198,6 @@ impl Transcode {
                 args.extend([Cow::Borrowed("-define"), Cow::Borrowed(PNG_COMPRESSION_ARG)]);
                 args.extend([Cow::Borrowed("-define"), Cow::Borrowed(PNG_EXCLUDE_TIME_ARG)]);
                 args.push(Cow::Borrowed("png:-"));
-            }
-            OutputFormat::WebpLossless => {
-                args.extend([Cow::Borrowed("-define"), Cow::Borrowed("webp:lossless=true")]);
-                args.extend([Cow::Borrowed("-quality"), Cow::Borrowed(LOSSLESS_QUALITY_ARG)]);
-                args.push(Cow::Borrowed("webp:-"));
-            }
-            OutputFormat::WebpLossy(quality) => {
-                args.extend([Cow::Borrowed("-define"), Cow::Borrowed("webp:lossless=false")]);
-                args.extend([Cow::Borrowed("-quality"), Cow::Owned(quality.get().to_string())]);
-                args.push(Cow::Borrowed("webp:-"));
             }
         }
         args
@@ -353,10 +304,6 @@ mod tests {
         job.args().into_iter().map(Cow::into_owned).collect()
     }
 
-    fn lossy(quality: u8) -> OutputFormat {
-        OutputFormat::WebpLossy(Quality::new(quality))
-    }
-
     /// Runs `magick` directly (no stripping, no pinned decoder) to build
     /// fixtures and to take measurements; the code under test is `transcode`.
     fn raw(args: &[&str], input: Vec<u8>) -> Vec<u8> {
@@ -457,8 +404,7 @@ mod tests {
         [InputFormat::Png, InputFormat::Jpeg, InputFormat::Gif, InputFormat::Webp, InputFormat::Bmp];
 
     fn all_jobs() -> Vec<Transcode> {
-        let outputs = [OutputFormat::Png, OutputFormat::WebpLossless, lossy(1), lossy(90), lossy(100)];
-        ALL_INPUTS.iter().flat_map(|&input| outputs.iter().map(move |&output| Transcode { input, output })).collect()
+        ALL_INPUTS.iter().map(|&input| Transcode { input, output: OutputFormat::Png }).collect()
     }
 
     fn owned_count(args: &[Cow<'static, str>]) -> usize {
@@ -466,21 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn lossless_argument_vectors_are_built_entirely_from_borrowed_static_tokens() {
+    fn argument_vectors_are_built_entirely_from_borrowed_static_tokens() {
         for input in ALL_INPUTS {
-            for output in [OutputFormat::Png, OutputFormat::WebpLossless] {
-                let args = Transcode { input, output }.args();
-                assert_eq!(owned_count(&args), 0, "{input:?} -> {output:?} allocated a token");
-            }
-        }
-    }
-
-    #[test]
-    fn a_lossy_encode_allocates_exactly_one_token_the_quality_value() {
-        for input in ALL_INPUTS {
-            let args = Transcode { input, output: lossy(70) }.args();
-            let owned: Vec<&str> = args.iter().filter(|arg| matches!(arg, Cow::Owned(_))).map(|arg| &**arg).collect();
-            assert_eq!(owned, ["70"], "only the run-time quality may be allocated");
+            let args = Transcode { input, output: OutputFormat::Png }.args();
+            assert_eq!(owned_count(&args), 0, "{input:?} allocated a token");
         }
     }
 
@@ -523,11 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn the_spelled_out_lossless_quality_matches_the_constant() {
-        assert_eq!(LOSSLESS_QUALITY_ARG, IMAGE_QUALITY_MAX.to_string());
-    }
-
-    #[test]
     fn every_pinned_input_names_its_own_coder_and_selects_the_first_frame() {
         let expected = [
             (InputFormat::Png, "png:-[0]"),
@@ -544,7 +474,7 @@ mod tests {
 
     #[test]
     fn args_apply_limits_before_the_pinned_input_then_strip_then_encode() {
-        let job = Transcode { input: InputFormat::Jpeg, output: lossy(70) };
+        let job = Transcode { input: InputFormat::Jpeg, output: OutputFormat::Png };
         let args = owned_args(&job);
         let pos = |needle: &str| args.iter().position(|a| a == needle).unwrap();
 
@@ -555,9 +485,9 @@ mod tests {
         }
         assert!(pos("jpeg:-[0]") < pos("-auto-orient"));
         assert!(pos("-auto-orient") < pos("-strip"), "orientation must be applied before EXIF is stripped");
-        assert!(pos("-strip") < pos("webp:lossless=false"));
-        assert_eq!(args.last().map(String::as_str), Some("webp:-"));
-        assert_eq!(args[pos("-quality") + 1], "70");
+        assert!(pos("-strip") < pos("png:compression-level=1"));
+        assert_eq!(args.last().map(String::as_str), Some("png:-"));
+        assert!(args.iter().all(|a| a != "-quality"));
     }
 
     #[test]
@@ -576,32 +506,6 @@ mod tests {
             assert!(args.iter().all(|a| a != "-quality"), "-quality would override the zlib level for PNG");
             assert!(args.iter().all(|a| a != "png:compression-level=9"));
         }
-    }
-
-    #[test]
-    fn lossless_webp_args_ignore_quality_and_pin_the_exact_setting() {
-        let args = owned_args(&Transcode { input: InputFormat::Png, output: OutputFormat::WebpLossless });
-        assert!(args.windows(2).any(|w| w == ["-define", "webp:lossless=true"]));
-        assert!(args.windows(2).any(|w| w == ["-quality", "100"]), "only quality 100 is bit-exact");
-        assert_eq!(args.last().map(String::as_str), Some("webp:-"));
-    }
-
-    #[test]
-    fn quality_is_clamped_into_range_at_both_ends() {
-        assert_eq!(Quality::new(0).get(), IMAGE_QUALITY_MIN);
-        assert_eq!(Quality::new(1).get(), 1);
-        assert_eq!(Quality::new(100).get(), 100);
-        assert_eq!(Quality::new(101).get(), IMAGE_QUALITY_MAX);
-        assert_eq!(Quality::new(255).get(), IMAGE_QUALITY_MAX);
-        assert_eq!(Quality::default().get(), IMAGE_QUALITY_DEFAULT);
-    }
-
-    #[test]
-    fn extreme_quality_values_reach_magick_already_clamped() {
-        let low = owned_args(&Transcode { input: InputFormat::Png, output: lossy(0) });
-        let high = owned_args(&Transcode { input: InputFormat::Png, output: lossy(255) });
-        assert!(low.windows(2).any(|w| w == ["-quality", "1"]));
-        assert!(high.windows(2).any(|w| w == ["-quality", "100"]));
     }
 
     #[test]
@@ -626,25 +530,22 @@ mod tests {
     }
 
     #[test]
-    fn output_mime_matches_the_encoding() {
+    fn output_mime_is_png() {
         assert_eq!(OutputFormat::Png.mime(), "image/png");
-        assert_eq!(OutputFormat::WebpLossless.mime(), "image/webp");
     }
 
     // --- privacy stripping ---
 
     #[test]
-    fn png_text_chunks_are_removed_for_both_output_formats() {
+    fn png_text_chunks_are_removed() {
         if !magick_or_skip() { return; }
         let source = png_with_text_metadata();
         assert!(contains(&source, MARKER_COMMENT) && contains(&source, MARKER_AUTHOR), "fixture must carry the metadata");
 
-        for output in [OutputFormat::Png, lossy(80), OutputFormat::WebpLossless] {
-            let (result, out) = run_job(Transcode { input: InputFormat::Png, output }, source.clone());
-            result.unwrap();
-            assert!(!contains(&out, MARKER_COMMENT), "{output:?} kept the comment");
-            assert!(!contains(&out, MARKER_AUTHOR), "{output:?} kept the author");
-        }
+        let (result, out) = run_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, source);
+        result.unwrap();
+        assert!(!contains(&out, MARKER_COMMENT), "the comment was kept");
+        assert!(!contains(&out, MARKER_AUTHOR), "the author was kept");
     }
 
     #[test]
@@ -656,18 +557,14 @@ mod tests {
         // Control: the same conversion WITHOUT `-strip` keeps the EXIF, so
         // the absence asserted below is caused by the stripping, not by the
         // fixture or the encoder happening to drop it.
-        let unstripped_webp = raw(&["jpeg:-", "-quality", "80", "webp:-"], source.clone());
         let unstripped_png = raw(&["jpeg:-", "png:-"], source.clone());
-        assert!(contains(&unstripped_webp, MARKER_CAMERA), "control: webp should carry EXIF without -strip");
         assert!(contains(&unstripped_png, MARKER_CAMERA), "control: png should carry EXIF without -strip");
         assert!(contains(&unstripped_png, MARKER_COMMENT), "control: png should carry the comment without -strip");
 
-        for output in [OutputFormat::Png, lossy(80), OutputFormat::WebpLossless] {
-            let (result, out) = run_job(Transcode { input: InputFormat::Jpeg, output }, source.clone());
-            result.unwrap();
-            assert!(!contains(&out, MARKER_CAMERA), "{output:?} kept EXIF");
-            assert!(!contains(&out, MARKER_COMMENT), "{output:?} kept the comment");
-        }
+        let (result, out) = run_job(Transcode { input: InputFormat::Jpeg, output: OutputFormat::Png }, source);
+        result.unwrap();
+        assert!(!contains(&out, MARKER_CAMERA), "EXIF was kept");
+        assert!(!contains(&out, MARKER_COMMENT), "the comment was kept");
     }
 
     #[test]
@@ -684,61 +581,25 @@ mod tests {
     // --- encoding ---
 
     #[test]
-    fn webp_output_has_a_riff_webp_signature_and_is_smaller_than_the_png() {
+    fn png_output_has_a_png_signature_and_matches_the_reported_transfer() {
         if !magick_or_skip() { return; }
         let png = generate(&["-size", "512x512", "plasma:fractal", "-depth", "8", "png:-"]);
-        let (result, out) = run_job(Transcode { input: InputFormat::Png, output: lossy(80) }, png.clone());
+        let (result, out) = run_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, png.clone());
         let transfer = result.unwrap();
-        assert_eq!(&out[..4], b"RIFF");
-        assert_eq!(&out[8..12], b"WEBP");
+        assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(transfer.bytes_in, png.len() as u64);
         assert_eq!(transfer.bytes_out, out.len() as u64);
-        assert!(out.len() < png.len(), "lossy webp ({}) should be smaller than png ({})", out.len(), png.len());
         assert_eq!(dimensions(out), "512x512");
     }
 
     #[test]
-    fn lower_quality_yields_a_smaller_lossy_file() {
-        if !magick_or_skip() { return; }
-        let png = generate(&["-size", "256x256", "plasma:fractal", "-depth", "8", "png:-"]);
-        let (low, low_out) = run_job(Transcode { input: InputFormat::Png, output: lossy(10) }, png.clone());
-        let (high, high_out) = run_job(Transcode { input: InputFormat::Png, output: lossy(95) }, png);
-        low.unwrap();
-        high.unwrap();
-        assert!(low_out.len() < high_out.len());
-    }
-
-    #[test]
-    fn lossless_webp_and_png_preserve_every_pixel() {
+    fn png_output_preserves_every_pixel() {
         if !magick_or_skip() { return; }
         let png = generate(&["-size", "128x128", "plasma:fractal", "-depth", "8", "png:-"]);
         let original = pixel_signature(png.clone());
-        for output in [OutputFormat::Png, OutputFormat::WebpLossless] {
-            let (result, out) = run_job(Transcode { input: InputFormat::Png, output }, png.clone());
-            result.unwrap();
-            assert_eq!(pixel_signature(out), original, "{output:?} altered pixel data");
-        }
-    }
-
-    #[test]
-    fn lossy_webp_is_not_pixel_identical_which_distinguishes_the_two_modes() {
-        if !magick_or_skip() { return; }
-        let png = generate(&["-size", "128x128", "plasma:fractal", "-depth", "8", "png:-"]);
-        let original = pixel_signature(png.clone());
-        let (result, out) = run_job(Transcode { input: InputFormat::Png, output: lossy(30) }, png);
+        let (result, out) = run_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, png);
         result.unwrap();
-        assert_ne!(pixel_signature(out), original);
-    }
-
-    #[test]
-    fn extreme_quality_inputs_still_produce_valid_webp() {
-        if !magick_or_skip() { return; }
-        let png = generate(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
-        for q in [0u8, 255] {
-            let (result, out) = run_job(Transcode { input: InputFormat::Png, output: lossy(q) }, png.clone());
-            result.unwrap();
-            assert_eq!(&out[8..12], b"WEBP");
-        }
+        assert_eq!(pixel_signature(out), original, "PNG altered pixel data");
     }
 
     #[test]
@@ -804,7 +665,7 @@ mod tests {
         let png = generate(&["-size", "128x128", "plasma:fractal", "-depth", "8", "png:-"]);
         let truncated = png[..png.len() / 2].to_vec();
         for input in [Vec::new(), b"definitely not an image".to_vec(), truncated, vec![0xA5u8; 4 * 1024 * 1024]] {
-            let (result, _) = run_job(Transcode { input: InputFormat::Png, output: lossy(80) }, input);
+            let (result, _) = run_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, input);
             assert!(matches!(result, Err(PipelineError::Failed { .. })));
         }
     }
@@ -827,14 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn png_output_excludes_the_time_chunk_and_no_other_output_needs_it() {
+    fn png_output_excludes_the_time_chunk() {
         for input in ALL_INPUTS {
-            let png = owned_args(&Transcode { input, output: OutputFormat::Png });
-            assert!(png.windows(2).any(|w| w == ["-define", "png:exclude-chunk=tIME"]), "{input:?}");
-            for output in [OutputFormat::WebpLossless, lossy(80)] {
-                let webp = owned_args(&Transcode { input, output });
-                assert!(webp.iter().all(|a| !a.contains("exclude-chunk")), "{input:?} -> {output:?}");
-            }
+            let args = owned_args(&Transcode { input, output: OutputFormat::Png });
+            assert!(args.windows(2).any(|w| w == ["-define", "png:exclude-chunk=tIME"]), "{input:?}");
         }
     }
 
@@ -988,7 +845,8 @@ mod tests {
         std::fs::write(&file.0, b"\x89PNG\r\n\x1a\nrest").unwrap();
         assert!(check_signature(OutputFormat::Png, &reader()).is_ok());
         // A valid image of another kind is still not what was promised.
-        assert!(check_signature(OutputFormat::WebpLossless, &reader()).is_err());
+        std::fs::write(&file.0, b"RIFF\x24\x00\x00\x00WEBPVP8 ").unwrap();
+        assert!(check_signature(OutputFormat::Png, &reader()).is_err());
         std::fs::write(&file.0, b"").unwrap();
         assert!(matches!(check_signature(OutputFormat::Png, &reader()), Err(PipelineError::Failed { .. })), "an empty output is not an image");
     }

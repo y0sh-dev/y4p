@@ -90,10 +90,8 @@ pub const SPLICE_ROUND_BYTES: usize = PIPE_TARGET_BYTES;
 pub const CDC_MIN_CHUNK_BYTES: usize = 4 * 1024;
 pub const CDC_AVG_CHUNK_BYTES: usize = 16 * 1024;
 pub const CDC_MAX_CHUNK_BYTES: usize = 64 * 1024;
-// Directory (inside the cache directory, hence on the same filesystem as the
-// final `<hash>.cache` files) the storage layer's spool-file API adopts from.
-// Keeping it on one filesystem is what lets a finished file be renamed into the
-// cache instead of copied. Ingestion itself no longer spools.
+// Directory the CLI reports as the spool location (`core::spool_dir_path`).
+// Nothing writes to it any more: payloads are stored inline or as cache files.
 pub const SPOOL_DIR_NAME: &str = "spool";
 // Extension of a cached binary payload, `<hash>.<extension>`: the one rule
 // `crates/storage` (`FileCache::path`) names cache files by.

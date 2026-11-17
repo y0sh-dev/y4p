@@ -13,17 +13,17 @@ Following `v0.9.0` (**Trust**), `v0.10.0` (**Subtraction**) removes over-enginee
 
 ### Phase 1: Ingestion & Speculative Debt Subtraction (`v0.9.1` – `v0.9.3`)
 
-- [ ] **v0.9.1: Ingestion Simplification (`MAX_PAYLOAD_BYTES = 32 MiB`)**
+- [x] **v0.9.1: Ingestion Simplification (`MAX_PAYLOAD_BYTES = 32 MiB`)**
   - Lower `MAX_PAYLOAD_BYTES` from `256 MiB` to `32 MiB`.
   - Remove `spool`, `splice(2)` / `tee(2)` ingestion plumbing, `ByteBudget`, and `Payload::Spooled` / `Stream` polymorphism; unify ingestion on bounded `DeadlineReader` (`read_bounded`) into `Vec<u8>`.
   - Retain `sendfile(2)` zero-copy egress for `<hash>.cache` files.
 
-- [ ] **v0.9.2: FastCDC Write Halt & Whole-Payload Dedup**
+- [x] **v0.9.2: FastCDC Write Halt & Whole-Payload Dedup**
   - Halt all new writes to `chunks` and `manifest` tables (`cdc.rs` persistence path); unify persistence on whole-payload SHA3 deduplication (inline payloads + `<hash>.cache`).
   - Preserve read, `delete`, and `wipe` compatibility for legacy `chunks` / `manifest` rows.
   - Update `AGENTS.md` to replace the frozen `crates/storage/` prohibition with schema backwards-compatibility invariants.
 
-- [ ] **v0.9.3: Dead & Speculative Code Removal**
+- [x] **v0.9.3: Dead & Speculative Code Removal**
   - Remove `ClipboardDb::open_read_only`, `core::splice::splice_all` / `try_splice`, unused `OutputFormat::WebpLossless` / `WebpLossy` variants, and speculative `ContentLocation` notes.
 
 ### Phase 2: Image Opt-In & Cache Quota (`v0.9.4` – `v0.9.5`)

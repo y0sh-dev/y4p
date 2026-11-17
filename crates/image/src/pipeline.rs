@@ -182,10 +182,6 @@ fn drain_capped<R: Read>(mut from: R, cap: usize) -> Vec<u8> {
     kept
 }
 
-// `try_splice` and `splice_all` live in `core::splice` beside the rest of the
-// kernel-copy machinery; re-exported so existing callers keep their path.
-pub use crate::core::splice::{splice_all, try_splice};
-
 /// SIGKILLs the child's whole process group. The child is started as the
 /// leader of its own group (`process_group(0)`, so its pgid is its pid),
 /// which makes this reach any helper processes it spawned too. That matters
@@ -1051,81 +1047,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
-    }
-
-    // The bare primitives live in `core::splice`, which tests them directly;
-    // what follows checks that the re-exported pair still serves this module's
-    // callers, including with a real child process on the other end.
-
-    #[test]
-    fn splice_drains_many_chunks_in_one_call() {
-        within_deadline(|| {
-            let payload = patterned(1 << 20);
-            assert!(payload.len() > 4 * PIPELINE_CHUNK_BYTES, "the test must span several chunks");
-            let (a_read, a_write) = io::pipe().unwrap();
-            let (b_read, b_write) = io::pipe().unwrap();
-
-            thread::scope(|scope| {
-                let expected = &payload;
-                scope.spawn(move || {
-                    let mut a_write = a_write;
-                    a_write.write_all(expected).unwrap();
-                });
-                let reader = scope.spawn(move || {
-                    let mut b_read = b_read;
-                    let mut received = Vec::new();
-                    b_read.read_to_end(&mut received).unwrap();
-                    received
-                });
-
-                let moved = splice_all(&a_read, &b_write).unwrap();
-                drop(b_write);
-                assert_eq!(moved, Some(payload.len() as u64));
-                assert_eq!(reader.join().unwrap(), payload);
-            });
-        });
-    }
-
-    #[test]
-    fn splice_between_a_pipe_and_a_file_works_in_both_directions() {
-        let payload = patterned(30_000);
-        let scratch = ScratchFile::new("pipe-file");
-
-        // pipe -> file
-        let (reader, mut writer) = io::pipe().unwrap();
-        writer.write_all(&payload).unwrap();
-        drop(writer);
-        let file = scratch.open_rw();
-        assert_eq!(splice_all(&reader, &file).unwrap(), Some(payload.len() as u64));
-        assert_eq!(scratch.contents(), payload);
-
-        // file -> pipe
-        let source = std::fs::File::open(&scratch.0).unwrap();
-        let (mut reader, writer) = io::pipe().unwrap();
-        assert_eq!(splice_all(&source, &writer).unwrap(), Some(payload.len() as u64));
-        drop(writer);
-        let mut received = Vec::new();
-        reader.read_to_end(&mut received).unwrap();
-        assert_eq!(received, payload);
-    }
-
-    #[test]
-    fn splice_drains_a_child_process_stdout_into_a_file() {
-        within_deadline(|| {
-            const LEN: u64 = 200_000;
-            let scratch = ScratchFile::new("child-stdout");
-            let file = scratch.open_rw();
-            let mut child = Command::new("head")
-                .args(["-c", &LEN.to_string(), "/dev/zero"])
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let stdout = child.stdout.take().unwrap();
-
-            assert_eq!(splice_all(&stdout, &file).unwrap(), Some(LEN));
-            assert!(child.wait().unwrap().success());
-            assert_eq!(scratch.contents().len() as u64, LEN);
-        });
     }
 
     // --- descriptor to descriptor: a file as stdin, stdout spliced into a file ---
