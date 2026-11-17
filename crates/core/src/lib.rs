@@ -86,9 +86,11 @@ pub fn get_cache_dir() -> PathBuf {
     path
 }
 
-/// Directory where payloads are spooled while they stream in: a subdirectory of
-/// the cache directory (so storage can adopt a finished file into the cache with a `rename(2)`), not
-/// created here. See `constants::SPOOL_DIR_NAME`.
+/// Directory the storage layer uses for a payload spooled on disk: a
+/// subdirectory of the cache directory (so a finished file can be adopted into
+/// the cache with a `rename(2)`), not created here. Ingestion no longer writes
+/// to it, but the path is still reported by `y4p stats`/`y4p doctor`.
+/// See `constants::SPOOL_DIR_NAME`.
 pub fn spool_dir_path() -> PathBuf {
     let mut path = get_cache_dir();
     path.push(SPOOL_DIR_NAME);
