@@ -2,7 +2,7 @@
 
 ## 0. Non-negotiables (Project-Specific)
 - Global `~/.agent-protocols/CARD.md` is the authoritative safety set. On conflict, follow the more restrictive rule and report it.
-- **Storage Layer Invariant**: Do not modify `crates/storage/` (0 lines changed).
+- **Schema Backwards-Compatibility Invariant**: Never write new rows to the `chunks` / `manifest` tables or set `clipboard.is_chunked = 1`; all new payloads are stored inline (`content`) or in `<hash>.cache`. Existing SQLite v4 databases must keep working: legacy `is_chunked = 1` rows must stay readable (`get_content_by_id`), searchable (`search_metadata`), rotatable, deletable (`delete_by_id`) and wipeable (`wipe`), and the v4 table definitions in `crates/storage/src/schema.rs` must not be removed or altered destructively.
 - **Zero External Dependencies**: Do not add external crates to `Cargo.toml` without human approval.
 - **Strict Panic-Free**: Do not introduce `unwrap()`, `expect()`, or `panic!()`. Keep Clippy warning-free under `-D warnings`.
 - **Language**: Deliverables (code, comments, commits, PRs, docs) strictly in British English.

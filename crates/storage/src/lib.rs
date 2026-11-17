@@ -654,10 +654,10 @@ mod tests {
         assert!(f.db.insert_raw("text/plain", b"after the wipe").unwrap() > 0, "the connection survives shrink_memory");
     }
 
-    // --- chunked payloads through the facade ---
+    // --- large payloads through the facade: inline writes only ---
 
     #[test]
-    fn a_large_spooled_non_image_is_chunked_and_served_whole_from_the_row() {
+    fn a_large_spooled_non_image_is_stored_inline_and_served_whole_from_the_row() {
         let mut f = Fixture::new("chunked-spool");
         let bytes = pattern(500_000, 13);
         let id = f.db.insert_spooled("application/pdf", f.spooled("1-1.part", &bytes), 100).unwrap();
@@ -666,29 +666,29 @@ mod tests {
         assert_eq!(f.db.get_content_by_id(id).unwrap(), ("application/pdf".to_owned(), bytes));
         assert_eq!(f.cache_files(), 0);
         assert!(f.spool_is_empty());
-        assert!(f.db.store.chunk_usage().manifest > 1);
+        let usage = f.db.store.chunk_usage();
+        assert_eq!((usage.chunks, usage.manifest), (0, 0), "no chunk or manifest row is written");
     }
 
     #[test]
-    fn insert_raw_of_an_edited_text_stores_the_shared_chunks_once() {
+    fn insert_raw_of_an_edited_text_stores_both_rows_inline() {
         let mut f = Fixture::new("chunked-edit");
         let original: String = (0..60_000u32).map(|i| format!("{:x} ", i.wrapping_mul(2_654_435_761))).collect();
         let mut edited = original.clone();
         edited.insert_str(original.len() / 2, "INSERTED ");
         let a = f.db.insert_raw("text/plain", original.as_bytes()).unwrap();
-        let one = f.db.store.chunk_usage();
         let b = f.db.insert_raw("text/plain", edited.as_bytes()).unwrap();
-        let two = f.db.store.chunk_usage();
 
         assert_ne!(a, b);
-        assert!(original.len() > 300_000, "the payload must span many chunks");
-        assert!(two.bytes < one.bytes * 3 / 2, "{} bytes after the edit, {} before", two.bytes, one.bytes);
+        assert!(original.len() > 300_000, "the payload must span many former chunk boundaries");
         assert_eq!(f.db.get_content_by_id(a).unwrap().1, original.into_bytes());
         assert_eq!(f.db.get_content_by_id(b).unwrap().1, edited.into_bytes());
+        let usage = f.db.store.chunk_usage();
+        assert_eq!((usage.chunks, usage.manifest), (0, 0), "each row keys its own hash, whole");
     }
 
     #[test]
-    fn chunked_rows_survive_reopening_the_database_and_are_searchable() {
+    fn large_inline_rows_survive_reopening_the_database_and_are_searchable() {
         let mut f = Fixture::new("chunked-reopen");
         let mut text = vec![b'q'; 200_000];
         text[120_000..120_011].copy_from_slice(b"reopenedkey");
@@ -704,15 +704,18 @@ mod tests {
     }
 
     #[test]
-    fn deleting_and_wiping_through_the_facade_leave_no_chunks_behind() {
+    fn deleting_and_wiping_through_the_facade_leave_the_chunk_tables_empty() {
         let mut f = Fixture::new("chunked-gc");
         let a = f.db.insert_raw("application/octet-stream", &pattern(300_000, 14)).unwrap();
         f.db.insert_raw("application/octet-stream", &pattern(300_000, 15)).unwrap();
 
+        let written = f.db.store.chunk_usage();
+        assert_eq!((written.chunks, written.manifest), (0, 0), "new rows never split their bytes");
+
         assert!(f.db.delete_by_id(a).unwrap());
         assert!(f.db.get_content_by_id(a).is_none());
         let after_delete = f.db.store.chunk_usage();
-        assert_eq!(after_delete.manifest, crate::core::cdc::FastCdc::new(&pattern(300_000, 15)).count());
+        assert_eq!((after_delete.chunks, after_delete.manifest), (0, 0));
 
         f.db.wipe().unwrap();
         let after_wipe = f.db.store.chunk_usage();
