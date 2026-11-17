@@ -47,13 +47,13 @@ pub const SOCKET_FILE_NAME: &str = "y4p.sock";
 // this cap: a stream that is actually larger is thereby told apart from one
 // that exactly fits, and discarded outright rather than silently truncated
 // and persisted as corrupt data.
-pub const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
 // --- Payload Routing ---
-// Boundary between the in-memory fast path and the kernel-streamed descriptor
-// path (see `core::payload::route_payload`). One OS page: below it a payload
-// costs less to copy through the heap than to set a descriptor transfer up
-// for, and clipboard text is overwhelmingly this small.
+// Boundary between the small/text-like pre-allocation and the binary one (see
+// `core::payload::route_payload`). One OS page: a text payload is almost always
+// below it, so reserving a page up front replaces the read loop's repeated
+// growth by one allocation; a binary starts empty and grows.
 pub const INLINE_PAYLOAD_THRESHOLD_BYTES: usize = 4096;
 // Ceiling on what a length hint may pre-allocate in `core::payload::read_bounded`.
 // A hint is advisory (a peer may lie), so it never reserves more than this
@@ -91,13 +91,10 @@ pub const CDC_MIN_CHUNK_BYTES: usize = 4 * 1024;
 pub const CDC_AVG_CHUNK_BYTES: usize = 16 * 1024;
 pub const CDC_MAX_CHUNK_BYTES: usize = 64 * 1024;
 // Directory (inside the cache directory, hence on the same filesystem as the
-// final `<hash>.cache` files) where a payload is spooled while it streams in.
-// Keeping it on one filesystem is what lets the finished file be adopted into
-// the cache with an atomic `rename(2)` instead of a copy.
+// final `<hash>.cache` files) the storage layer's spool-file API adopts from.
+// Keeping it on one filesystem is what lets a finished file be renamed into the
+// cache instead of copied. Ingestion itself no longer spools.
 pub const SPOOL_DIR_NAME: &str = "spool";
-// Extension of a spool file. A leftover with this extension is, by definition,
-// debris of a previous run and is swept at daemon start.
-pub const SPOOL_FILE_EXTENSION: &str = "part";
 // Extension of a cached binary payload, `<hash>.<extension>`: the one rule
 // `crates/storage` (`FileCache::path`) names cache files by.
 pub const CACHE_FILE_EXTENSION: &str = "cache";
@@ -106,20 +103,10 @@ pub const DIGEST_LEN: usize = 32;
 
 // --- Ingestion Backpressure & Concurrency Bounds ---
 // Capacity of the bounded channel between the Wayland ingestion threads and
-// the database worker. A count: it bounds how many payloads wait, while
-// INGEST_QUEUE_BYTE_BUDGET (below) bounds how many bytes they hold between
-// them. A payload that streams in past INLINE_PAYLOAD_THRESHOLD_BYTES is
-// spooled to disk and queued as a path and a digest: it costs a spool file, not
-// heap, but the byte budget counts it all the same, so the disk it pins is
-// bounded too.
+// the database worker. A count, and the only queue bound: every payload is read
+// into memory before it is queued, so the worst case this admits is
+// INGEST_QUEUE_CAPACITY buffers of at most MAX_PAYLOAD_BYTES each.
 pub const INGEST_QUEUE_CAPACITY: usize = 64;
-// Ceiling on the payload bytes queued but not yet persisted, in memory and in
-// spool files together. Without it the count bound alone still admits
-// INGEST_QUEUE_CAPACITY maximal payloads (64 * MAX_PAYLOAD_BYTES). A payload
-// larger than the whole budget can never be admitted and is shed at once
-// instead of being waited on. Note that this is below MAX_PAYLOAD_BYTES: a
-// payload between the two is read in full, then shed.
-pub const INGEST_QUEUE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 // Simultaneous ingestion readers (one thread, one pipe read end and one
 // payload buffer each). Checked *before* the pipe is allocated, so a burst of
 // selection changes can neither exhaust file descriptors (`EMFILE`) nor spawn
@@ -132,8 +119,7 @@ pub const INGEST_MAX_CONCURRENT_READERS: usize = 8;
 pub const INGEST_ENQUEUE_WAIT_MS: u64 = 2000;
 // Polling interval while waiting for queue room (`std` offers no timed send).
 pub const INGEST_ENQUEUE_POLL_MS: u64 = 5;
-// Hard wall-clock deadline for draining a single compositor selection pipe
-// (covering both the initial inline read and any kernel-spliced remainder).
+// Hard wall-clock deadline for draining a single compositor selection pipe.
 // A stalled or slow-drip sender that has not finished by this deadline is
 // cut off so it cannot hold a `ReaderGate` slot indefinitely.
 pub const INGEST_READ_TIMEOUT_MS: u64 = 5000;
@@ -143,7 +129,6 @@ pub const INGEST_READ_TIMEOUT_MS: u64 = 5000;
 const _: () = assert!(
     INGEST_QUEUE_CAPACITY >= 1
         && INGEST_MAX_CONCURRENT_READERS >= 1
-        && INGEST_QUEUE_BYTE_BUDGET >= 1
         && INGEST_READ_TIMEOUT_MS >= 1,
     "the ingestion bounds must admit at least one reader, one queued payload, and a non-zero read timeout",
 );

@@ -11,7 +11,7 @@
 //! cargo test  --workspace --all-targets           # smoke mode: one pass, no timing claims
 //! ```
 //!
-//! What is measured, and why these eleven groups:
+//! What is measured, and why these ten groups:
 //!
 //! | Group     | Subject                                                     |
 //! | :-------- | :---------------------------------------------------------- |
@@ -20,8 +20,7 @@
 //! | queue     | bounded-channel hand-off, load shedding, reader gate, memory |
 //! | payload   | routing decision, reader dispatch, bounded reads, pipe streams |
 //! | splice    | pipe -> file: heap `Vec` road versus `splice(2)`/`tee(2)` and the fallback |
-//! | ingest    | pipe -> database end to end, in memory versus spooled; memory bound |
-//! | transcode | raster image: spool file -> converted bytes, heap road versus descriptor to descriptor |
+//! | ingest    | pipe -> database end to end; queue memory bound |
 //! | sqlite    | insert, insert + rotation, duplicate hit, metadata scans      |
 //! | cdc       | FastCDC chunking throughput and allocations, 4 KiB - 16 MiB; chunking + SHA3; edit deduplication |
 //! | pipe      | pipe capacity 64 KiB versus 1 MiB (`F_SETPIPE_SZ`): read loop, splice, splice + tee + sha3, sendfile egress; with context switches |
@@ -57,17 +56,14 @@ use std::time::{Duration, Instant};
 
 use sha3::{Digest, Sha3_256};
 use y4p_core as core;
-use y4p_core::payload::{read_bounded, route_payload, to_hex, Payload, PayloadReader, SpooledFile, StreamDescriptor};
+use y4p_core::payload::{read_bounded, route_payload, to_hex, Payload, PayloadReader};
 use y4p_core::cdc::FastCdc;
 use y4p_core::pipe::grow_to;
 use y4p_core::splice::{copy_to_file, copy_to_file_buffered, ByteTap, NoTap};
 use y4p_daemon::metrics::DaemonMetrics;
-use y4p_daemon::spool::{transcode_spooled, FileSpooler};
 use y4p_daemon::worker::DbWorker;
-use y4p_image::transcode::{self, InputFormat, OutputFormat, Transcode};
 use y4p_storage::ClipboardDb;
-use y4p_wayland::spool::{PayloadSpooler, SpoolOutcome};
-use y4p_wayland::ingest::{self, ByteBudget, Enqueue, ReaderGate};
+use y4p_wayland::ingest::{self, Enqueue, ReaderGate};
 use y4p_wayland::state::ClipboardJob;
 
 // ---------------------------------------------------------------------------
@@ -418,28 +414,13 @@ fn bench_payload(mode: &Mode, rows: &mut Vec<Row>) {
             Err(_) => false,
         }
     }));
-
-    // A real descriptor: pipe, write, close, read to EOF. The syscall floor that
-    // the v0.7.3 splice path has to beat; pipe set-up is part of every operation.
-    for len in [4096usize, 32 * 1024] {
-        let bytes = payload(len, 5);
-        rows.push(mode.micro("payload", format!("pipe stream read_bounded, {} (incl. pipe set-up)", size_label(len)), len as u64, || {
-            let Ok((reader, mut writer)) = std::io::pipe() else { return 0 };
-            if writer.write_all(&bytes).is_err() {
-                return 0;
-            }
-            drop(writer);
-            let stream = StreamDescriptor::new(OwnedFd::from(reader), Some(len as u64));
-            Payload::Stream(stream).read_bounded(limit).map(|v| v.len()).unwrap_or(0)
-        }));
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Stream-to-file: the v0.7.3 kernel path against the heap road it replaces
 // ---------------------------------------------------------------------------
 
-/// SHA3-256 as a stream observer, exactly what the daemon's spooler uses.
+/// SHA3-256 as a stream observer, for the splice measurements below.
 struct Sha3Tap(Sha3_256);
 
 impl ByteTap for Sha3Tap {
@@ -524,16 +505,13 @@ fn bench_splice(mode: &Mode, rows: &mut Vec<Row>) {
 // ---------------------------------------------------------------------------
 
 /// Persists `len`-byte GIFs end to end, one at a time, and reports what the
-/// heap did while each one was in flight. `spooled` selects the road: the
-/// v0.7.2 one (the ingestion thread reads the pipe into a `Vec`) or the v0.7.3
-/// one (`FileSpooler` splices it to a file, the worker adopts the file).
+/// heap did while each one was in flight: the ingestion thread reads the pipe
+/// into a `Vec`, normalises it and queues it.
 fn ingest_once(
     tx: &std::sync::mpsc::SyncSender<ClipboardJob>,
-    spooler: &FileSpooler,
     metrics: &DaemonMetrics,
     data: &mut Arc<Vec<u8>>,
     counter: &mut u64,
-    spooled: bool,
 ) -> Result<(), String> {
     *counter += 1;
     // A unique payload per operation, so every one is an insert, never a duplicate.
@@ -543,19 +521,9 @@ fn ingest_once(
         }
     }
     let persisted_before = metrics.ingress_count();
-    let (mut src, handle) = fed_pipe(data).ok_or("pipe set-up failed")?;
-    let job = if spooled {
-        let head_len = core::constants::INLINE_PAYLOAD_THRESHOLD_BYTES.min(data.len());
-        let mut head = vec![0u8; head_len];
-        src.read_exact(&mut head).map_err(|e| format!("head read failed: {e}"))?;
-        match spooler.spool(&head, src, core::constants::MAX_PAYLOAD_BYTES) {
-            SpoolOutcome::Spooled(file) => ClipboardJob::from_payload("image/gif".to_owned(), Payload::Spooled(Box::new(file))),
-            _ => return Err("the spooler did not spool the payload".into()),
-        }
-    } else {
-        let bytes = read_bounded(src, core::constants::MAX_PAYLOAD_BYTES, None).map_err(|e| e.to_string())?;
-        ClipboardJob::new("image/gif".to_owned(), bytes)
-    };
+    let (src, handle) = fed_pipe(data).ok_or("pipe set-up failed")?;
+    let bytes = read_bounded(src, core::constants::MAX_PAYLOAD_BYTES, None).map_err(|e| e.to_string())?;
+    let job = ClipboardJob::new("image/gif".to_owned(), bytes);
     if let Some(handle) = handle {
         let _ = handle.join();
     }
@@ -571,7 +539,6 @@ fn ingest_once(
 }
 
 fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
-    let spooler = FileSpooler::open(core::spool_dir_path()).map_err(|e| format!("spool directory: {e}"))?;
     let metrics = Arc::new(DaemonMetrics::new());
     let worker = DbWorker::spawn(ClipboardDb::open()?, Arc::clone(&metrics), false, 8);
     let tx = worker.sender();
@@ -585,50 +552,40 @@ fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
             Arc::new(bytes)
         };
         let mut counter = 0u64;
-        for spooled in [false, true] {
-            let road = if spooled { "spooled, splice + adopt (v0.7.3)" } else { "heap Vec (v0.7.2)" };
-            let before = LIVE_BYTES.load(Ordering::Relaxed);
-            PEAK_BYTES.store(before, Ordering::Relaxed);
-            let row = mode.batched(
-                "ingest",
-                format!("pipe -> database, {} GIF, {road}", size_label(len)),
-                ops,
-                len as u64,
-                &mut (),
-                |_| Ok(()),
-                |_| ingest_once(&tx, &spooler, &metrics, &mut data, &mut counter, spooled),
-            )?;
-            let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
-            notes.push(format!(
-                "ingest peak heap growth, {} GIF, {road}: {:.2} MiB",
-                size_label(len),
-                peak as f64 / (1024.0 * 1024.0)
-            ));
-            rows.push(row);
-        }
+        let road = "heap Vec";
+        let before = LIVE_BYTES.load(Ordering::Relaxed);
+        PEAK_BYTES.store(before, Ordering::Relaxed);
+        let row = mode.batched(
+            "ingest",
+            format!("pipe -> database, {} GIF, {road}", size_label(len)),
+            ops,
+            len as u64,
+            &mut (),
+            |_| Ok(()),
+            |_| ingest_once(&tx, &metrics, &mut data, &mut counter),
+        )?;
+        let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+        notes.push(format!(
+            "ingest peak heap growth, {} GIF, {road}: {:.2} MiB",
+            size_label(len),
+            peak as f64 / (1024.0 * 1024.0)
+        ));
+        rows.push(row);
     }
     for note in &notes {
         println!("\n{note}");
     }
 
-    // Memory bound with spooled payloads: offer twice the queue's capacity of
-    // 1 MiB payloads. The queue holds paths and digests, so what it pins on the
-    // heap is independent of the payloads' size; the surplus is shed (and its
-    // files unlinked).
+    // Memory bound: offer twice the queue's capacity of 1 MiB payloads. The
+    // queue holds buffers, so the surplus is shed rather than allowed to grow
+    // the heap without limit.
     let capacity = core::constants::INGEST_QUEUE_CAPACITY;
     let (qtx, qrx) = sync_channel::<ClipboardJob>(capacity);
     let before = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(before, Ordering::Relaxed);
     let (mut queued, mut shed) = (0usize, 0usize);
-    let mut dir = core::get_cache_dir();
-    dir.push("bench-bound");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for i in 0..capacity * 2 {
-        let path = dir.join(format!("{i}.part"));
-        let file = File::create(&path).map_err(|e| e.to_string())?;
-        file.set_len(1024 * 1024).map_err(|e| e.to_string())?;
-        let spooled = SpooledFile::new(path, 1024 * 1024, [0u8; core::constants::DIGEST_LEN]);
-        let job = ClipboardJob::from_payload("image/gif".to_owned(), Payload::Spooled(Box::new(spooled)));
+        let job = ClipboardJob::from_payload("image/gif".to_owned(), Payload::memory(bench_payload_bytes(i)));
         match ingest::enqueue(&qtx, job, Duration::ZERO) {
             Enqueue::Queued => queued += 1,
             Enqueue::Shed => shed += 1,
@@ -636,99 +593,28 @@ fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
         }
     }
     let held = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
-    let files_left = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
     println!(
-        "\nmemory bound (spooled): offered {} x 1 MiB into a queue of {capacity}: queued {queued}, shed {shed}, peak heap growth {:.3} MiB, spool files left on disk {files_left}",
+        "\nmemory bound: offered {} x 1 MiB into a queue of {capacity}: queued {queued}, shed {shed}, peak heap growth {:.3} MiB",
         capacity * 2,
         held as f64 / (1024.0 * 1024.0)
     );
-    if queued != capacity || shed != capacity || files_left != capacity {
-        return Err(format!("spooled queue bound violated: queued {queued}, shed {shed}, files {files_left}"));
+    if queued != capacity || shed != capacity {
+        return Err(format!("queue bound violated: queued {queued}, shed {shed}, capacity {capacity}"));
     }
     drop(qrx);
     drop(qtx);
-    let files_after = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
-    let _ = std::fs::remove_dir_all(&dir);
-    if files_after != 0 {
-        return Err(format!("{files_after} spool files outlived their queue"));
-    }
     drop(tx);
     drop(worker);
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Transcode: a spooled raster image through `magick`, heap road versus descriptors
-// ---------------------------------------------------------------------------
-
-/// A spooled raster image, converted two ways: the v0.7.3 road reads the whole
-/// file into a `Vec`, feeds `magick` through the chunk-buffered relay, collects
-/// its output in a second `Vec` and hashes that; the v0.7.4 road hands the file
-/// to `magick` as its stdin and splices its stdout into a new file, hashing on
-/// the way (`transcode_spooled`). Both start from the same spool file and end
-/// with the converted bytes' SHA3-256; only the second also leaves them on disk
-/// ready for adoption, so the first is not charged for a write it would still owe.
-///
-/// Incompressible noise on purpose: the PNG is as large as the pixels, so the
-/// byte volume is what the label says and `magick` has real work to do.
-fn bench_transcode(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
-    if !y4p_image::magick::is_available() {
-        println!("\ntranscode group skipped: `magick` is not available on this system");
-        return Ok(());
+/// A fresh 1 MiB buffer for the queue bound: `i` keeps each one distinct.
+fn bench_payload_bytes(i: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; 1024 * 1024];
+    if let Some(first) = bytes.first_mut() {
+        *first = (i % 251) as u8;
     }
-    let dir = core::spool_dir_path();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("spool directory: {e}"))?;
-    let job = Transcode { input: InputFormat::Png, output: OutputFormat::Png };
-    let limit = core::constants::MAX_PAYLOAD_BYTES;
-
-    // Smoke mode (`cargo test`) converts the small image only.
-    let sides: &[u32] = if mode.full { &[512, 2048] } else { &[512] };
-    let mut notes = Vec::new();
-    for &side in sides {
-        let geometry = format!("{side}x{side}");
-        let mut png = Vec::new();
-        y4p_image::magick::run(&["-size", &geometry, "xc:", "+noise", "Random", "-depth", "8", "png:-"], std::io::empty(), &mut png)
-            .map_err(|e| format!("cannot generate the fixture image: {e}"))?;
-        let path = dir.join(format!("{}-{side}.part", std::process::id()));
-        std::fs::write(&path, &png).map_err(|e| e.to_string())?;
-        let digest = <[u8; core::constants::DIGEST_LEN]>::try_from(Sha3_256::digest(&png).as_slice()).map_err(|e| e.to_string())?;
-        let source = SpooledFile::new(path.clone(), png.len() as u64, digest);
-        let label = size_label(png.len());
-        let len = png.len() as u64;
-        drop(png);
-
-        let memory_road = || -> Option<[u8; core::constants::DIGEST_LEN]> {
-            let bytes = std::fs::read(&path).ok()?;
-            let mut out = Vec::with_capacity(bytes.len());
-            transcode::transcode(job, std::io::Cursor::new(&bytes), &mut out).ok()?;
-            <[u8; core::constants::DIGEST_LEN]>::try_from(Sha3_256::digest(&out).as_slice()).ok()
-        };
-        let descriptor_road = || transcode_spooled(&source, job, limit).ok().map(|converted| *converted.digest());
-
-        // Same input, same arguments: the two roads must produce the same digest,
-        // or deduplication would key one image two ways.
-        let (a, b) = (memory_road(), descriptor_road());
-        if a.is_none() || a != b {
-            return Err(format!("the two transcode roads disagree on the {label} image: {a:?} vs {b:?}"));
-        }
-
-        for (road, run) in [
-            ("read into Vec + buffered relay + sha3 (v0.7.3 road)", &memory_road as &dyn Fn() -> Option<[u8; core::constants::DIGEST_LEN]>),
-            ("spool file -> spool file, stdin handed over, stdout spliced + tee + sha3 (v0.7.4 road)", &descriptor_road),
-        ] {
-            let before = LIVE_BYTES.load(Ordering::Relaxed);
-            PEAK_BYTES.store(before, Ordering::Relaxed);
-            black_box(run());
-            let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before);
-            notes.push(format!("transcode peak heap growth, {label} PNG, {road}: {:.2} MiB", peak as f64 / (1024.0 * 1024.0)));
-            rows.push(mode.micro("transcode", format!("raster {label} PNG -> PNG: {road}"), len, run));
-        }
-        drop(source);
-    }
-    for note in &notes {
-        println!("\n{note}");
-    }
-    Ok(())
+    bytes
 }
 
 fn bench_queue(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
@@ -743,23 +629,6 @@ fn bench_queue(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
             (outcome, rx.try_recv().is_ok())
         }));
     }
-
-    // The same hand-off under the byte budget: one compare-and-swap to reserve,
-    // one atomic subtraction when the dequeued job (and its permit) is dropped.
-    let budget = Arc::new(ByteBudget::new(core::constants::INGEST_QUEUE_BYTE_BUDGET));
-    for len in [64usize, 4 * 1024] {
-        let (tx, rx) = sync_channel::<ClipboardJob>(capacity);
-        rows.push(mode.micro("queue", format!("enqueue_bounded + dequeue, {} payload", size_label(len)), 0, || {
-            let outcome = ingest::enqueue_bounded(&tx, &budget, job(len), Duration::ZERO);
-            (outcome, rx.try_recv().is_ok())
-        }));
-    }
-    // Cost of refusing work for want of bytes: the queue has room, the budget has none.
-    let tight = Arc::new(ByteBudget::new(64));
-    let held = tight.try_reserve(64).ok_or("could not fill the benchmark byte budget")?;
-    let (tx, _rx) = sync_channel::<ClipboardJob>(capacity);
-    rows.push(mode.micro("queue", "shed on a full byte budget (zero patience)", 0, || ingest::enqueue_bounded(&tx, &tight, job(64), Duration::ZERO)));
-    drop(held);
 
     // Cost of refusing work: the queue is full, nobody drains it, patience is zero.
     let (tx, rx) = sync_channel::<ClipboardJob>(capacity);
@@ -1409,7 +1278,6 @@ fn run_measurements(root: &Path) -> Result<(), String> {
     // slower when they ran first).
     bench_splice(&mode, &mut rows);
     bench_ingest(&mode, &mut rows)?;
-    bench_transcode(&mode, &mut rows)?;
     let mut facts = Vec::new();
     bench_cdc(&mode, &mut rows, &mut facts);
     bench_pipe(&mode, &mut rows, &mut facts);

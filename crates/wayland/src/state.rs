@@ -10,10 +10,9 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_source_v1::ExtDataControlSourceV1,
 };
 use std::sync::{Arc, Mutex, mpsc};
-use crate::core::constants::{INGEST_MAX_CONCURRENT_READERS, INGEST_QUEUE_BYTE_BUDGET};
+use crate::core::constants::INGEST_MAX_CONCURRENT_READERS;
 use crate::core::payload::{Payload, PayloadError};
-use crate::ingest::{BytePermit, ByteBudget, IngestStats, ReaderGate};
-use crate::spool::PayloadSpooler;
+use crate::ingest::{IngestStats, ReaderGate};
 
 pub struct OfferData {
     pub mimes: Arc<Mutex<Vec<String>>>,
@@ -22,10 +21,10 @@ pub struct OfferData {
 /// What a data source serves: its advertised MIME and where the bytes live.
 ///
 /// `payload` is the shared `core::payload::Payload`, so egress speaks the same
-/// vocabulary as ingress (`ClipboardJob`): an in-memory buffer, a streaming
-/// descriptor, or a file in the on-disk cache. The `Send` handler picks the
-/// transfer from the variant (see `handlers/data_control/source.rs`); a `File`
-/// or `Stream` payload never has to be materialised in this process's heap.
+/// vocabulary as ingress (`ClipboardJob`): an in-memory buffer or a file in the
+/// on-disk cache. The `Send` handler picks the transfer from the variant (see
+/// `handlers/data_control/source.rs`); a `File` payload never has to be
+/// materialised in this process's heap.
 pub struct SourceMetadata {
     pub mime: String,
     pub payload: Payload,
@@ -35,41 +34,22 @@ pub struct SourceMetadata {
 /// worker. Deliberately carries no fingerprint: image transcoding rewrites the
 /// bytes, so the digest is only meaningful once the worker has the final ones.
 ///
-/// The payload is a `core::payload::Payload`, not a bare `Vec<u8>`. The ingestion
-/// thread hands over `Payload::Memory` for anything that fits the inline
-/// threshold (and always for text, which it must normalise), and
-/// `Payload::Spooled` for a larger one it has already drained to a spool file
-/// (see `crate::spool`): the queue then carries a path and a digest, not the
-/// bytes, so what a full queue pins in memory is bounded by the number of
-/// slots, not by the size of the payloads (the byte budget, `permit` below,
-/// bounds the spool files too). Moving either through the queue moves a pointer.
-///
-/// `permit` is the job's share of the queue's byte budget
-/// (`crate::ingest::enqueue_bounded`). It is `None` until the job is queued
-/// that way; the worker drops it once the payload has been persisted or
-/// discarded, which is what frees the bytes for the next payload.
+/// The payload is always `Payload::Memory`: the ingestion thread reads the
+/// compositor pipe into a bounded, normalised buffer before queueing it (see
+/// `core::payload::read_bounded`). Moving it through the queue moves a pointer.
 pub struct ClipboardJob {
     pub mime: String,
     pub payload: Payload,
-    pub permit: Option<BytePermit>,
 }
 
 impl ClipboardJob {
-    /// The common case, and the shape every caller had before payloads became
-    /// polymorphic: a MIME and fully-materialised bytes.
+    /// The common case: a MIME and fully-materialised bytes.
     pub fn new(mime: String, data: Vec<u8>) -> Self {
         Self::from_payload(mime, Payload::memory(data))
     }
 
     pub fn from_payload(mime: String, payload: Payload) -> Self {
-        Self { mime, payload, permit: None }
-    }
-
-    /// What this job counts for against the byte budget: its length when known
-    /// without I/O, otherwise nothing. Saturates on a (32-bit) overflow, which
-    /// then simply exceeds any budget.
-    pub fn accounted_bytes(&self) -> usize {
-        self.len_hint().map_or(0, |len| usize::try_from(len).unwrap_or(usize::MAX))
+        Self { mime, payload }
     }
 
     /// Length in bytes when known without I/O (see `Payload::len_hint`).
@@ -98,11 +78,6 @@ pub struct WaylandState {
     pub reader_gate: Arc<ReaderGate>,
     /// What overload has cost so far; read by the daemon for `y4p status`.
     pub ingest_stats: Arc<IngestStats>,
-    /// Ceiling on the payload bytes queued for the worker (see `crate::ingest`).
-    pub byte_budget: Arc<ByteBudget>,
-    /// Where a large payload is drained to disk instead of into the heap
-    /// (see `crate::spool`). `None`: every payload is read into memory.
-    pub spooler: Option<Arc<dyn PayloadSpooler>>,
     pub verbose: bool,
     // Action-mode-only: the specific MIME `y4p paste-from <mime>` was asked
     // for. `None` in daemon mode, where no single MIME is being awaited —
@@ -134,8 +109,6 @@ impl WaylandState {
             job_tx: Some(job_tx),
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
-            byte_budget: Arc::new(ByteBudget::new(INGEST_QUEUE_BYTE_BUDGET)),
-            spooler: None,
             verbose,
             target_mime: None,
             rx_buf: Vec::new(),
@@ -144,14 +117,6 @@ impl WaylandState {
             paused: false,
             config,
         }
-    }
-
-    /// Enables the streaming ingestion path (daemon mode only): payloads that
-    /// outgrow the inline threshold are drained by `spooler` instead of being
-    /// read into a `Vec`.
-    pub fn with_spooler(mut self, spooler: Arc<dyn PayloadSpooler>) -> Self {
-        self.spooler = Some(spooler);
-        self
     }
 
     pub fn new_action(target_mime: String, verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
@@ -164,8 +129,6 @@ impl WaylandState {
             job_tx: None,
             reader_gate: Arc::new(ReaderGate::new(INGEST_MAX_CONCURRENT_READERS)),
             ingest_stats: Arc::new(IngestStats::default()),
-            byte_budget: Arc::new(ByteBudget::new(INGEST_QUEUE_BYTE_BUDGET)),
-            spooler: None,
             verbose,
             target_mime: Some(target_mime),
             rx_buf: Vec::new(),

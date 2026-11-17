@@ -7,92 +7,29 @@
 //! ingress (`y4p-wayland` -> `y4p-daemon`) and egress (`y4p-daemon` ->
 //! `y4p-wayland`).
 //!
-//! - [`Payload`]: the places bytes can be -- a heap buffer, a streaming
-//!   descriptor ([`StreamDescriptor`]), a file on disk, or a [`SpooledFile`]
-//!   (a payload already drained into a file this value owns and deletes).
+//! - [`Payload`]: the places bytes can be -- a heap buffer or a file on disk.
+//!   ([`SpooledFile`] remains as the owned spool-file handle the storage layer
+//!   still accepts.)
 //! - [`PayloadReader`]: an `enum` implementing [`Read`] over the file- and
 //!   memory-backed variants, so a consumer reads any payload without a
 //!   `Box<dyn Read>` allocation and can still ask for the underlying
-//!   descriptor (for `sendfile(2)`/`splice(2)`).
-//! - [`route_payload`]: the heuristic that separates the in-memory fast path
-//!   from the descriptor path.
+//!   descriptor (for `sendfile(2)`).
+//! - [`route_payload`]: the heuristic that picks a sensible pre-allocation for
+//!   a pipe read.
 //! - [`read_bounded`]: the single "read at most N bytes, never truncate"
 //!   primitive that every materialisation goes through.
 //!
 //! Everything here is `std` only and panic-free; the only descriptor handling
-//! is std's own RAII (`File`/`OwnedFd`), so there is no `unsafe`.
+//! is std's own RAII (`File`), so there is no `unsafe`.
 
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use crate::constants::{DIGEST_LEN, INLINE_PAYLOAD_THRESHOLD_BYTES, PAYLOAD_PREALLOC_CAP_BYTES};
 use crate::utils::is_text_like_mime;
-
-// --- StreamDescriptor ---
-
-/// An owned, readable descriptor (pipe, socket, memfd, ...) with an optional
-/// advisory length.
-///
-/// The descriptor is closed exactly once, when the value is dropped, on every
-/// path (including an early return or an unwinding thread). Internally it is a
-/// `File`: std's own owner of a descriptor, which gives `Read` and `dup(2)`
-/// without any `unsafe` of ours. `into_owned_fd` hands the descriptor back.
-///
-/// `len_hint` is *advisory*: it pre-sizes buffers and feeds [`route_payload`],
-/// but nothing trusts it for correctness -- a reader still stops at its own
-/// limit and at EOF, so a peer that under- or over-states it cannot cause an
-/// over-read or a truncation.
-#[derive(Debug)]
-pub struct StreamDescriptor {
-    file: File,
-    len_hint: Option<u64>,
-}
-
-impl StreamDescriptor {
-    pub fn new(fd: OwnedFd, len_hint: Option<u64>) -> Self {
-        Self { file: File::from(fd), len_hint }
-    }
-
-    pub fn len_hint(&self) -> Option<u64> {
-        self.len_hint
-    }
-
-    /// `dup(2)`s the descriptor. The two share one open file description, so
-    /// for a pipe or socket the clones draw from the *same* stream: a
-    /// consumer-once source, not a replayable one.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self { file: self.file.try_clone()?, len_hint: self.len_hint })
-    }
-
-    pub fn into_owned_fd(self) -> OwnedFd {
-        OwnedFd::from(self.file)
-    }
-
-    pub fn into_file(self) -> File {
-        self.file
-    }
-}
-
-impl AsFd for StreamDescriptor {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
-    }
-}
-
-impl AsRawFd for StreamDescriptor {
-    fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
-    }
-}
-
-impl Read for StreamDescriptor {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
-    }
-}
 
 // --- Payload ---
 
@@ -102,18 +39,9 @@ pub enum Payload {
     /// Fully materialised on the heap. Moving it between threads moves the
     /// `Vec`'s pointer, never its bytes.
     Memory(Vec<u8>),
-    /// Still in flight on a descriptor; nothing has been read yet.
-    Stream(StreamDescriptor),
     /// On disk (the content cache). Opened lazily, by whoever reads it. The
     /// file is borrowed: dropping the payload never touches it.
     File(PathBuf),
-    /// A payload already drained from its pipe into a spool file (see
-    /// [`SpooledFile`]), complete and fingerprinted. Unlike `File`, the file is
-    /// *owned*: it is deleted when the payload is dropped, so a job that is
-    /// shed from a full queue or abandoned by a failing worker leaves nothing
-    /// behind. Boxed to keep `Payload` (and so every queue slot) the size of
-    /// the other variants.
-    Spooled(Box<SpooledFile>),
 }
 
 impl Payload {
@@ -121,15 +49,13 @@ impl Payload {
         Self::Memory(data)
     }
 
-    /// Length in bytes when it is known without any I/O: the buffer's length,
-    /// or the descriptor's advisory hint. A `File` is `None` here -- stating
-    /// it is I/O; [`Payload::into_reader`] reports the real size.
+    /// Length in bytes when it is known without any I/O: the buffer's length.
+    /// A `File` is `None` here -- stating it is I/O; [`Payload::into_reader`]
+    /// reports the real size.
     pub fn len_hint(&self) -> Option<u64> {
         match self {
             Self::Memory(data) => Some(data.len() as u64),
-            Self::Stream(stream) => stream.len_hint(),
             Self::File(_) => None,
-            Self::Spooled(spooled) => Some(spooled.len()),
         }
     }
 
@@ -137,40 +63,28 @@ impl Payload {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Memory(data) => Some(data),
-            Self::Stream(_) | Self::File(_) | Self::Spooled(_) => None,
+            Self::File(_) => None,
         }
     }
 
     /// An independent handle to the same bytes, for a source that is served
-    /// more than once: the buffer is copied, the path is cloned, and a stream
-    /// is `dup(2)`ed (see [`StreamDescriptor::try_clone`] for what that shares).
-    /// A spooled payload owns its file's lifetime, so it cannot be duplicated
-    /// (`ErrorKind::Unsupported`); read it, or hand its path on explicitly.
+    /// more than once: the buffer is copied and the path is cloned.
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(match self {
             Self::Memory(data) => Self::Memory(data.clone()),
-            Self::Stream(stream) => Self::Stream(stream.try_clone()?),
             Self::File(path) => Self::File(path.clone()),
-            Self::Spooled(_) => return Err(io::Error::from(io::ErrorKind::Unsupported)),
         })
     }
 
     /// Opens the payload for reading. Only a `File` can fail here (it is
-    /// opened and stated); the other two are already in hand.
+    /// opened and stated); memory is already in hand.
     pub fn into_reader(self) -> io::Result<PayloadReader> {
         Ok(match self {
             Self::Memory(data) => PayloadReader::Memory(Cursor::new(data)),
-            Self::Stream(stream) => PayloadReader::Stream(stream),
             Self::File(path) => {
                 let file = File::open(&path)?;
                 let len = file.metadata().ok().map(|m| m.len());
                 PayloadReader::File { file, len }
-            }
-            // The open descriptor outlives the unlink that dropping `spooled`
-            // performs, so the reader stays valid and nothing is left on disk.
-            Self::Spooled(spooled) => {
-                let file = File::open(spooled.path())?;
-                PayloadReader::File { file, len: Some(spooled.len()) }
             }
         })
     }
@@ -191,10 +105,6 @@ impl Payload {
                     Ok(data)
                 }
             }
-            Self::Stream(stream) => {
-                let hint = stream.len_hint();
-                read_bounded(stream, limit, hint)
-            }
             Self::File(path) => {
                 let file = File::open(&path)?;
                 let len = file.metadata().ok().map(|m| m.len());
@@ -202,13 +112,6 @@ impl Payload {
                     return Err(PayloadError::TooLarge { limit });
                 }
                 read_bounded(file, limit, len)
-            }
-            Self::Spooled(spooled) => {
-                if spooled.len() > limit {
-                    return Err(PayloadError::TooLarge { limit });
-                }
-                let file = File::open(spooled.path())?;
-                read_bounded(file, limit, Some(spooled.len()))
             }
         }
     }
@@ -219,13 +122,12 @@ impl Payload {
 /// A complete payload on disk in the spool directory, with its fingerprint,
 /// owned by this value: dropping it unlinks the file.
 ///
-/// It is produced by the ingestion thread after it has drained a compositor
-/// pipe with `splice(2)` (see `core::splice`) and consumed by the daemon's
-/// worker, which either adopts the file into the content cache with a
-/// `rename(2)` ([`SpooledFile::into_path`] disarms the unlink) or lets it drop.
-/// Neither the queue nor the worker therefore ever holds the payload's bytes on
-/// the heap, and a payload that is shed, rejected or dropped on error cannot
-/// leak a file.
+/// The ingestion path no longer produces one (every payload is read into
+/// memory under [`MAX_PAYLOAD_BYTES`](crate::constants::MAX_PAYLOAD_BYTES)),
+/// but the storage layer still accepts it (`ClipboardDb::insert_spooled`) and
+/// adopts the file into the content cache with a `rename(2)`
+/// ([`SpooledFile::into_path`] disarms the unlink). Keeping the type public is
+/// what lets that API stay available without a second vocabulary.
 #[derive(Debug)]
 pub struct SpooledFile {
     path: PathBuf,
@@ -298,7 +200,6 @@ pub fn to_hex(bytes: &[u8]) -> String {
 #[derive(Debug)]
 pub enum PayloadReader {
     Memory(Cursor<Vec<u8>>),
-    Stream(StreamDescriptor),
     /// `len` is the size when the file was opened (`None` if it could not be
     /// stated).
     File { file: File, len: Option<u64> },
@@ -310,7 +211,6 @@ impl PayloadReader {
     pub fn fd(&self) -> Option<BorrowedFd<'_>> {
         match self {
             Self::Memory(_) => None,
-            Self::Stream(stream) => Some(stream.as_fd()),
             Self::File { file, .. } => Some(file.as_fd()),
         }
     }
@@ -319,12 +219,10 @@ impl PayloadReader {
         self.fd().map(|fd| fd.as_raw_fd())
     }
 
-    /// Total length when known: the buffer's, the descriptor's hint, or the
-    /// file's size at open.
+    /// Total length when known: the buffer's, or the file's size at open.
     pub fn len_hint(&self) -> Option<u64> {
         match self {
             Self::Memory(cursor) => Some(cursor.get_ref().len() as u64),
-            Self::Stream(stream) => stream.len_hint(),
             Self::File { len, .. } => *len,
         }
     }
@@ -334,7 +232,6 @@ impl Read for PayloadReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Memory(cursor) => cursor.read(buf),
-            Self::Stream(stream) => stream.read(buf),
             Self::File { file, .. } => file.read(buf),
         }
     }
@@ -410,16 +307,16 @@ pub fn read_bounded<R: Read>(reader: R, limit: u64, capacity_hint: Option<u64>) 
 
 // --- Routing ---
 
-/// Which road a payload takes.
+/// How much of a pipe read to reserve up front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadRoute {
-    /// Fast path: read it into a heap buffer.
+    /// Small or text-like: reserve one page, which is almost always enough.
     Inline,
-    /// Slow-and-large path: keep it on a descriptor and let the kernel move it.
+    /// Large or binary: start empty and let the buffer grow.
     Stream,
 }
 
-/// Decides between the in-memory and the descriptor path.
+/// Picks the buffer capacity a bounded pipe read should start with.
 ///
 /// 1. **A length hint decides.** It is the only first-hand evidence: at or
 ///    below `INLINE_PAYLOAD_THRESHOLD_BYTES` is `Inline`, above is `Stream`,
@@ -430,8 +327,8 @@ pub enum PayloadRoute {
 ///    and goes `Stream`.
 ///
 /// Cheap by construction: a comparison when a hint exists, otherwise one
-/// allocation-free MIME scan. It is a *heuristic* -- a wrong guess only picks
-/// the slower of two correct paths, never a wrong result.
+/// allocation-free MIME scan. It is a *heuristic* -- a wrong guess only costs a
+/// different growth pattern, never a wrong result.
 pub fn route_payload(mime: &str, len_hint: Option<u64>) -> PayloadRoute {
     match len_hint {
         Some(len) if len <= INLINE_PAYLOAD_THRESHOLD_BYTES as u64 => PayloadRoute::Inline,
@@ -445,18 +342,8 @@ pub fn route_payload(mime: &str, len_hint: Option<u64>) -> PayloadRoute {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     const LIMIT: u64 = 1024;
-
-    /// A pipe pre-loaded with `bytes` and with its writer closed, so the read
-    /// end yields exactly them and then EOF.
-    fn loaded_stream(bytes: &[u8], hint: Option<u64>) -> StreamDescriptor {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(bytes).unwrap();
-        drop(writer);
-        StreamDescriptor::new(OwnedFd::from(reader), hint)
-    }
 
     fn temp_file(tag: &str, bytes: &[u8]) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -519,62 +406,17 @@ mod tests {
         assert_eq!(read_bounded(&b"x"[..], u64::MAX, None).unwrap(), b"x");
     }
 
-    // --- StreamDescriptor ---
-
-    #[test]
-    fn a_stream_descriptor_reads_what_was_written_and_reports_its_hint() {
-        let mut stream = loaded_stream(b"streamed", Some(8));
-        assert_eq!(stream.len_hint(), Some(8));
-        let mut out = String::new();
-        stream.read_to_string(&mut out).unwrap();
-        assert_eq!(out, "streamed");
-    }
-
-    #[test]
-    fn dropping_a_stream_descriptor_closes_it() {
-        let (reader, writer) = std::io::pipe().unwrap();
-        let stream = StreamDescriptor::new(OwnedFd::from(reader), None);
-        drop(stream);
-        // With the only reader gone, a write to the pipe must report EPIPE.
-        let mut writer = writer;
-        let err = writer.write_all(b"x").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
-    }
-
-    #[test]
-    fn a_cloned_stream_descriptor_keeps_the_pipe_open_until_both_are_dropped() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        let first = StreamDescriptor::new(OwnedFd::from(reader), Some(1));
-        let second = first.try_clone().unwrap();
-        assert_eq!(second.len_hint(), Some(1));
-        drop(first);
-        writer.write_all(b"x").unwrap();
-        drop(second);
-        assert_eq!(writer.write_all(b"y").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-    }
-
-    #[test]
-    fn into_owned_fd_hands_the_same_descriptor_back() {
-        let stream = loaded_stream(b"abc", None);
-        let raw = stream.as_raw_fd();
-        let fd = stream.into_owned_fd();
-        assert_eq!(fd.as_raw_fd(), raw);
-    }
-
     // --- Payload / PayloadReader ---
 
     #[test]
     fn payload_len_hints_need_no_io() {
         assert_eq!(Payload::memory(vec![0; 9]).len_hint(), Some(9));
-        assert_eq!(Payload::Stream(loaded_stream(b"", Some(42))).len_hint(), Some(42));
-        assert_eq!(Payload::Stream(loaded_stream(b"", None)).len_hint(), None);
         assert_eq!(Payload::File(PathBuf::from("/definitely/not/there")).len_hint(), None);
     }
 
     #[test]
     fn as_bytes_is_some_only_for_memory() {
         assert_eq!(Payload::memory(b"hi".to_vec()).as_bytes(), Some(&b"hi"[..]));
-        assert!(Payload::Stream(loaded_stream(b"hi", None)).as_bytes().is_none());
         assert!(Payload::File(PathBuf::from("x")).as_bytes().is_none());
     }
 
@@ -587,14 +429,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_and_file_readers_expose_a_valid_descriptor() {
-        let stream = Payload::Stream(loaded_stream(b"abc", Some(3))).into_reader().unwrap();
-        assert!(stream.raw_fd().is_some_and(|fd| fd >= 0));
-        assert!(stream.fd().is_some());
-
+    fn file_readers_expose_a_valid_descriptor() {
         let path = temp_file("fd", b"file bytes");
         let file = Payload::File(path.clone()).into_reader().unwrap();
         assert!(file.raw_fd().is_some_and(|fd| fd >= 0));
+        assert!(file.fd().is_some());
         assert_eq!(file.len_hint(), Some(10));
         std::fs::remove_file(path).unwrap();
     }
@@ -604,7 +443,6 @@ mod tests {
         let path = temp_file("same", b"same bytes");
         let payloads = [
             Payload::memory(b"same bytes".to_vec()),
-            Payload::Stream(loaded_stream(b"same bytes", None)),
             Payload::File(path.clone()),
         ];
         for payload in payloads {
@@ -642,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_read_bounded_applies_the_same_rules_as_a_stream() {
+    fn memory_read_bounded_applies_the_same_rules_as_a_file() {
         assert!(matches!(Payload::memory(Vec::new()).read_bounded(LIMIT), Err(PayloadError::Empty)));
         assert!(matches!(
             Payload::memory(vec![0; 11]).read_bounded(10),
@@ -652,11 +490,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_read_bounded_enforces_the_limit_even_when_the_hint_lies() {
-        let lying = Payload::Stream(loaded_stream(&[9; 50], Some(3)));
-        assert!(matches!(lying.read_bounded(10), Err(PayloadError::TooLarge { limit: 10 })));
-        let honest = Payload::Stream(loaded_stream(&[9; 5], Some(1_000_000)));
-        assert_eq!(honest.read_bounded(10).unwrap(), vec![9; 5]);
+    fn memory_read_bounded_enforces_the_limit() {
+        let too_big = Payload::memory(vec![9; 50]);
+        assert!(matches!(too_big.read_bounded(10), Err(PayloadError::TooLarge { limit: 10 })));
+        assert_eq!(Payload::memory(vec![9; 5]).read_bounded(10).unwrap(), vec![9; 5]);
     }
 
     #[test]
@@ -711,7 +548,7 @@ mod tests {
         assert_eq!(INLINE_PAYLOAD_THRESHOLD_BYTES, 4096);
     }
 
-    // --- SpooledFile / Payload::Spooled ---
+    // --- SpooledFile (retained for the storage layer) ---
 
     fn spooled(tag: &str, bytes: &[u8]) -> SpooledFile {
         SpooledFile::new(temp_file(tag, bytes), bytes.len() as u64, [0xab; DIGEST_LEN])
@@ -732,46 +569,6 @@ mod tests {
         let path = spool.into_path();
         assert!(path.exists(), "an adopted file must survive the guard");
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn a_spooled_payload_reports_its_length_and_has_no_bytes_in_memory() {
-        let payload = Payload::Spooled(Box::new(spooled("len", b"12345")));
-        assert_eq!(payload.len_hint(), Some(5));
-        assert!(payload.as_bytes().is_none());
-        assert_eq!(payload.try_clone().unwrap_err().kind(), io::ErrorKind::Unsupported);
-    }
-
-    #[test]
-    fn a_spooled_payload_is_materialised_within_the_bound_and_its_file_is_gone_after() {
-        let spool = spooled("read", b"from the spool");
-        let path = spool.path().to_path_buf();
-        let data = Payload::Spooled(Box::new(spool)).read_bounded(LIMIT).unwrap();
-        assert_eq!(data, b"from the spool");
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn a_spooled_payload_over_the_limit_is_refused_from_its_recorded_length() {
-        let payload = Payload::Spooled(Box::new(spooled("big", &[7u8; 64])));
-        assert!(matches!(payload.read_bounded(63), Err(PayloadError::TooLarge { limit: 63 })));
-    }
-
-    #[test]
-    fn a_reader_over_a_spooled_payload_outlives_the_unlink() {
-        let spool = spooled("reader", b"still readable");
-        let path = spool.path().to_path_buf();
-        let mut reader = Payload::Spooled(Box::new(spool)).into_reader().unwrap();
-        assert!(!path.exists(), "the payload was consumed, so its file is unlinked");
-        assert_eq!(reader.len_hint(), Some(14));
-        let mut out = String::new();
-        reader.read_to_string(&mut out).unwrap();
-        assert_eq!(out, "still readable");
-    }
-
-    #[test]
-    fn a_spooled_payload_keeps_the_size_of_the_other_variants() {
-        assert_eq!(std::mem::size_of::<Payload>(), 32, "the boxed variant must not widen every queue slot");
     }
 
     #[test]
