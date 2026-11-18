@@ -72,6 +72,23 @@ impl FileCache {
         }
     }
 
+    /// Total size of the cached payload files (`*.cache`) currently on disk.
+    ///
+    /// Only regular files directly inside the cache directory are counted.
+    /// A missing or unreadable directory, and an entry whose metadata cannot
+    /// be read, contribute zero rather than failing the caller: the quota is a
+    /// best-effort disk bound, never a reason to refuse a clipboard write.
+    pub fn total_bytes(&self) -> u64 {
+        let Ok(entries) = fs::read_dir(&self.cache_dir) else { return 0 };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == CACHE_FILE_EXTENSION))
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
     /// Wipes and recreates the cache directory. Must never be pointed at the
     /// same path as the SQLite data directory (see `ClipboardDb::wipe`) —
     /// this removes the directory wholesale.
@@ -119,6 +136,30 @@ mod tests {
         assert!(cache.store("h1", b"payload").is_err());
         assert!(!cache.path("h1").exists(), "a failed write must not leave a truncated entry");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn total_bytes_sums_only_cache_files() {
+        let root = dir("total");
+        let cache = FileCache::new(root.clone());
+        assert_eq!(cache.total_bytes(), 0, "an empty cache holds nothing");
+
+        cache.store("h1", b"payload").unwrap();
+        cache.store("h2", b"twelve bytes").unwrap();
+        // Neither a non-cache extension nor a directory may be counted.
+        fs::write(root.join("notes.txt"), b"not a cache entry").unwrap();
+        fs::create_dir_all(root.join("sub.cache")).unwrap();
+
+        assert_eq!(cache.total_bytes(), 7 + 12);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn total_bytes_of_a_missing_directory_is_zero() {
+        let root = dir("total-missing");
+        let cache = FileCache::new(root.join("absent"));
+        assert_eq!(cache.total_bytes(), 0, "a cache that was never created costs nothing");
         fs::remove_dir_all(root).unwrap();
     }
 }

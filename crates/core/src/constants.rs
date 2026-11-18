@@ -96,6 +96,12 @@ pub const SPOOL_DIR_NAME: &str = "spool";
 // Extension of a cached binary payload, `<hash>.<extension>`: the one rule
 // `crates/storage` (`FileCache::path`) names cache files by.
 pub const CACHE_FILE_EXTENSION: &str = "cache";
+// Ceiling on the total size of the on-disk payload cache (`<hash>.cache`).
+// History-count rotation alone still admits `max_history * MAX_PAYLOAD_BYTES`
+// of images, so this bounds the cache directory itself: unpinned entries are
+// evicted least-recently-used first until the total fits. 512 MiB leaves room
+// for many 32 MiB images while staying comfortably bounded.
+pub const CACHE_QUOTA_BYTES: u64 = 512 * 1024 * 1024;
 // Width of the payload fingerprint (SHA3-256) in bytes.
 pub const DIGEST_LEN: usize = 32;
 

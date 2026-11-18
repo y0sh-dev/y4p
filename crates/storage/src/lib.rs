@@ -21,7 +21,7 @@ use cache::{Adoption, FileCache};
 use db::SqliteStore;
 use schema::SchemaManager;
 
-use crate::core::constants::SQLITE_TIMEOUT_MS;
+use crate::core::constants::{CACHE_QUOTA_BYTES, SQLITE_TIMEOUT_MS};
 
 /// A single metadata row, shared by `fetch_metadata` and `search_metadata` so
 /// callers (and future callers) don't have to keep re-deriving the same
@@ -130,8 +130,36 @@ impl ClipboardDb {
             return Ok(-1);
         }
         self.cache.remove_many(&outcome.expired_hashes);
+        if cache_class {
+            // Best effort: the row is already committed, so a quota problem must
+            // never turn a successful clipboard write into an error.
+            if let Err(e) = self.enforce_cache_quota(CACHE_QUOTA_BYTES, outcome.real_id) {
+                eprintln!("{}cache quota enforcement failed: {}", crate::core::constants::LOG_ERROR, e);
+            }
+        }
 
         Ok(outcome.real_id)
+    }
+
+    /// Evicts least-recently-used unpinned cache rows until the cache fits
+    /// `quota_bytes`, sparing `keep_id`.
+    ///
+    /// The loop takes the oldest unpinned, cache-backed row
+    /// (`SqliteStore::oldest_unpinned_cache_row`), deletes the row and removes
+    /// its `<hash>.cache`. Pinned rows and `keep_id` are never candidates, so a
+    /// history made only of pinned images may legitimately stay above the
+    /// quota: the bound applies to disposable data, and a pin is never broken
+    /// to satisfy it.
+    fn enforce_cache_quota(&mut self, quota_bytes: u64, keep_id: i64) -> Result<(), String> {
+        while self.cache.total_bytes() > quota_bytes {
+            let Some((id, hash)) = self.store.oldest_unpinned_cache_row(keep_id) else { break };
+            let (deleted, _) = self.store.delete_by_id(id).map_err(|e| e.to_string())?;
+            if !deleted {
+                break;
+            }
+            self.cache.remove(&hash);
+        }
+        Ok(())
     }
 
     /// Search metadata with protection against full BLOB scans.
@@ -347,6 +375,81 @@ mod tests {
 
         assert_eq!(f.db.get_total_count(), 0);
         assert_eq!(f.cache_files(), 0, "a declined image must not be cached");
+    }
+
+    // --- cache quota: LRU eviction of unpinned cache rows ---
+
+    fn insert_image(f: &mut Fixture, bytes: &[u8]) -> i64 {
+        f.db.insert_with_hash("image/png", bytes, &hash_of(bytes), 100).unwrap()
+    }
+
+    #[test]
+    fn the_cache_quota_evicts_the_oldest_unpinned_image_first() {
+        let mut f = Fixture::new("quota-lru");
+        let (a, b, c) = (pattern(10_000, 20), pattern(10_000, 21), pattern(10_000, 22));
+        let id_a = insert_image(&mut f, &a);
+        let id_b = insert_image(&mut f, &b);
+        let id_c = insert_image(&mut f, &c);
+
+        // Directly enforce a one-image quota: the two oldest are disposable.
+        f.db.enforce_cache_quota(10_000, id_c).unwrap();
+
+        assert!(f.db.get_content_by_id(id_a).is_none(), "the oldest image went first");
+        assert!(!f.cache_file(&a).exists(), "its cache file went with it");
+        assert!(f.db.get_content_by_id(id_b).is_none(), "the next-oldest followed");
+        assert!(f.db.get_content_by_id(id_c).is_some(), "the newest is kept");
+        assert!(f.cache_file(&c).exists());
+        assert_eq!(f.cache_files(), 1);
+    }
+
+    #[test]
+    fn recopying_an_image_refreshes_its_lru_position() {
+        let mut f = Fixture::new("quota-recopy");
+        let (a, b, c) = (pattern(10_000, 23), pattern(10_000, 24), pattern(10_000, 25));
+        let id_a = insert_image(&mut f, &a);
+        let id_b = insert_image(&mut f, &b);
+        // A distinct millisecond, so the refreshed timestamp is unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(insert_image(&mut f, &a), id_a, "the copy is a duplicate, not a new row");
+        let id_c = insert_image(&mut f, &c);
+
+        // Room for two images: only the oldest unused one (b) is evicted.
+        f.db.enforce_cache_quota(20_000, id_c).unwrap();
+
+        assert!(f.db.get_content_by_id(id_b).is_none(), "b became the least recently used");
+        assert!(f.db.get_content_by_id(id_a).is_some(), "a's recopy moved it out of the way");
+        assert!(f.db.get_content_by_id(id_c).is_some());
+    }
+
+    #[test]
+    fn the_cache_quota_never_evicts_a_pinned_image() {
+        let mut f = Fixture::new("quota-pin");
+        let (a, b, c) = (pattern(10_000, 26), pattern(10_000, 27), pattern(10_000, 28));
+        let id_a = insert_image(&mut f, &a);
+        f.db.set_pin_by_id(id_a, true).unwrap();
+        let id_b = insert_image(&mut f, &b);
+        let id_c = insert_image(&mut f, &c);
+
+        f.db.enforce_cache_quota(10_000, id_c).unwrap();
+
+        assert!(f.db.get_content_by_id(id_a).is_some(), "a pin is absolute, even over quota");
+        assert!(f.cache_file(&a).exists());
+        assert!(f.db.get_content_by_id(id_b).is_none(), "the oldest unpinned image is the victim");
+        assert!(f.db.get_content_by_id(id_c).is_some(), "keep_id is spared");
+    }
+
+    #[test]
+    fn the_cache_quota_never_evicts_the_row_that_triggered_it() {
+        let mut f = Fixture::new("quota-keep");
+        let (a, b) = (pattern(10_000, 29), pattern(10_000, 30));
+        let id_a = insert_image(&mut f, &a);
+        let id_b = insert_image(&mut f, &b);
+
+        f.db.enforce_cache_quota(0, id_b).unwrap();
+
+        assert!(f.db.get_content_by_id(id_a).is_none(), "everything disposable goes at a zero quota");
+        assert!(f.db.get_content_by_id(id_b).is_some(), "keep_id survives even a zero quota");
+        assert!(f.cache_file(&b).exists());
     }
 
     // --- insert_with_hash: the cache write precedes the row ---
