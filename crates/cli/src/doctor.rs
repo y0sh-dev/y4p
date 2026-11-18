@@ -166,22 +166,36 @@ fn environment_checks() -> Vec<Check> {
     checks.push(Check::pass(
         "environment",
         format!(
-            "{} ({}, max_history={}, drop_rtf={})",
+            "{} ({}, max_history={}, drop_rtf={}, sanitize={})",
             config_path.display(),
             if config_path.is_file() { "loaded" } else { "absent; defaults in use" },
             config.general.max_history,
             config.mime.drop_rtf,
+            config.should_sanitize_images(),
         ),
     ));
 
+    let sanitize = config.should_sanitize_images();
     match std::process::Command::new(MAGICK_PROGRAM).arg("-version").output() {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             let first = version.lines().next().unwrap_or(MAGICK_PROGRAM);
             checks.push(Check::pass("environment", first.to_owned()));
         }
-        Ok(_) => checks.push(Check::warn("environment", "`magick -version` exited non-zero; images are stored unmodified")),
-        Err(_) => checks.push(Check::warn("environment", "`magick` is not installed; images are stored unmodified")),
+        Ok(_) if sanitize => {
+            checks.push(Check::warn("environment", "`magick -version` exited non-zero; images are stored unmodified"))
+        }
+        Ok(_) => checks.push(Check::pass(
+            "environment",
+            "`magick -version` exited non-zero (not required; [image] sanitize = false)",
+        )),
+        Err(_) if sanitize => {
+            checks.push(Check::warn("environment", "`magick` is not installed; images are stored unmodified"))
+        }
+        Err(_) => checks.push(Check::pass(
+            "environment",
+            "`magick` is not installed (not required; [image] sanitize = false)",
+        )),
     }
 
     checks
