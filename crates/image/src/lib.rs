@@ -9,12 +9,6 @@
 //! Layering: depends only on `std` and `core`; nothing here knows about
 //! SQLite, Wayland or the daemon, so any layer may adopt it later.
 
-// Only ingestion (`route::route_for_ingest`) consumes this module so far;
-// parts of the public surface (e.g. PNG output, egress-side conversion) are
-// exercised by the unit tests only until later v0.5.x milestones adopt them,
-// so `dead_code` is allowed module-wide rather than sprinkled per item.
-#![allow(dead_code)]
-
 // Aliased to `core` so the `crate::core::...` paths in the modules below
 // resolve exactly as they did inside the monolith (import resolution only).
 use y4p_core as core;
