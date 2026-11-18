@@ -141,7 +141,7 @@ mod tests {
             db.insert_raw("text/plain", row).unwrap();
         }
         let listener = UnixListener::bind(store.socket_path()).unwrap();
-        let worker = DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100);
+        let worker = DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false);
         (listener, worker)
     }
 

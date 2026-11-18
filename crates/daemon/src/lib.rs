@@ -154,10 +154,11 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> DaemonExit {
 
     let metrics = Arc::new(DaemonMetrics::new());
     let max_history = crate::core::get_max_history();
-    let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history);
-
-    // Active configuration loaded once at startup and shared read-only across handlers.
+    // Active configuration loaded once at startup and shared read-only across
+    // handlers. Loaded before the worker so ingestion can be told whether
+    // image sanitisation is enabled.
     let config = Arc::new(crate::core::config::Config::load());
+    let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history, config.should_sanitize_images());
 
     let Some((conn, mut event_queue)) = wayland::create_connection() else {
         eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);

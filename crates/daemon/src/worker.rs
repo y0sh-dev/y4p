@@ -15,10 +15,11 @@ use std::sync::{mpsc, Arc, Mutex};
 /// persistence goes through this one channel, so SQLite only ever sees one
 /// writer.
 ///
-/// Image transcoding and fingerprinting happen on this thread too (see
-/// `process_job`): the Wayland layer hands over normalised raw payloads and
-/// never blocks on `magick`. Jobs are therefore also persisted strictly in
-/// arrival order.
+/// Fingerprinting happens on this thread too (see `process_job`): the Wayland
+/// layer hands over normalised raw payloads and never blocks on `magick`.
+/// Image sanitisation is opt-in (`[image] sanitize = true`); when it is off,
+/// the raw bytes are stored unchanged and no converter runs. Jobs are therefore
+/// also persisted strictly in arrival order.
 ///
 /// A job's payload is materialised on this thread, just before `process_job`,
 /// by `ClipboardJob::into_bytes` under the same `MAX_PAYLOAD_BYTES` bound as
@@ -43,7 +44,7 @@ pub struct DbWorker {
 }
 
 impl DbWorker {
-    pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize) -> Self {
+    pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize, sanitize_images: bool) -> Self {
         let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
         let db = Arc::new(Mutex::new(db));
         let writer = Arc::clone(&db);
@@ -52,7 +53,7 @@ impl DbWorker {
             while let Ok(job) = rx.recv() {
                 let ClipboardJob { mime, payload } = job;
                 let stored = match writer.lock() {
-                    Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history),
+                    Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history, sanitize_images),
                     // Only reachable if a writer panicked mid-transaction. The
                     // job is dropped rather than the worker stopped, exactly as
                     // an unstorable payload is.
@@ -105,11 +106,12 @@ impl DbWorker {
 /// What was saved: the MIME it was recorded under and its size in bytes.
 type Saved = (String, usize);
 
-/// The in-memory road: materialise, route through the image pipeline, hash,
-/// insert. `Ok(None)` means the payload could not be materialised (logged).
-fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usize) -> Result<Option<Saved>, String> {
+/// The in-memory road: materialise, optionally route through the image
+/// pipeline, hash, insert. `Ok(None)` means the payload could not be
+/// materialised (logged).
+fn store_materialised(db: &mut ClipboardDb, job: ClipboardJob, max_history: usize, sanitize_images: bool) -> Result<Option<Saved>, String> {
     let Some((mime, data)) = materialise(job) else { return Ok(None) };
-    let (mime, data, hash) = process_job(mime, data);
+    let (mime, data, hash) = process_job(mime, data, sanitize_images);
     db.insert_with_hash(&mime, &data, &hash, max_history)?;
     Ok(Some((mime, data.len())))
 }
@@ -126,21 +128,28 @@ fn materialise(job: ClipboardJob) -> Option<(String, Vec<u8>)> {
     }
 }
 
-/// Turns a normalised raw payload into what will actually be persisted, in a
-/// fixed order: route through the image pipeline, then hash.
+/// Turns a normalised raw payload into what will actually be persisted:
+/// optionally route through the image pipeline, then hash.
 ///
-/// The order matters. Raster images are privacy-stripped and re-encoded by
-/// `image::route::route_for_ingest`, which may change both the MIME and every
-/// byte; the fingerprint must describe what the database and the cache file
-/// really store, so it is computed last, over the final bytes. (Hashing
-/// earlier would key the row by bytes that are never saved, and the same
-/// image copied twice would still dedupe only by accident.) Routing falls
-/// back to the untouched original on any failure, so the hash then covers
-/// the original instead — consistent either way.
+/// When `sanitize_images` is set, raster images are privacy-stripped and
+/// re-encoded by `image::route::route_for_ingest`, which may change both the
+/// MIME and every byte; the fingerprint must describe what the database and
+/// the cache file really store, so it is computed last, over the final bytes.
+/// (Hashing earlier would key the row by bytes that are never saved, and the
+/// same image copied twice would still dedupe only by accident.) Routing falls
+/// back to the untouched original on any failure, so the hash then covers the
+/// original instead — consistent either way.
+///
+/// When it is off (the default), the raw bytes are persisted exactly as they
+/// arrived: no converter is spawned and the hash keys those bytes.
 ///
 /// Returns `(mime, data, hash)`.
-fn process_job(mime: String, data: Vec<u8>) -> (String, Vec<u8>, String) {
-    let (mime, data) = crate::image::route::route_for_ingest(mime, data);
+fn process_job(mime: String, data: Vec<u8>, sanitize_images: bool) -> (String, Vec<u8>, String) {
+    let (mime, data) = if sanitize_images {
+        crate::image::route::route_for_ingest(mime, data)
+    } else {
+        (mime, data)
+    };
     let hash = fingerprint(&data);
     (mime, data, hash)
 }
@@ -224,16 +233,26 @@ mod tests {
     #[test]
     fn process_job_plain_text_is_unchanged_and_hashed_as_is() {
         let raw = b"hello clipboard".to_vec();
-        let (mime, data, hash) = process_job("text/plain".to_string(), raw.clone());
+        let (mime, data, hash) = process_job("text/plain".to_string(), raw.clone(), true);
         assert_eq!(mime, "text/plain");
         assert_eq!(data, raw);
         assert_eq!(hash, fingerprint(&raw));
     }
 
     #[test]
+    fn process_job_with_sanitisation_off_stores_a_raster_image_byte_for_byte() {
+        if !magick_available() { return; }
+        let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
+        let (mime, data, hash) = process_job("image/png".to_string(), png.clone(), false);
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, png, "sanitisation is off: no byte may change");
+        assert_eq!(hash, fingerprint(&png), "the hash keys the raw bytes");
+    }
+
+    #[test]
     fn process_job_svg_bypasses_the_image_pipeline_unchanged() {
         let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"5\" height=\"5\"/>".to_vec();
-        let (mime, data, hash) = process_job("image/svg+xml".to_string(), svg.clone());
+        let (mime, data, hash) = process_job("image/svg+xml".to_string(), svg.clone(), true);
         assert_eq!(mime, "image/svg+xml");
         assert_eq!(data, svg);
         assert_eq!(hash, fingerprint(&svg));
@@ -243,7 +262,7 @@ mod tests {
     fn process_job_uri_list_bypasses_image_routing_and_is_hashed() {
         // Already normalised upstream: one path per line. A path that merely
         // *names* a PNG is still text and must never reach the transcoder.
-        let (mime, data, hash) = process_job(MIME_URI_LIST.to_string(), b"/a.png".to_vec());
+        let (mime, data, hash) = process_job(MIME_URI_LIST.to_string(), b"/a.png".to_vec(), true);
         assert_eq!(mime, MIME_URI_LIST);
         assert_eq!(data, b"/a.png".to_vec());
         assert_eq!(hash, fingerprint(b"/a.png"));
@@ -253,7 +272,7 @@ mod tests {
     fn process_job_png_is_rewritten_as_png_and_the_hash_covers_the_converted_bytes() {
         if !magick_available() { return; }
         let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
-        let (mime, data, hash) = process_job("image/png".to_string(), png.clone());
+        let (mime, data, hash) = process_job("image/png".to_string(), png.clone(), true);
         assert_eq!(mime, "image/png");
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
         assert_ne!(data, png, "the stored bytes are the stripped re-encode, not the original");
@@ -265,8 +284,8 @@ mod tests {
     fn process_job_same_image_copied_twice_yields_the_same_fingerprint() {
         if !magick_available() { return; }
         let png = generated(&["-size", "32x32", "plasma:fractal", "-depth", "8", "png:-"]);
-        let (_, _, first) = process_job("image/png".to_string(), png.clone());
-        let (_, _, second) = process_job("image/png".to_string(), png);
+        let (_, _, first) = process_job("image/png".to_string(), png.clone(), true);
+        let (_, _, second) = process_job("image/png".to_string(), png, true);
         assert_eq!(first, second, "deduplication relies on a deterministic conversion");
     }
 
@@ -275,7 +294,7 @@ mod tests {
         if !magick_available() { return; }
         let mut corrupt = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         corrupt.extend_from_slice(&[0xA5; 2048]);
-        let (mime, data, hash) = process_job("image/png".to_string(), corrupt.clone());
+        let (mime, data, hash) = process_job("image/png".to_string(), corrupt.clone(), true);
         assert_eq!(mime, "image/png");
         assert_eq!(data, corrupt);
         assert_eq!(hash, fingerprint(&corrupt));
@@ -285,7 +304,7 @@ mod tests {
     fn process_job_mislabelled_image_is_reidentified_before_routing() {
         if !magick_available() { return; }
         let png = generated(&["-size", "16x16", "xc:red", "png:-"]);
-        let (mime, data, _) = process_job("application/octet-stream".to_string(), png.clone());
+        let (mime, data, _) = process_job("application/octet-stream".to_string(), png.clone(), true);
         assert_eq!(mime, "image/png", "an unlabelled image must leave as a PNG");
         assert_ne!(data, png, "...and only the converter's output carries that label");
     }
@@ -297,7 +316,7 @@ mod tests {
         let jpeg = generated(&["-size", "16x16", "plasma:fractal", "jpg:-"]);
         let webp = generated(&["-size", "16x16", "plasma:fractal", "webp:-"]);
         for (label, mime, payload) in [("png", "image/png", png), ("jpeg", "image/jpeg", jpeg), ("webp", "image/webp", webp)] {
-            let (out_mime, data, hash) = process_job(mime.to_string(), payload);
+            let (out_mime, data, hash) = process_job(mime.to_string(), payload, true);
             assert_eq!(out_mime, "image/png", "{label}");
             assert_eq!(&data[..4], b"\x89PNG", "{label}");
             assert_eq!(hash, fingerprint(&data), "{label}");
@@ -307,7 +326,7 @@ mod tests {
     #[test]
     fn process_job_gif_keeps_its_bytes_and_mime_so_animation_survives() {
         let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
-        let (mime, data, hash) = process_job("image/gif".to_string(), gif.clone());
+        let (mime, data, hash) = process_job("image/gif".to_string(), gif.clone(), true);
         assert_eq!(mime, "image/gif");
         assert_eq!(data, gif);
         assert_eq!(hash, fingerprint(&gif));
@@ -320,7 +339,7 @@ mod tests {
         webp[8..12].copy_from_slice(b"WEBP");
         webp[12..16].copy_from_slice(b"VP8X");
         webp[20] = 0x02; // Animation flag
-        let (mime, data, hash) = process_job("image/webp".to_string(), webp.clone());
+        let (mime, data, hash) = process_job("image/webp".to_string(), webp.clone(), true);
         assert_eq!(mime, "image/webp");
         assert_eq!(data, webp);
         assert_eq!(hash, fingerprint(&webp));
@@ -337,7 +356,7 @@ mod tests {
         for payload in seed {
             db.insert_raw("text/plain", payload).unwrap();
         }
-        DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100)
+        DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false)
     }
 
     #[test]
@@ -373,7 +392,7 @@ mod tests {
     fn a_queued_job_and_a_mutation_never_interleave_on_the_connection() {
         let store = PrivateStore::new("worker-serialised");
         let metrics = Arc::new(DaemonMetrics::new());
-        let worker = DbWorker::spawn(store.open(), Arc::clone(&metrics), false, 100);
+        let worker = DbWorker::spawn(store.open(), Arc::clone(&metrics), false, 100, false);
         let tx = worker.sender();
 
         // The store is empty, so the queued payload will be row 1. Deleting it
