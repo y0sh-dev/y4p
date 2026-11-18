@@ -477,6 +477,30 @@ impl SqliteStore {
         Ok(affected > 0)
     }
 
+    /// The oldest unpinned row whose bytes live in `<hash>.cache`, excluding
+    /// `keep_id`: the least-recently-used candidate for the cache quota.
+    ///
+    /// Only `is_pinned = 0 AND content IS NULL AND is_chunked = 0` rows are
+    /// candidates: inline rows and legacy chunked rows keep their bytes in
+    /// SQLite, so evicting their cache file would reclaim nothing. `keep_id`
+    /// is the row just written and is always spared; a re-copied payload has
+    /// had its `timestamp` refreshed (see `upsert`), so it naturally sorts
+    /// later in this ordering.
+    pub fn oldest_unpinned_cache_row(&self, keep_id: i64) -> Option<(i64, String)> {
+        self.conn.query_row(
+            "SELECT id, hash FROM clipboard
+             WHERE is_pinned = 0
+               AND content IS NULL
+               AND is_chunked = 0
+               AND hash IS NOT NULL
+               AND id != ?1
+             ORDER BY timestamp ASC, id ASC
+             LIMIT 1",
+            params![keep_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok()
+    }
+
     pub fn get_total_count(&self) -> usize {
         self.conn.query_row(
             "SELECT COUNT(*) FROM clipboard",
@@ -890,6 +914,47 @@ mod tests {
     fn set_pinned_on_missing_id_returns_false() {
         let mut store = test_store();
         assert!(!store.set_pinned(999_999, true).unwrap());
+    }
+
+    // --- oldest_unpinned_cache_row: the cache quota's LRU candidate ---
+
+    #[test]
+    fn oldest_unpinned_cache_row_is_none_without_cache_rows() {
+        let mut store = test_store();
+        store.upsert_record("text/plain", b"inline", "h-text", 100).unwrap();
+        assert_eq!(store.oldest_unpinned_cache_row(-1), None);
+    }
+
+    #[test]
+    fn oldest_unpinned_cache_row_is_the_oldest_by_timestamp_then_id() {
+        let mut store = test_store();
+        let a = store.upsert_record("image/png", &noise(1_000, 1), "h-a", 100).unwrap().real_id;
+        let b = store.upsert_record("image/png", &noise(1_000, 2), "h-b", 100).unwrap().real_id;
+        set_timestamp(&mut store, "h-a", 100);
+        set_timestamp(&mut store, "h-b", 200);
+
+        assert_eq!(store.oldest_unpinned_cache_row(-1), Some((a, "h-a".to_owned())));
+        assert_eq!(store.oldest_unpinned_cache_row(a), Some((b, "h-b".to_owned())), "keep_id is excluded");
+    }
+
+    #[test]
+    fn oldest_unpinned_cache_row_skips_pinned_rows_and_ignores_legacy_chunks() {
+        let mut store = test_store();
+        let pinned = store.upsert_record("image/png", &noise(1_000, 3), "h-pin", 100).unwrap().real_id;
+        set_timestamp(&mut store, "h-pin", 100);
+        store.set_pinned(pinned, true).unwrap();
+
+        let inline = store.upsert_record("text/plain", b"inline", "h-inline", 100).unwrap().real_id;
+        set_timestamp(&mut store, "h-inline", 110);
+        let chunked = insert_legacy_chunked(&mut store, "application/octet-stream", &noise(100_000, 4), "h-chunked", 120);
+        let cache = store.upsert_record("image/png", &noise(1_000, 5), "h-cache", 100).unwrap().real_id;
+        set_timestamp(&mut store, "h-cache", 130);
+
+        assert_eq!(
+            store.oldest_unpinned_cache_row(-1),
+            Some((cache, "h-cache".to_owned())),
+            "the inline row {inline} and the legacy chunked row {chunked} hold no cache file",
+        );
     }
 
     // --- inline storage: whole-payload writes ---
