@@ -24,3 +24,12 @@ max_history = 256
 # `y4p paste-from text/rtf`) is always honoured.
 # Default: true
 drop_rtf = true
+
+[image]
+# Sanitise raster images on ingestion by re-encoding them through
+# ImageMagick: metadata (EXIF, ICC, comments) is stripped and the image is
+# stored as a deterministic lossless PNG. Disabled by default, in which case
+# the raw clipboard bytes are stored untouched and no external converter is
+# needed at run time.
+# Default: false
+sanitize = false

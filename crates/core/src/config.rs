@@ -37,9 +37,16 @@ impl Default for MimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+pub struct ImageConfig {
+    /// Off by default: store raw image bytes and require no converter.
+    pub sanitize: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Config {
     pub general: GeneralConfig,
     pub mime: MimeConfig,
+    pub image: ImageConfig,
 }
 
 impl Config {
@@ -89,6 +96,13 @@ impl Config {
 
     pub fn should_drop_rtf(&self) -> bool {
         self.mime.drop_rtf
+    }
+
+    /// Whether ingestion should re-encode raster images through ImageMagick to
+    /// strip metadata. Off by default: the raw bytes are stored untouched and
+    /// no external converter is needed at run time.
+    pub fn should_sanitize_images(&self) -> bool {
+        self.image.sanitize
     }
 }
 
@@ -153,6 +167,9 @@ fn apply_kv(config: &mut Config, section: &str, key: &str, value: &str) {
         ("mime", "drop_rtf") => {
             if let Some(b) = parse_bool(value) { config.mime.drop_rtf = b; }
         }
+        ("image", "sanitize") => {
+            if let Some(b) = parse_bool(value) { config.image.sanitize = b; }
+        }
         _ => {}
     }
 }
@@ -189,6 +206,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.general.max_history, DEFAULT_MAX_HISTORY);
         assert!(config.mime.drop_rtf);
+        assert!(!config.image.sanitize, "image sanitisation is opt-in");
     }
 
     // --- Config::parse: the full agreed schema ---
@@ -201,11 +219,15 @@ mod tests {
 
             [mime]
             drop_rtf = true
+
+            [image]
+            sanitize = true
         "#;
 
         let config = Config::parse(toml);
         assert_eq!(config.general.max_history, 1000);
         assert!(config.mime.drop_rtf);
+        assert!(config.image.sanitize);
     }
 
     #[test]
@@ -251,6 +273,7 @@ mod tests {
         // Boolean key given a non-boolean value: default retained.
         let toml = "[mime]\ndrop_rtf = maybe";
         assert!(Config::parse(toml).mime.drop_rtf);
+        assert!(!Config::parse("[image]\nsanitize = perhaps").image.sanitize);
     }
 
     #[test]
@@ -278,6 +301,19 @@ mod tests {
         assert!(Config::default().should_drop_rtf());
         let config = Config { mime: MimeConfig { drop_rtf: false }, ..Default::default() };
         assert!(!config.should_drop_rtf());
+    }
+
+    #[test]
+    fn should_sanitize_images_mirrors_the_image_config_field() {
+        assert!(!Config::default().should_sanitize_images());
+        let config = Config { image: ImageConfig { sanitize: true }, ..Default::default() };
+        assert!(config.should_sanitize_images());
+    }
+
+    #[test]
+    fn parse_image_sanitize_false_keeps_it_off() {
+        assert!(!Config::parse("[image]\nsanitize = false").should_sanitize_images());
+        assert!(Config::parse("[image]\nsanitize = true").should_sanitize_images());
     }
 
     // --- Config::load: safe fallback ---
