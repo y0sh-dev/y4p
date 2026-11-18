@@ -12,19 +12,16 @@
 //! through clipboard-controlled data.
 
 use std::borrow::Cow;
-use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
 use std::time::Duration;
 
 use crate::core::constants::{
     IMAGE_LIMIT_DISK, IMAGE_LIMIT_HEIGHT_PX, IMAGE_LIMIT_MAP, IMAGE_LIMIT_MEMORY,
     IMAGE_LIMIT_TIME_SECS, IMAGE_LIMIT_WIDTH_PX, IMAGE_TRANSCODE_TIMEOUT_SECS,
 };
-use crate::core::splice::ByteTap;
 use crate::core::utils::{detect_image_mime, mime_base};
 use crate::magick;
-use crate::pipeline::{FileSink, PipelineError, Transfer};
+use crate::pipeline::{PipelineError, Transfer};
 
 /// Raster formats accepted as *input*. The decoder is pinned explicitly
 /// (`png:-`) instead of letting ImageMagick sniff the stream: auto-detection
@@ -224,54 +221,6 @@ where
     let args = job.args();
     let refs: Vec<&str> = args.iter().map(|arg| &**arg).collect();
     magick::run_with_timeout(&refs, input, output, Duration::from_secs(IMAGE_TRANSCODE_TIMEOUT_SECS))
-}
-
-/// [`transcode`] descriptor to descriptor: `magick` reads `input` directly as
-/// its stdin and its output is spliced into `output` (at most `limit` bytes),
-/// with `tap` seeing every output byte once, in order, as it passes (the
-/// fingerprint of what is stored). No payload byte touches this process's heap;
-/// see [`crate::pipeline::run_filter_file_in_env`] for the mechanics, the
-/// fallbacks and the failure semantics.
-///
-/// Unlike [`transcode`], success is checked here: the first bytes of `output`
-/// must carry the signature of `job.output`. A converter that exits 0 having
-/// written nothing, or something else, ends as [`PipelineError::Failed`] (a
-/// converter fault, like a crash), because the caller has no buffer to inspect
-/// and would otherwise have to re-read the file to find out. For that check
-/// `output` must have been opened for reading as well as writing; a file that
-/// cannot be read back ends as [`PipelineError::Sink`].
-///
-/// On `Err`, `output` may hold partial bytes and must be discarded.
-pub fn transcode_file<T: ByteTap>(
-    job: Transcode,
-    input: File,
-    output: &mut File,
-    limit: u64,
-    tap: &mut T,
-) -> Result<Transfer, PipelineError> {
-    let args = job.args();
-    let refs: Vec<&str> = args.iter().map(|arg| &**arg).collect();
-    let sink = FileSink { file: &mut *output, limit, tap };
-    let transfer = magick::run_file_with_timeout(&refs, input, sink, Duration::from_secs(IMAGE_TRANSCODE_TIMEOUT_SECS))?;
-    check_signature(job.output, output)?;
-    Ok(transfer)
-}
-
-/// Signature bytes inspected by [`check_signature`]; binary image signatures
-/// fit in 12 (see `detect_image_mime`), the rest is slack.
-const SIGNATURE_PROBE_BYTES: usize = 32;
-
-/// Whether the first bytes of `file` identify an image of `target`'s type.
-fn check_signature(target: OutputFormat, file: &File) -> Result<(), PipelineError> {
-    let mut head = [0u8; SIGNATURE_PROBE_BYTES];
-    let read = file.read_at(&mut head, 0).map_err(PipelineError::Sink)?;
-    if read > 0 && detect_image_mime(&head[..read]) == Some(target.mime()) {
-        return Ok(());
-    }
-    Err(PipelineError::Failed {
-        code: Some(0),
-        stderr: format!("converter exited successfully but its output is not a {} image", target.mime()),
-    })
 }
 
 #[cfg(test)]
@@ -729,132 +678,4 @@ mod tests {
         assert!(first == later, "the conversion depends on the time of day");
     }
 
-    // --- descriptor to descriptor: `transcode_file` ---
-
-    /// A file under `target/` removed on drop (no temp-dir crate).
-    struct TempFile(std::path::PathBuf);
-
-    impl TempFile {
-        fn new(tag: &str) -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("transcode-file-test-tmp");
-            std::fs::create_dir_all(&dir).unwrap();
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self(dir.join(format!("{}-{id}-{tag}", std::process::id())))
-        }
-
-        fn with(tag: &str, bytes: &[u8]) -> Self {
-            let file = Self::new(tag);
-            std::fs::write(&file.0, bytes).unwrap();
-            file
-        }
-
-        /// A fresh handle open for reading and writing, as the converter's sink needs.
-        fn open_rw(&self) -> File {
-            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&self.0).unwrap()
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    #[derive(Default)]
-    struct Collect(Vec<u8>);
-
-    impl ByteTap for Collect {
-        fn update(&mut self, chunk: &[u8]) {
-            self.0.extend_from_slice(chunk);
-        }
-    }
-
-    /// Runs `transcode_file` from `input` bytes; returns the result, the stored
-    /// bytes and what the tap saw.
-    fn run_file_job(job: Transcode, input: &[u8], limit: u64) -> (Result<Transfer, PipelineError>, Vec<u8>, Vec<u8>) {
-        let source = TempFile::with("in", input);
-        let sink = TempFile::new("out");
-        let mut output = sink.open_rw();
-        let mut tap = Collect::default();
-        let result = transcode_file(job, File::open(&source.0).unwrap(), &mut output, limit, &mut tap);
-        (result, std::fs::read(&sink.0).unwrap(), tap.0)
-    }
-
-    #[test]
-    fn the_descriptor_road_produces_exactly_the_bytes_of_the_buffered_road() {
-        // Same arguments, same decoder: only the plumbing differs, so the output
-        // (and with it the fingerprint that keys deduplication) must be identical.
-        if !magick_or_skip() { return; }
-        let png = generate(&["-size", "96x64", "plasma:fractal", "-depth", "8", "-set", "comment", SECRET, "png:-"]);
-        let jpeg = generate(&["-size", "96x64", "plasma:fractal", "jpg:-"]);
-        let webp = generate(&["-size", "96x64", "plasma:fractal", "webp:-"]);
-        let bmp = generate(&["-size", "96x64", "plasma:fractal", "bmp:-"]);
-        for (input, source) in [(InputFormat::Png, png), (InputFormat::Jpeg, jpeg), (InputFormat::Webp, webp), (InputFormat::Bmp, bmp)] {
-            let job = Transcode { input, output: OutputFormat::Png };
-            let (buffered, expected) = run_job(job, source.clone());
-            buffered.unwrap();
-
-            let (result, stored, seen) = run_file_job(job, &source, 64 << 20);
-            let transfer = result.unwrap();
-            assert!(stored == expected, "{input:?}: the two roads disagree");
-            assert!(seen == expected, "{input:?}: the tap must have seen the stored bytes");
-            assert_eq!(transfer.bytes_in, source.len() as u64, "{input:?}");
-            assert_eq!(transfer.bytes_out, expected.len() as u64, "{input:?}");
-        }
-    }
-
-    const SECRET: &str = "SECRETCOMMENT";
-
-    #[test]
-    fn the_descriptor_road_strips_metadata_like_the_buffered_road() {
-        if !magick_or_skip() { return; }
-        let source = png_with_text_metadata();
-        assert!(contains(&source, MARKER_COMMENT), "fixture must carry the metadata");
-        let (result, stored, _) = run_file_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, &source, 64 << 20);
-        result.unwrap();
-        assert!(!contains(&stored, MARKER_COMMENT));
-    }
-
-    #[test]
-    fn undecodable_files_fail_cleanly_on_the_descriptor_road() {
-        if !magick_or_skip() { return; }
-        let png = generate(&["-size", "128x128", "plasma:fractal", "-depth", "8", "png:-"]);
-        let truncated = png[..png.len() / 2].to_vec();
-        for input in [Vec::new(), b"definitely not an image".to_vec(), truncated, vec![0xA5u8; 4 * 1024 * 1024]] {
-            let (result, _, _) = run_file_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, &input, 64 << 20);
-            assert!(matches!(result, Err(PipelineError::Failed { .. })), "{result:?}");
-        }
-    }
-
-    #[test]
-    fn an_output_over_the_limit_is_a_sink_error_not_a_truncated_image() {
-        if !magick_or_skip() { return; }
-        let source = generate(&["-size", "64x64", "plasma:fractal", "-depth", "8", "png:-"]);
-        let (result, stored, _) = run_file_job(Transcode { input: InputFormat::Png, output: OutputFormat::Png }, &source, 100);
-        assert!(matches!(result, Err(PipelineError::Sink(_))), "{result:?}");
-        assert!(stored.len() <= 101);
-    }
-
-    #[test]
-    fn the_signature_check_accepts_only_the_promised_type() {
-        let file = TempFile::new("signature");
-        let reader = || File::open(&file.0).unwrap();
-        std::fs::write(&file.0, b"definitely not a png").unwrap();
-        assert!(matches!(check_signature(OutputFormat::Png, &reader()), Err(PipelineError::Failed { code: Some(0), .. })));
-        std::fs::write(&file.0, b"\x89PNG\r\n\x1a\nrest").unwrap();
-        assert!(check_signature(OutputFormat::Png, &reader()).is_ok());
-        // A valid image of another kind is still not what was promised.
-        std::fs::write(&file.0, b"RIFF\x24\x00\x00\x00WEBPVP8 ").unwrap();
-        assert!(check_signature(OutputFormat::Png, &reader()).is_err());
-        std::fs::write(&file.0, b"").unwrap();
-        assert!(matches!(check_signature(OutputFormat::Png, &reader()), Err(PipelineError::Failed { .. })), "an empty output is not an image");
-    }
-
-    #[test]
-    fn a_sink_that_cannot_be_read_back_is_reported_as_a_sink_error() {
-        let file = TempFile::new("writeonly");
-        let writer = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&file.0).unwrap();
-        assert!(matches!(check_signature(OutputFormat::Png, &writer), Err(PipelineError::Sink(_))));
-    }
 }

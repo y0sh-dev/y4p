@@ -73,30 +73,10 @@ fn classify(mime: &str, payload: &[u8]) -> Option<InputFormat> {
     }
 }
 
-/// Whether [`route_with`] would hand a payload with this MIME and these leading
-/// bytes to the converter, decided from the first bytes alone.
-///
-/// A payload that was streamed to disk instead of into memory (see
-/// `y4p-daemon`'s `spool` module) is only worth reading back into memory when
-/// this is `true`; otherwise it is stored exactly as it arrived and its bytes
-/// never need to enter the heap. `head` must hold at least the first
-/// `SNIFF_HEAD_BYTES` bytes of the payload (or all of it, when shorter), which
-/// also covers the 21 bytes the animated-WebP check inspects and the PNG chunk
-/// headers the animated-PNG check walks.
-///
-/// This is the *classification* half of `route_with`, factored so the two
-/// cannot disagree about what a converter would touch. Whether a conversion then
-/// actually runs still depends on the breaker and the throttle (an open circuit
-/// returns the original), which is why a `true` here means "might convert".
-pub fn wants_transcode(mime: &str, head: &[u8]) -> bool {
-    plan(mime, head).is_some()
-}
-
 /// The conversion a payload with this MIME and these leading bytes is due, or
 /// `None` when it is stored untouched (nothing to convert, a format the policy
 /// leaves alone, or an animation that a transcode would flatten). The single
-/// source of that decision for every road: [`route_with`] (in-memory),
-/// [`route_file_with`] (file-backed) and [`wants_transcode`] all ask it.
+/// source of that decision: [`route_with`] asks it.
 fn plan(mime: &str, head: &[u8]) -> Option<Transcode> {
     // Nothing to convert (ingestion already rejects empty reads; this keeps
     // the function safe on its own): never spawn a process for zero bytes.
@@ -183,53 +163,8 @@ where
     }
 }
 
-/// What a payload that lives in a file is routed to: see [`route_file_with`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum FileRoute<T> {
-    /// Stored as it is: nothing to convert, or a conversion that was skipped
-    /// (open circuit, no free slot) or failed. The caller keeps its file.
-    Original,
-    /// Converted: the new MIME and whatever the converter produced (a spool
-    /// file, in the daemon). The caller's original file is now surplus.
-    Converted { mime: &'static str, output: T },
-}
-
-/// [`route_with`] for a payload that was streamed to a file instead of into
-/// memory: it decides from the first bytes (`head`, as for [`wants_transcode`])
-/// and never reads the rest. The converter is injected, as there, so every
-/// branch is deterministic to test; the real one is [`route_file_for_ingest`].
-///
-/// `convert` is handed the job and must produce the converted artefact `T`, or
-/// fail. It is responsible for judging the result usable (the real converter,
-/// [`crate::transcode::transcode_file`], checks the signature of what it wrote):
-/// an `Ok` is trusted, so a bad `Ok` would be stored. Whatever `convert` creates
-/// on failure is its own to clean up.
-///
-/// The guarantees are those of [`route_with`], because the machinery is the
-/// same code ([`attempt_guarded`]): classification first, so what is not
-/// converted never touches the breaker or the throttle; an open circuit or a
-/// saturated throttle answers [`FileRoute::Original`] without calling `convert`;
-/// a converter fault counts against the breaker and a busy or absent one does
-/// not; and every failure ends in `Original`, never in lost data.
-pub fn route_file_with<T, F>(
-    mime: &str,
-    head: &[u8],
-    breaker: &CircuitBreaker,
-    throttle: &ProcessThrottle,
-    convert: F,
-) -> FileRoute<T>
-where
-    F: FnOnce(Transcode) -> Result<T, PipelineError>,
-{
-    let Some(job) = plan(mime, head) else { return FileRoute::Original };
-    match attempt_guarded(breaker, throttle, || convert(job), |_| true) {
-        Some(output) => FileRoute::Converted { mime: job.output.mime(), output },
-        None => FileRoute::Original,
-    }
-}
-
-/// Runs one conversion attempt under the breaker and the throttle, the shared
-/// core of [`route_with`] and [`route_file_with`].
+/// Runs one conversion attempt under the breaker and the throttle; the core of
+/// [`route_with`].
 ///
 /// Returns the converted artefact, or `None` when the original must be kept:
 /// the circuit is open, no slot freed up in time, the attempt failed, or its
@@ -322,24 +257,7 @@ pub fn route_for_ingest(mime: String, payload: Vec<u8>) -> (String, Vec<u8>) {
     })
 }
 
-/// [`route_for_ingest`] for a payload that was streamed to a file: `head` is its
-/// first bytes (at least `SNIFF_HEAD_BYTES`, or all of it when shorter) and
-/// `convert` runs the real conversion between descriptors (in the daemon:
-/// [`crate::transcode::transcode_file`] from the spool file into a new one).
-///
-/// It shares everything with the in-memory entry point that is not about the
-/// bytes: the same process-wide breaker and throttle (so the two roads together
-/// never exceed `IMAGE_CONCURRENCY_LIMIT` converters, and a fault seen on one
-/// counts on the other), the same availability probe and the same one-time
-/// warnings. `convert` is not called when `magick` is missing.
-pub fn route_file_for_ingest<T, F>(mime: &str, head: &[u8], convert: F) -> FileRoute<T>
-where
-    F: FnOnce(Transcode) -> Result<T, PipelineError>,
-{
-    route_file_with(mime, head, &BREAKER, &THROTTLE, |job| converter_call(|| convert(job)))
-}
-
-// Process-wide, shared by both ingestion roads (see `route_file_for_ingest`).
+// Process-wide, shared by every ingestion call.
 static WARNED: AtomicBool = AtomicBool::new(false);
 static WARNED_SCRATCH: AtomicBool = AtomicBool::new(false);
 static BREAKER: CircuitBreaker =
@@ -537,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn wants_transcode_agrees_with_route_with_on_every_kind_of_payload() {
+    fn classification_agrees_with_route_with_on_every_kind_of_payload() {
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"frames");
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -558,20 +476,20 @@ mod tests {
             ("text/plain", b"plain".to_vec()),
         ];
         for (mime, payload) in cases {
-            let predicted = wants_transcode(mime, &payload);
+            let predicted = plan(mime, &payload).is_some();
             let (_, called) = route_recording(mime, payload, Ok(fake_png()));
-            assert_eq!(predicted, called.is_some(), "{mime}: prediction must match whether the converter ran");
+            assert_eq!(predicted, called.is_some(), "{mime}: classification must match whether the converter ran");
         }
     }
 
     #[test]
-    fn wants_transcode_needs_only_the_leading_bytes_and_never_panics_on_short_ones() {
+    fn classification_needs_only_the_leading_bytes_and_never_panics_on_short_ones() {
         let mut png = fake_png();
         png.extend(std::iter::repeat_n(0u8, 10_000));
-        assert!(wants_transcode("application/octet-stream", &png[..SNIFF_HEAD_BYTES]));
-        assert!(!wants_transcode("image/png", &[]), "no bytes, nothing to convert");
+        assert!(plan("application/octet-stream", &png[..SNIFF_HEAD_BYTES]).is_some());
+        assert!(plan("image/png", &[]).is_none(), "no bytes, nothing to convert");
         for len in 0..24 {
-            let _ = wants_transcode("image/webp", &fake_animated_webp()[..len.min(24)]);
+            let _ = plan("image/webp", &fake_animated_webp()[..len.min(24)]);
         }
     }
 
@@ -594,7 +512,6 @@ mod tests {
     #[test]
     fn animated_png_is_left_untouched_by_policy_so_its_animation_survives() {
         let apng = fake_apng();
-        assert!(!wants_transcode("image/png", &apng));
         let (routed, called) = route_recording("image/png", apng.clone(), Ok(fake_png()));
         assert!(called.is_none(), "an APNG must not be flattened by the converter");
         assert_eq!(routed, ("image/png".to_owned(), apng));
@@ -605,22 +522,9 @@ mod tests {
         // Bytes outrank the label: an APNG announced as a generic blob is still
         // classified as PNG, and still must not be flattened.
         let apng = fake_apng();
-        assert!(!wants_transcode("application/octet-stream", &apng));
         let (routed, called) = route_recording("application/octet-stream", apng.clone(), Ok(fake_png()));
         assert!(called.is_none(), "the label must not turn an APNG into a conversion");
         assert_eq!(routed, ("application/octet-stream".to_owned(), apng));
-    }
-
-    #[test]
-    fn the_file_road_bypasses_an_apng_without_calling_the_converter() {
-        let apng = fake_apng();
-        let called = Cell::new(false);
-        let route = route_file_with::<(), _>("image/png", &apng, &fresh_breaker(), &roomy_throttle(), |_| {
-            called.set(true);
-            Ok(())
-        });
-        assert_eq!(route, FileRoute::Original);
-        assert!(!called.get(), "the file must be stored as it is");
     }
 
     #[test]
@@ -1288,259 +1192,6 @@ mod tests {
         let (capacity, _) = capacity_seen_by_converter(payload);
         assert!(capacity >= IMAGE_OUTPUT_HINT_CAP_BYTES);
         assert!(capacity < IMAGE_OUTPUT_HINT_CAP_BYTES + 1_000_000, "reserved {capacity}: the cap was ignored");
-    }
-
-    // --- the file road: `route_file_with` ---
-    //
-    // The artefact a real conversion yields is a spool file; here it is a plain
-    // number, so what is under test is the routing, not the filesystem.
-
-    const ARTEFACT: u32 = 7;
-
-    /// Runs `route_file_with`, recording whether and how the converter was called.
-    fn route_file_through(
-        breaker: &CircuitBreaker,
-        throttle: &ProcessThrottle,
-        mime: &str,
-        head: &[u8],
-        reply: Result<u32, PipelineError>,
-    ) -> (FileRoute<u32>, Option<Transcode>) {
-        let called = Cell::new(None);
-        let routed = route_file_with(mime, head, breaker, throttle, |job| {
-            called.set(Some(job));
-            reply
-        });
-        (routed, called.get())
-    }
-
-    fn route_file_on(breaker: &CircuitBreaker, mime: &str, head: &[u8], reply: Result<u32, PipelineError>) -> (FileRoute<u32>, Option<Transcode>) {
-        route_file_through(breaker, &roomy_throttle(), mime, head, reply)
-    }
-
-    #[test]
-    fn the_file_road_bypasses_what_the_memory_road_bypasses_without_invoking_the_converter() {
-        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
-        let mut gif = b"GIF89a".to_vec();
-        gif.extend_from_slice(b"frames");
-        let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("text/plain", b"hello world".to_vec()),
-            ("text/uri-list", b"/home/user/a.png".to_vec()),
-            ("application/octet-stream", vec![0, 1, 2, 3, 4, 5]),
-            ("image/svg+xml", svg.clone()),
-            ("image/png", svg),
-            ("image/gif", gif),
-            ("image/webp", fake_animated_webp()),
-            ("image/png", Vec::new()),
-        ];
-        for (mime, head) in cases {
-            let (routed, called) = route_file_on(&fresh_breaker(), mime, &head, Ok(ARTEFACT));
-            assert!(called.is_none(), "converter invoked for {mime}");
-            assert_eq!(routed, FileRoute::Original, "{mime}");
-        }
-    }
-
-    #[test]
-    fn both_roads_hand_the_converter_the_same_job_for_every_kind_of_payload() {
-        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
-        let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("image/png", fake_png()),
-            ("image/jpeg", jpeg),
-            ("image/webp", fake_webp()),
-            ("image/webp", fake_animated_webp()),
-            ("image/gif", b"GIF89a frames".to_vec()),
-            ("image/png", svg),
-            ("image/bmp", b"BM not detectable by signature".to_vec()),
-            ("application/octet-stream", fake_png()),
-            ("application/pdf", b"%PDF-1.7 body".to_vec()),
-            ("text/plain", b"plain".to_vec()),
-        ];
-        for (mime, payload) in cases {
-            let (_, memory_job) = route_recording(mime, payload.clone(), Ok(fake_png()));
-            let (_, file_job) = route_file_on(&fresh_breaker(), mime, &payload, Ok(ARTEFACT));
-            assert_eq!(file_job, memory_job, "{mime}");
-        }
-    }
-
-    #[test]
-    fn a_successful_file_conversion_returns_the_artefact_under_the_target_mime() {
-        let (routed, called) = route_file_on(&fresh_breaker(), "image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10], Ok(ARTEFACT));
-        assert_eq!(routed, FileRoute::Converted { mime: "image/png", output: ARTEFACT });
-        assert_eq!(called.map(|job| (job.input, job.output)), Some((InputFormat::Jpeg, OutputFormat::Png)));
-    }
-
-    #[test]
-    fn every_file_conversion_failure_falls_back_to_the_original() {
-        let replies: Vec<PipelineError> = vec![
-            PipelineError::Spawn(io::Error::from(io::ErrorKind::NotFound)),
-            failed(),
-            PipelineError::Source(io::Error::other("x")),
-            PipelineError::Sink(io::Error::other("x")),
-            PipelineError::Child(io::Error::other("x")),
-            PipelineError::Timeout(Duration::from_secs(15)),
-            PipelineError::Isolation(io::Error::other("x")),
-        ];
-        for reply in replies {
-            let (routed, called) = route_file_on(&fresh_breaker(), "image/png", &png_header(), Err(reply));
-            assert!(called.is_some());
-            assert_eq!(routed, FileRoute::Original);
-        }
-    }
-
-    fn trip_file_road(breaker: &CircuitBreaker) {
-        for _ in 0..3 {
-            let (routed, called) = route_file_on(breaker, "image/png", &png_header(), Err(failed()));
-            assert!(called.is_some());
-            assert_eq!(routed, FileRoute::Original);
-        }
-        assert_eq!(breaker.state(), BreakerState::Open);
-    }
-
-    #[test]
-    fn three_file_conversion_failures_open_the_circuit_and_later_images_skip_the_converter() {
-        let breaker = fresh_breaker();
-        trip_file_road(&breaker);
-        let (routed, called) = route_file_on(&breaker, "image/png", &png_header(), Ok(ARTEFACT));
-        assert!(called.is_none(), "an open circuit must not spawn a converter");
-        assert_eq!(routed, FileRoute::Original);
-    }
-
-    #[test]
-    fn a_fault_on_either_road_counts_against_the_one_breaker() {
-        // Two faults on the memory road and one on the file road open it.
-        let breaker = fresh_breaker();
-        for _ in 0..2 {
-            route_on(&breaker, "image/png", png_header(), Err(failed()));
-        }
-        assert_eq!(breaker.state(), BreakerState::Closed);
-        route_file_on(&breaker, "image/png", &png_header(), Err(failed()));
-        assert_eq!(breaker.state(), BreakerState::Open);
-        // ... and both roads then skip the converter.
-        let (_, memory) = route_on(&breaker, "image/png", png_header(), Ok(fake_png()));
-        let (_, file) = route_file_on(&breaker, "image/png", &png_header(), Ok(ARTEFACT));
-        assert!(memory.is_none() && file.is_none());
-    }
-
-    #[test]
-    fn a_missing_tool_and_the_hosts_own_errors_never_open_the_circuit_on_the_file_road() {
-        let strict = CircuitBreaker::new(1, Duration::from_secs(30));
-        for _ in 0..20 {
-            for reply in [
-                PipelineError::Spawn(io::Error::from(io::ErrorKind::NotFound)),
-                PipelineError::Source(io::Error::other("x")),
-                PipelineError::Sink(io::Error::other("x")),
-                PipelineError::Isolation(io::Error::other("x")),
-            ] {
-                route_file_on(&strict, "image/png", &png_header(), Err(reply));
-            }
-        }
-        assert_eq!(strict.state(), BreakerState::Closed);
-    }
-
-    #[test]
-    fn a_saturated_throttle_keeps_the_original_on_the_file_road_without_counting_a_fault() {
-        let strict = CircuitBreaker::new(1, Duration::from_secs(30));
-        let throttle = ProcessThrottle::new(1, Duration::ZERO);
-        let _held = throttle.acquire().unwrap();
-        for _ in 0..20 {
-            let (routed, called) = route_file_through(&strict, &throttle, "image/png", &png_header(), Ok(ARTEFACT));
-            assert!(called.is_none(), "no process may be spawned past the cap");
-            assert_eq!(routed, FileRoute::Original);
-        }
-        assert_eq!(strict.state(), BreakerState::Closed);
-        assert_eq!(throttle.in_use(), 1);
-    }
-
-    #[test]
-    fn the_slot_is_released_after_a_file_conversion_whatever_its_outcome() {
-        let throttle = ProcessThrottle::new(1, Duration::ZERO);
-        for reply in [Ok(ARTEFACT), Err(failed()), Err(PipelineError::Sink(io::Error::other("x")))] {
-            route_file_through(&fresh_breaker(), &throttle, "image/png", &png_header(), reply);
-            assert_eq!(throttle.in_use(), 0);
-        }
-    }
-
-    // --- the file road, end to end with the real magick ---
-
-    /// A file under `target/` removed on drop (no temp-dir crate).
-    struct TempFile(std::path::PathBuf);
-
-    impl TempFile {
-        fn new(tag: &str) -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("route-file-test-tmp");
-            std::fs::create_dir_all(&dir).unwrap();
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            Self(dir.join(format!("{}-{id}-{tag}", std::process::id())))
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    /// Fingerprint stand-in that keeps the bytes it saw.
-    #[derive(Default)]
-    struct Collect(Vec<u8>);
-
-    impl crate::core::splice::ByteTap for Collect {
-        fn update(&mut self, chunk: &[u8]) {
-            self.0.extend_from_slice(chunk);
-        }
-    }
-
-    /// Converts the file `source` through the real descriptor road into `sink`.
-    fn convert_file(breaker: &CircuitBreaker, mime: &str, source: &TempFile, sink: &TempFile) -> (FileRoute<(u64, Vec<u8>)>, Vec<u8>) {
-        let mut head = std::fs::read(&source.0).unwrap();
-        head.truncate(SNIFF_HEAD_BYTES);
-        let routed = route_file_with(mime, &head, breaker, &roomy_throttle(), |job| {
-            let input = std::fs::File::open(&source.0).map_err(PipelineError::Source)?;
-            let mut output = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&sink.0).map_err(PipelineError::Sink)?;
-            let mut tap = Collect::default();
-            let transfer = transcode::transcode_file(job, input, &mut output, 64 << 20, &mut tap)?;
-            Ok((transfer.bytes_out, tap.0))
-        });
-        let stored = std::fs::read(&sink.0).unwrap_or_default();
-        (routed, stored)
-    }
-
-    #[test]
-    fn a_real_png_file_is_converted_between_descriptors_into_a_pixel_identical_stripped_png() {
-        if !magick_or_skip() { return; }
-        let original = generate(&["-size", "32x32", "plasma:fractal", "-depth", "8", "-set", "comment", "SECRETCOMMENT", "png:-"]);
-        assert!(contains(&original, b"SECRETCOMMENT"));
-        let (source, sink) = (TempFile::new("src"), TempFile::new("dst"));
-        std::fs::write(&source.0, &original).unwrap();
-
-        let (routed, stored) = convert_file(&fresh_breaker(), "image/png", &source, &sink);
-
-        let FileRoute::Converted { mime, output: (len, seen) } = routed else { panic!("not converted: {routed:?}") };
-        assert_eq!(mime, "image/png");
-        assert_eq!(detect_image_mime(&stored), Some("image/png"));
-        assert!(!contains(&stored, b"SECRETCOMMENT"), "metadata must be stripped");
-        assert_eq!(len, stored.len() as u64);
-        assert_eq!(seen, stored, "the tap must have seen exactly the stored bytes");
-        assert_eq!(pixel_signature(stored), pixel_signature(original.clone()));
-        assert_eq!(std::fs::read(&source.0).unwrap(), original, "the source file is never modified");
-    }
-
-    #[test]
-    fn real_corrupt_files_keep_the_original_and_trip_the_breaker() {
-        if !magick_or_skip() { return; }
-        let breaker = fresh_breaker();
-        let mut corrupt = png_header();
-        corrupt.extend_from_slice(&[0xA5; 2048]);
-        let source = TempFile::new("corrupt");
-        std::fs::write(&source.0, &corrupt).unwrap();
-        for _ in 0..3 {
-            let sink = TempFile::new("corrupt-out");
-            let (routed, _) = convert_file(&breaker, "image/png", &source, &sink);
-            assert_eq!(routed, FileRoute::Original);
-        }
-        assert_eq!(breaker.state(), BreakerState::Open);
-        assert_eq!(std::fs::read(&source.0).unwrap(), corrupt, "the original is untouched");
     }
 
 }

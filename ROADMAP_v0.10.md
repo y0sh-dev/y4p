@@ -36,6 +36,9 @@ Following `v0.9.0` (**Trust**), `v0.10.0` (**Subtraction**) removes over-enginee
 - [ ] **v0.9.5: Cache Quota & Operational Bounds**
   - Enforce a bounded total disk quota for `<hash>.cache` (LRU eviction of unpinned cache files) so repeated `32 MiB` image copies cannot grow disk usage unboundedly.
 
+- [ ] **v0.9.6: Selection Type Inspection (`y4p paste-from -l` / `--list-types`)**
+  - Add `-l` / `--list-types` to `y4p paste-from` using the existing Wayland Action Mode (`OfferData.mimes`) to print advertised MIME types one per line without opening a pipe.
+
 ### Phase 3: Documentation Distillation (`v0.9.9`)
 
 - [ ] **v0.9.9: Documentation Subtraction & Consolidation**
