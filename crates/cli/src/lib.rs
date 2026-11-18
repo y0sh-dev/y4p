@@ -46,6 +46,9 @@ pub enum CliAction {
     None,
     RunDaemon(ClipboardDb, bool),
     PasteFrom(String),
+    /// `y4p paste-from -l` / `--list-types`: print the selection's offered
+    /// MIME types instead of fetching a payload.
+    ListTypes,
     /// `y4p doctor`: only the Wayland handshake needs the composition root, so
     /// the rest of the diagnostics run in `cli::doctor` with this handle.
     Doctor(ClipboardDb),
@@ -99,7 +102,8 @@ pub fn handle_command(args: &[String], mut db: ClipboardDb) -> CliAction {
 
         // --- Utilities ---
         "paste-from" => return match paste_from::run(args) {
-            Some(mime) => CliAction::PasteFrom(mime),
+            Some(paste_from::PasteFromRequest::Payload(mime)) => CliAction::PasteFrom(mime),
+            Some(paste_from::PasteFromRequest::ListTypes) => CliAction::ListTypes,
             None => CliAction::None,
         },
         "status"     => status::run(args),
