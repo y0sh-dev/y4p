@@ -272,6 +272,7 @@ fn quota_checks(db: &ClipboardDb) -> Vec<Check> {
         checks.push(Check::pass("quota", format!("{} / {} entries", count, max_history)));
     }
     checks.push(Check::pass("quota", format!("payload ceiling {} bytes ({})", MAX_PAYLOAD_BYTES, format_bytes(MAX_PAYLOAD_BYTES))));
+    checks.push(Check::pass("quota", format!("cache ceiling {} bytes ({})", CACHE_QUOTA_BYTES, format_bytes(CACHE_QUOTA_BYTES))));
 
     // Both directories are created on demand, so an absent one is normal on a
     // fresh profile; only a present but unwritable one is a problem.
