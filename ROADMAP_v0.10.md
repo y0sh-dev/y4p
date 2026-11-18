@@ -28,7 +28,7 @@ Following `v0.9.0` (**Trust**), `v0.10.0` (**Subtraction**) removes over-enginee
 
 ### Phase 2: Image Opt-In & Cache Quota (`v0.9.4` – `v0.9.5`)
 
-- [ ] **v0.9.4: Image Sanitisation Opt-In (`[image] sanitize = false` Default)**
+- [x] **v0.9.4: Image Sanitisation Opt-In (`[image] sanitize = false` Default)**
   - Default image conversion to off (`[image] sanitize = false` in `y4p.toml`), storing raw image bytes verbatim without requiring `magick` at runtime.
   - Simplify `crates/image` by removing file-to-file spool transcode paths and `#![allow(dead_code)]`, keeping opt-in sanitisation clean.
   - Update `y4p doctor` to warn about missing `magick` only when `sanitize = true`.
