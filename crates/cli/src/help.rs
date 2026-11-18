@@ -67,7 +67,9 @@ pub fn print_help() {
     println!("    store [mime]       - Ingest stdin to storage and sync with active daemon.");
     println!("                         Flags: --verbose (-v).");
     
-    println!("    paste-from [mime]  - Access system clipboard directly. Bypasses database.");
+    println!("    paste-from [-l|--list-types | mime]");
+    println!("                       - Access system clipboard directly. Bypasses database.");
+    println!("                         -l, --list-types prints the offered MIME types only.");
 
     println!("\nMANAGEMENT:");
     println!("    delete <target>    - Physically remove a specific record from persistent storage.");

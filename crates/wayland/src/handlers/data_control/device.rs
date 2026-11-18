@@ -49,6 +49,11 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
 
             if mimes.is_empty() || is_sensitive(&mimes) { return; }
 
+            // Action Mode's `--list-types`: the offer is the answer. Record
+            // the advertised types and stop before any candidate selection,
+            // reader slot or pipe allocation.
+            if capture_offered_mimes(state, &mimes) { return; }
+
             // Every MIME worth requesting for this selection, best first: the
             // ones matching an explicit request (Action Mode), or the
             // allowlisted chain `MIME_PRIORITY_ORDER` → `image/*` → `text/*`
@@ -135,6 +140,20 @@ fn shed_unallocatable_pipe(stats: &IngestStats) -> u64 {
     let total = stats.record_shed_reader();
     ingest::report_shed("could not allocate pipe descriptors (EMFILE)", total);
     total
+}
+
+/// Records an offer's MIME types when Action Mode asked for a list
+/// (`y4p paste-from --list-types`).
+///
+/// Returns `true` when the selection is fully handled: the caller must then
+/// return before selecting candidates, taking a `ReaderGate` permit or
+/// allocating a pipe. `false` means the normal payload path continues.
+fn capture_offered_mimes(state: &mut WaylandState, mimes: &[String]) -> bool {
+    if !state.list_types {
+        return false;
+    }
+    state.offered_mimes = mimes.to_vec();
+    true
 }
 
 /// Chooses which of an offer's `mimes` to request from the compositor.
@@ -418,6 +437,29 @@ mod tests {
 
     fn mimes(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn config() -> Arc<crate::core::config::Config> {
+        Arc::new(crate::core::config::Config::default())
+    }
+
+    // --- Action Mode: listing offered types instead of a payload ---
+
+    #[test]
+    fn list_types_mode_records_the_offered_mimes_and_stops() {
+        let mut state = WaylandState::new_list_types(false, config());
+        let offers = mimes(&["image/png", "text/plain", "TARGETS"]);
+        assert!(capture_offered_mimes(&mut state, &offers), "the offer ends the selection");
+        assert_eq!(state.offered_mimes, offers);
+        assert_eq!(state.reader_gate.active(), 0, "no reader slot may be taken");
+    }
+
+    #[test]
+    fn the_payload_path_leaves_the_offered_mimes_alone() {
+        let mut state = WaylandState::new_action("text/plain".to_owned(), false, config());
+        let offers = mimes(&["text/plain"]);
+        assert!(!capture_offered_mimes(&mut state, &offers), "the payload path continues");
+        assert!(state.offered_mimes.is_empty());
     }
 
     /// The best candidate only, for the assertions that are about a single

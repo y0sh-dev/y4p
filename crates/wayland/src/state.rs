@@ -83,6 +83,13 @@ pub struct WaylandState {
     // for. `None` in daemon mode, where no single MIME is being awaited —
     // the Selection handler falls back to `MIME_PRIORITY_ORDER` instead.
     pub target_mime: Option<String>,
+    // Action-mode-only: `y4p paste-from --list-types` wants the selection's
+    // advertised MIME types and nothing else. The Selection handler records
+    // them in `offered_mimes` and returns before allocating a pipe.
+    pub list_types: bool,
+    // Action-mode-only: the offered MIME types of the last selection, filled
+    // only when `list_types` is set.
+    pub offered_mimes: Vec<String>,
     pub rx_buf: Vec<u8>,
     pub selection_received: bool,
     pub current_source: Option<ExtDataControlSourceV1>,
@@ -111,6 +118,8 @@ impl WaylandState {
             ingest_stats: Arc::new(IngestStats::default()),
             verbose,
             target_mime: None,
+            list_types: false,
+            offered_mimes: Vec::new(),
             rx_buf: Vec::new(),
             selection_received: false,
             current_source: None,
@@ -131,12 +140,23 @@ impl WaylandState {
             ingest_stats: Arc::new(IngestStats::default()),
             verbose,
             target_mime: Some(target_mime),
+            list_types: false,
+            offered_mimes: Vec::new(),
             rx_buf: Vec::new(),
             selection_received: false,
             current_source: None,
             paused: false,
             config,
         }
+    }
+
+    /// Action Mode for `y4p paste-from --list-types`: no target MIME (nothing
+    /// is to be fetched), just the offer's advertised types.
+    pub fn new_list_types(verbose: bool, config: Arc<crate::core::config::Config>) -> Self {
+        let mut state = Self::new_action(String::new(), verbose, config);
+        state.target_mime = None;
+        state.list_types = true;
+        state
     }
 }
 
@@ -165,5 +185,26 @@ mod tests {
     fn into_bytes_enforces_the_bound_and_rejects_nothing() {
         assert!(ClipboardJob::new("text/plain".to_owned(), vec![0; 17]).into_bytes(16).is_err());
         assert!(ClipboardJob::new("text/plain".to_owned(), Vec::new()).into_bytes(16).is_err());
+    }
+
+    fn config() -> Arc<crate::core::config::Config> {
+        Arc::new(crate::core::config::Config::default())
+    }
+
+    #[test]
+    fn list_types_mode_waits_for_types_only() {
+        let state = WaylandState::new_list_types(false, config());
+        assert!(state.list_types);
+        assert!(state.offered_mimes.is_empty());
+        assert_eq!(state.target_mime, None, "no payload is being awaited");
+        assert!(state.job_tx.is_none(), "Action Mode never writes to the database");
+    }
+
+    #[test]
+    fn the_payload_action_mode_does_not_collect_types() {
+        let state = WaylandState::new_action("text/plain".to_owned(), false, config());
+        assert!(!state.list_types);
+        assert!(state.offered_mimes.is_empty());
+        assert_eq!(state.target_mime.as_deref(), Some("text/plain"));
     }
 }
