@@ -126,6 +126,28 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        CliAction::ListTypes => {
+            // Observation only: the compositor's advertised types, one per
+            // line. Nothing is stored and no pipe is opened.
+            let mimes = wayland::list_offer_types();
+            if mimes.is_empty() {
+                eprintln!("{}no MIME types were advertised by the current selection", LOG_ERROR);
+                std::process::exit(1);
+            }
+
+            let mut out = String::new();
+            for mime in &mimes {
+                out.push_str(mime);
+                out.push('\n');
+            }
+
+            let mut stdout = std::io::stdout();
+            if let Err(e) = stdout.write_all(out.as_bytes()) {
+                eprintln!("{}standard output stream failure: {}", LOG_ERROR, e);
+                return;
+            }
+            let _ = stdout.flush();
+        }
         CliAction::PasteFrom(mime) => {
             // Synchronous data extraction from the Wayland compositor.
             let raw = wayland::paste_from_os(&mime);
