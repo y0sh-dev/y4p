@@ -151,6 +151,7 @@ match arg.as_str() {
 | `--force` | `-f` | Confirm destructive action (`wipe`) |
 | `--verbose` | `-v` | Detailed logging |
 | `--id` | `-i` | Interpret the target as a stable ID |
+| `--list-types` | `-l` | `paste-from` only: print the offered MIME types |
 | `--help` / `--version` | `-h` / `-V` | Help / version |
 
 Parsing is global; **each subcommand then declares which of the parsed flags apply to it and rejects the rest**:
@@ -162,8 +163,10 @@ Parsing is global; **each subcommand then declares which of the parsed flags app
 | `copy-to`, `store`, `daemon` | `--raw`, `--full`, `--force` |
 | `delete`, `pin`, `unpin` | `--raw`, `--full`, `--force`, `--verbose` |
 | `wipe` | `--raw`, `--full`, `--verbose`; `--force` is **required** |
-| `paste-from` | `--raw`, `--full`, `--force`, `--verbose` |
+| `paste-from` | `--raw`, `--full`, `--force`, `--verbose`, `--id`; accepts `-l` / `--list-types`, which is an error together with a MIME argument |
 | `status`, `pause`, `resume`, `stats`, `doctor` | every flag, including `--id` and `--verbose` |
+
+`-l` / `--list-types` is deliberately parsed inside `paste_from.rs` rather than added to the shared `ArgContext`: the global parser collects it in `unknown_flags`, and only `paste-from` opts in. Every other subcommand therefore keeps rejecting it exactly as before.
 
 ```rust
 // crates/cli/src/pin.rs:L24
@@ -187,7 +190,7 @@ For an interactive user this is a slightly less forgiving CLI. For a script, the
 | `copy-to`, `store` (sync) | Promote/insert in the database, then send `IPC_CMD_RESTORE` + decimal ID + `\n` to the daemon socket |
 | `status`, `pause`, `resume` | One-shot IPC command (`0x03`, `0x04`, `0x05`) |
 | `delete`, `wipe` | IPC mutation (`IPC_CMD_DELETE` `0x06` + decimal ID, `IPC_CMD_WIPE` `0x07`), answered on the same connection. **Only when `UnixStream::connect` fails** does the CLI fall back to its own `ClipboardDb`; once connected, a timeout or an `ERR:` reply is an error and the command exits non-zero, never a second attempt against the file ([03](03_concurrency_and_memory.md) section 2.2) |
-| `daemon`, `paste-from`, `doctor` | `y4p-cli` only validates and returns a `CliAction`; the composition root (`src/main.rs`) performs the actual daemon / Wayland call, so `y4p-cli` depends on neither crate |
+| `daemon`, `paste-from`, `doctor` | `y4p-cli` only validates and returns a `CliAction` (`RunDaemon`, `PasteFrom` / `ListTypes`, `Doctor`); the composition root (`src/main.rs`) performs the actual daemon / Wayland call, so `y4p-cli` depends on neither crate |
 
 The socket lives at `$XDG_RUNTIME_DIR/y4p/y4p.sock`, falling back to `/tmp/y4p.<uid>.sock` only when no session runtime directory exists ([`crates/core/src/lib.rs`](../crates/core/src/lib.rs)).
 
@@ -204,7 +207,7 @@ Read-only, takes no arguments, and exits `0` for any readable store — a stoppe
 | Section | Content | Source |
 | :--- | :--- | :--- |
 | Entries | total / pinned / unpinned counts, total logical payload bytes, and a per-category breakdown: `image/*` first, then anything `core::utils::is_text_like_mime` accepts, then everything else, each with its own count and bytes | `ClipboardDb::fetch_metadata(usize::MAX)`: metadata only, no payload is read |
-| On-disk | database file size, cache file count and bytes, spool file count and bytes | `core::get_db_path()`, `core::get_cache_dir()`, `core::spool_dir_path()` |
+| On-disk | database file size, cache file count and bytes, and the (now unused) spool directory's count and bytes | `core::get_db_path()`, `core::get_cache_dir()`, `core::spool_dir_path()` |
 | Daemon | `uptime_ms`, `paused`, `ingress`, `egress`, `shed_readers`, `shed_queue`, `shed_timeout` | an IPC `status` query; the line is only shown when every field parsed, and a stopped daemon prints `daemon: not running (shed counts unavailable)` |
 
 The categories are a classification of what is stored, not a filter: they always sum to the total. `stats` never mutates anything and never opens a write transaction.
@@ -215,10 +218,14 @@ Prints exactly one line per check, tagged `[PASS]`, `[WARN]` or `[FAIL]`, then a
 
 | Group | Checks | Severity policy |
 | :--- | :--- | :--- |
-| Environment | `XDG_RUNTIME_DIR`, `XDG_DATA_HOME` (or `HOME`), `WAYLAND_DISPLAY`, `Config::get_config_path()` / `Config::load()` (effective `max_history` and `drop_rtf`), `magick -version` | Only a missing *data* home (neither variable set) is a `[FAIL]`; `magick` absent or broken is a `[WARN]`, since images are then stored unmodified |
+| Environment | `XDG_RUNTIME_DIR`, `XDG_DATA_HOME` (or `HOME`), `WAYLAND_DISPLAY`, `Config::get_config_path()` / `Config::load()` (effective `max_history`, `drop_rtf` and `sanitize`), `magick -version` | Only a missing *data* home (neither variable set) is a `[FAIL]`; `magick` absent or broken is a `[WARN]` only when `[image] sanitize = true`, and a `[PASS]` (`not required; [image] sanitize = false`) otherwise |
 | Compositor | the Wayland handshake itself (`wayland::create_connection()`) | `[FAIL]` when unreachable: without it the daemon cannot start |
 | Database | `core::get_db_path()` exists and is a regular file, its size, and `db.get_total_count()` | `[FAIL]` if the file cannot be read |
 | Socket & daemon | socket path, `<socket>.lock`, the parent directory's mode (`0700` expected), and an IPC `status` round trip | Absent socket/lock or a stopped daemon is a `[WARN]`; a wrong directory mode is a `[WARN]`; an unreadable parent is a `[FAIL]` |
-| Quota & directories | `db.get_total_count()` against `core::get_max_history()`, the `MAX_PAYLOAD_BYTES` ceiling, and that the cache and spool directories exist and are writable | Exceeding `max_history` is a `[WARN]` (rotation catches up); an absent directory is normal (`created on first use`); an unwritable one is a `[FAIL]`, tested by creating and removing a probe file |
+| Quota & directories | `db.get_total_count()` against `core::get_max_history()`, the `MAX_PAYLOAD_BYTES` ceiling (32 MiB), the `CACHE_QUOTA_BYTES` ceiling (512 MiB), and that the cache and spool directories exist and are writable | Exceeding `max_history` is a `[WARN]` (rotation catches up); an absent directory is normal (`created on first use`); an unwritable one is a `[FAIL]`, tested by creating and removing a probe file |
 
 If the database cannot even be opened, `main` reports that one line as a `[FAIL] database: ...` and exits `1`, rather than the bare `critical:` line every other command would print: the command whose job is to explain a broken setup should not be the one that dies without explaining it.
+
+### 7.3 `y4p paste-from [-l|--list-types | mime]`
+
+`paste-from` is the observation counterpart to daemon ingestion. With a MIME it reads the current selection synchronously and writes the bytes to stdout, exactly as the daemon would have stored them (before optional image routing). With `-l` / `--list-types` it opens no pipe at all: the Wayland Action Mode records `OfferData.mimes` and `src/main.rs` prints one MIME per line, in compositor order. An empty result (no compositor, no selection, a sensitive selection, or the one-second timeout) exits `1`; a payload fetch that returns nothing does the same.

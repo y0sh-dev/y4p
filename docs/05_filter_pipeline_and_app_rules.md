@@ -2,7 +2,7 @@
 
 A clipboard manager cannot simply be a passive byte sink. Modern desktops hand it payloads in arbitrary formats, bloated by redundant rich-text duplicates. Sensitive applications (password managers) demand exclusion, while command-line utilities and API debuggers require raw, unmodified input.
 
-This document explains how `y4p` filters and transforms clipboard data without stalling the Wayland event loop and without any network communication: a clipboard manager stores and returns what the compositor gave it, nothing more, apart from the explicit, bounded image hardening of [06](06_local_image_pipeline.md).
+This document explains how `y4p` filters and transforms clipboard data without stalling the Wayland event loop and without any network communication: a clipboard manager stores and returns what the compositor gave it, nothing more, apart from the explicit, opt-in, bounded image hardening of [06](06_local_image_pipeline.md).
 
 Crates involved: `y4p-wayland` (stages 1-5, egress), `y4p-daemon` (stages 6-8), `y4p-core` (constants, MIME helpers, `y4p.toml` parser).
 
@@ -18,6 +18,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              v
  [Stage 1: Gate]  --------------------> sensitive hint? paused?                  -> discard silently
              |                          reader limit (8) reached?                 -> shed, counted
+             |                          list-types Action Mode?                    -> record MIMEs, no pipe
              |                          (all checked before any pipe is opened)
              v
  [Stage 2: MIME Allowlist]              strict: no catch-all
@@ -25,7 +26,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              |-- candidates: MIME_PRIORITY_ORDER -> image/* -> text/*
              v
  [Stage 3: Payload Acquisition]         crates/wayland
-             \-- bounded read: read_to_end, capped at MAX_PAYLOAD_BYTES (256 MiB), +1 probe byte
+             \-- bounded read: DeadlineReader + read_to_end, capped at MAX_PAYLOAD_BYTES (32 MiB), +1 probe byte
              |
              v
  [Stage 4: Normalisation]
@@ -37,8 +38,9 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
   ===========================================================  crate boundary: wayland | daemon
              |
              v
- [Stage 6: Image Routing]               crates/daemon (DbWorker thread)
-             \-- raster images: privacy-strip + re-encode via y4p-image; original kept on any failure
+ [Stage 6: Image Routing (opt-in)]      crates/daemon (DbWorker thread)
+             \-- sanitize = true: raster images privacy-stripped + re-encoded via y4p-image;
+                 sanitize = false (default): bytes pass through untouched
              |
              v
  [Stage 7: SHA3-256 Fingerprint]
@@ -46,8 +48,10 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              |
              v
  [Stage 8: Persist]
-             \-- ClipboardDb::insert_with_hash  ->  SQLite (WAL) + cache directory
+             \-- ClipboardDb::insert_with_hash  ->  SQLite (WAL) + cache directory (+ LRU quota)
 ```
+
+> **Action Mode `paste-from -l`** stops at stage 1: the Selection handler records the offer's advertised MIME types and returns before candidate selection, a reader slot or a pipe ([01](01_wayland_streaming_io.md) section 5).
 
 ### 1.1 Stage 1: the gate
 
@@ -56,6 +60,7 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
 | `paused` | IPC `pause` (private mode) | return; no `offer.receive`, no job |
 | `is_sensitive(mimes)` | `core::utils::is_sensitive_mime` | return |
 | empty offer list | | return |
+| `list_types` Action Mode | `paste-from -l` | copy the MIME list into `offered_mimes` and return before any reader slot or pipe |
 
 A restore of the daemon's own does **not** appear here: since v0.8.7 there is no `provider_locks` counter, and a re-offer of what was just served is deduplicated by content hash in storage ([01](01_wayland_streaming_io.md) section 3).
 
@@ -65,7 +70,7 @@ A restore of the daemon's own does **not** appear here: since v0.8.7 there is no
 
 ### 1.2 Stage 2: MIME selection
 
-`select_mime_candidates` ([`crates/wayland/src/handlers/data_control/device.rs`](../crates/wayland/src/handlers/data_control/device.rs)) returns an ordered candidate array, not a single choice; the fallback loop that walks it is described in [01](01_wayland_streaming_io.md) section 2.5:
+`select_mime_candidates` ([`crates/wayland/src/handlers/data_control/device.rs`](../crates/wayland/src/handlers/data_control/device.rs)) returns an ordered candidate array, not a single choice; the fallback loop that walks it is described in [01](01_wayland_streaming_io.md) section 2.4:
 
 | Mode | `target_mime` | Rule |
 | :--- | :--- | :--- |
@@ -79,10 +84,10 @@ A restore of the daemon's own does **not** appear here: since v0.8.7 there is no
 ### 1.3 Why the order matters
 
 1. **Discard before allocation.** Sensitive hints are checked before opening pipes or allocating buffers. An offer from a password manager is dropped at zero I/O cost.
-2. **Plain text outranks rich markup, and an empty attempt costs only one candidate.** Electron and Chromium applications routinely announce `text/html` next to `text/plain` but synthesise HTML only on request; a non-rich selection returns an empty transfer for `text/html`. Trying plain text first makes that failure structurally impossible, while `text/html` stays reachable when no plain-text alternative exists. Since v0.8.6 a 0-byte transfer is not the end of the selection either: the fallback loop moves to the next candidate ([01](01_wayland_streaming_io.md) section 2.5).
+2. **Plain text outranks rich markup, and an empty attempt costs only one candidate.** Electron and Chromium applications routinely announce `text/html` next to `text/plain` but synthesise HTML only on request; a non-rich selection returns an empty transfer for `text/html`. Trying plain text first makes that failure structurally impossible, while `text/html` stays reachable when no plain-text alternative exists. Since v0.8.6 a 0-byte transfer is not the end of the selection either: the fallback loop moves to the next candidate ([01](01_wayland_streaming_io.md) section 2.4).
 3. **Hash after every transformation.** Normalisation and image routing may change bytes; the fingerprint is computed last so the persisted hash always matches the persisted bytes.
 
-> **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are the only payloads rewritten**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); GIF, SVG, AVIF and non-image types pass through untouched; PNG, BMP, JPEG and WebP leave as `image/png`.
+> **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are rewritten only when `[image] sanitize = true`**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); by default (and for GIF, SVG, AVIF and non-image types in either mode) the bytes pass through untouched. When sanitisation is enabled, PNG, BMP, JPEG and WebP leave as `image/png`.
 
 ---
 
@@ -97,8 +102,7 @@ A restore of the daemon's own does **not** appear here: since v0.8.7 there is no
    mime_is_compatible(requested, stored)?  --no-->  fd closed, nothing sent
               | yes
               v
-   File(path)  -> sendfile(2): cache file -> destination pipe   (an adopted spool file is a cache file)
-   Stream(fd)  -> sendfile(2) if addressable, else userspace copy
+   File(path)  -> sendfile(2): cache file -> destination pipe
    Memory(data) -> write_all on a spawned thread
                   (HTML stored, plain text requested -> strip_html_tags first)
 ```
@@ -133,7 +137,7 @@ To honour the project's no-new-crates invariant, `y4p` avoids parsing frameworks
 | :--- | :--- |
 | Grammar | `[section]` headers, `key = value`, `#` comments (a `#` inside a quoted string is not a comment; no `\"` escapes) |
 | Value types | unsigned integers and booleans only |
-| Recognised keys | `[general] max_history` (positive integer), `[mime] drop_rtf` (`true`/`false`) |
+| Recognised keys | `[general] max_history` (positive integer), `[mime] drop_rtf` (`true`/`false`), `[image] sanitize` (`true`/`false`) |
 | Anything else | unknown section, unknown key, malformed line, or a value that fails its type: **skipped silently**, leaving the default |
 
 > **Invariant — a config problem never stops the daemon.** A missing, unreadable, non-UTF-8 or syntactically broken file yields `Config::default()`. A malformed file can never crash the daemon or prevent it from monitoring the clipboard.
@@ -147,7 +151,7 @@ To honour the project's no-new-crates invariant, `y4p` avoids parsing frameworks
  2. User configuration file        $XDG_CONFIG_HOME/y4p/y4p.toml   (falls back to ~/.config/y4p/y4p.toml)
                   |
                   v
- 3. Built-in defaults              DEFAULT_MAX_HISTORY = 256, drop_rtf = true
+ 3. Built-in defaults              DEFAULT_MAX_HISTORY = 256, drop_rtf = true, sanitize = false
 ```
 
 `core::get_max_history()` ([`crates/core/src/lib.rs:L27`](../crates/core/src/lib.rs)) implements this chain. There is no command-line override. The result is full operation in minimal containers where no configuration file exists, while desktop users keep control over retention and MIME handling. A documented template ships as [`y4p.toml.example`](../y4p.toml.example).
