@@ -46,7 +46,7 @@ Following `v0.9.0` (**Trust**), `v0.10.0` (**Subtraction**) removes over-enginee
 
 ### Phase 4: Formal Release (`v0.10.0`)
 
-- [ ] **v0.10.0: Official Major Release: Subtraction**
+- [x] **v0.10.0: Official Major Release: Subtraction**
   - Bump workspace version and badges to `0.10.0`.
   - Verify production line-count reduction, 100% test pass, and 0 clippy warnings.
   - Cut `release/v0.10.0`, push `v0.10.0` tag, and publish GitHub Release (`RELEASE_TEMPLATE.md` format).
