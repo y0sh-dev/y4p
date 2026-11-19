@@ -33,15 +33,15 @@ Following `v0.9.0` (**Trust**), `v0.10.0` (**Subtraction**) removes over-enginee
   - Simplify `crates/image` by removing file-to-file spool transcode paths and `#![allow(dead_code)]`, keeping opt-in sanitisation clean.
   - Update `y4p doctor` to warn about missing `magick` only when `sanitize = true`.
 
-- [ ] **v0.9.5: Cache Quota & Operational Bounds**
+- [x] **v0.9.5: Cache Quota & Operational Bounds**
   - Enforce a bounded total disk quota for `<hash>.cache` (LRU eviction of unpinned cache files) so repeated `32 MiB` image copies cannot grow disk usage unboundedly.
 
-- [ ] **v0.9.6: Selection Type Inspection (`y4p paste-from -l` / `--list-types`)**
+- [x] **v0.9.6: Selection Type Inspection (`y4p paste-from -l` / `--list-types`)**
   - Add `-l` / `--list-types` to `y4p paste-from` using the existing Wayland Action Mode (`OfferData.mimes`) to print advertised MIME types one per line without opening a pipe.
 
 ### Phase 3: Documentation Distillation (`v0.9.9`)
 
-- [ ] **v0.9.9: Documentation Subtraction & Consolidation**
+- [x] **v0.9.9: Documentation Subtraction & Consolidation**
   - Synchronise `docs/`, `README.md`, and `README_ja.md` with the simplified architecture (`32 MiB` cap, whole-payload dedup, opt-in `magick`), consolidating redundant chapters where subtraction makes them obsolete.
 
 ### Phase 4: Formal Release (`v0.10.0`)
