@@ -13,7 +13,7 @@
 `y4p` is a standalone clipboard manager, built natively for Wayland.
 
 It runs as a single daemon — no separate monitor process, no separate provider process — that watches the clipboard, serves history back out, and persists everything to disk.
-Engineered with strict zero-loss integrity and defence-in-depth resource controls, it seamlessly handles text streams, binary payloads, and high-resolution images with deterministic performance.
+Engineered with strict zero-loss integrity and defence-in-depth resource controls, it handles text, binaries and high-resolution images under fixed memory and disk bounds.
 
 </div>
 
@@ -30,11 +30,11 @@ Engineered with strict zero-loss integrity and defence-in-depth resource control
 ## Features
 
 - **Unified Daemon**: Single-process architecture managing clipboard monitoring, IPC serving, and disk persistence without external daemon orchestration.
-- **Hybrid Storage**: Fast, searchable SQLite engine for text metadata paired with content-addressed filesystem caching for binary blobs.
+- **Hybrid Storage**: Fast, searchable SQLite metadata with whole-payload SHA3 deduplication; large binaries live in a content-addressed cache directory bounded by a 512 MiB LRU quota.
+- **Pristine by Default**: Copied images are stored byte for byte. Metadata-stripping image sanitisation is an explicit opt-in (`[image] sanitize = true`) and requires ImageMagick only then.
 - **Script-First CLI**: Deterministic command interface with immutable entry IDs and strict argument parsing for shell pipeline integration (`fzf`, `rofi`).
-- **Zero-Loss Integrity**: Pinned entries are strictly immune to ring buffer rotation; zero schema corruption across migrations.
-- **Local Image Pipeline**: Privacy-stripping image transcoding with isolated scratch directories, a process-group timeout watchdog, resource limits, bounded concurrency and a self-healing circuit breaker.
-- **Robust by Construction**: Panic-free execution path (`unwrap`, `expect` and `panic!` are denied workspace-wide by lints) and a deliberately small, pinned dependency set.
+- **Zero-Loss Integrity**: Pinned entries are strictly immune to history rotation and cache eviction; schema migrations are additive and idempotent.
+- **Robust by Construction**: Panic-free resident layers (`unwrap`, `expect` and `panic!` are denied by lints) and a deliberately small, pinned dependency set.
 - **Built-in Observability**: `y4p stats` reports entry, on-disk and daemon shed figures; `y4p doctor` walks environment, compositor, database, socket and quota with `[PASS]` / `[WARN]` / `[FAIL]` per check.
 
 ---
@@ -49,7 +49,8 @@ A quick look at what's available. Full flags and examples live in `y4p help`.
 | `list` / `search` | Browse or search clipboard history. |
 | `copy-to` | Restore a history entry to the live clipboard. |
 | `show` | Inspect a record's content directly. |
-| `store` / `paste-from` | Manually ingest stdin, or read the OS clipboard directly. |
+| `store` | Ingest standard input manually. |
+| `paste-from [-l\|--list-types \| mime]` | Read the OS clipboard directly; `-l` prints the advertised MIME types only. |
 | `pin` / `unpin` | Protect or release a record from automatic rotation. |
 | `delete` / `wipe` | Remove one record, or clear all history. |
 | `status` / `pause` / `resume` | Check or control the daemon's monitoring state. |
@@ -135,7 +136,7 @@ bash scripts/e2e_compositor.sh
 
 `y4p` works out of the box with sensible defaults and zero mandatory configuration.
 
-To customise behaviour — such as history limits or MIME filtering — place a `y4p.toml` file at `$XDG_CONFIG_HOME/y4p/y4p.toml` (defaulting to `~/.config/y4p/y4p.toml`).
+To customise behaviour — history limits, MIME filtering, or opt-in image sanitisation — place a `y4p.toml` file at `$XDG_CONFIG_HOME/y4p/y4p.toml` (defaulting to `~/.config/y4p/y4p.toml`).
 
 A documented reference template is provided in [`y4p.toml.example`](y4p.toml.example):
 
@@ -150,11 +151,11 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 `y4p` is a Cargo workspace. The root package is a thin composition root (`src/main.rs`); every domain lives in its own crate, and dependencies flow strictly inward towards `y4p-core`.
 
-- **[`crates/core`](crates/core) (`y4p-core`)**: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, `splice(2)` / pipe-sizing / FastCDC primitives, exit flag.
-- **[`crates/storage`](crates/storage) (`y4p-storage`)**: SQLite store, schema migrations, deduplicated chunk storage, filesystem blob cache.
-- **[`crates/image`](crates/image) (`y4p-image`)**: image sniffing, sandboxed transcoding, circuit breaker, throttle.
-- **[`crates/wayland`](crates/wayland) (`y4p-wayland`)**: `ext-data-control-v1` handlers, streaming clipboard I/O, bounded ingestion queue.
-- **[`crates/daemon`](crates/daemon) (`y4p-daemon`)**: event loop, IPC socket, background worker (image routing, hashing, persistence).
+- **[`crates/core`](crates/core) (`y4p-core`)**: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, pipe sizing and kernel-copy primitives, exit flag.
+- **[`crates/storage`](crates/storage) (`y4p-storage`)**: SQLite v4 facade, schema migrations, inline payload storage, legacy chunk-row compatibility, filesystem cache with the LRU quota.
+- **[`crates/image`](crates/image) (`y4p-image`)**: image sniffing, opt-in sanitisation, sandboxed transcoding, circuit breaker, throttle.
+- **[`crates/wayland`](crates/wayland) (`y4p-wayland`)**: `ext-data-control-v1` handlers, bounded clipboard reads, ingestion queue, egress.
+- **[`crates/daemon`](crates/daemon) (`y4p-daemon`)**: event loop, IPC socket, background worker (optional image routing, hashing, persistence).
 - **[`crates/cli`](crates/cli) (`y4p-cli`)**: strict argument parsing, command handlers, output formatting.
 
 ---
@@ -166,8 +167,8 @@ The technical architecture lives in [`docs/00_overview.md`](docs/00_overview.md)
 Project governance, planning and references:
 
 - [`.github/POLICY.md`](.github/POLICY.md): Shared contribution policy and engineering standards.
-- [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and targets for the zero-copy cycle; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
-- [`ROADMAP_v0.9.md`](ROADMAP_v0.9.md): The v0.8.x hardening roadmap towards v0.9.0 (Trust).
+- [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and historical targets; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
+- [`ROADMAP_v0.10.md`](ROADMAP_v0.10.md): The v0.9.x subtraction milestones towards v0.10.0.
 - [`README_ja.md`](README_ja.md): Japanese README (日本語版).
 
 ---
