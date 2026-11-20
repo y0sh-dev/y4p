@@ -33,6 +33,10 @@ When a Wayland application sets a new selection, the compositor emits an `offer`
              \-- uri-list: percent-decode, strip file://   |   mislabelled image: re-identify by magic bytes
              |
              v
+ [Stage 4b: Blank-Text Filter (daemon ingestion path)]
+             \-- text-like MIME that trims to nothing -> discard, not counted as shed
+             |
+             v
  [Stage 5: Forward]
              \-- bounded SyncSender<ClipboardJob { mime, payload }>  (queue full for 2 s -> shed, counted)
   ===========================================================  crate boundary: wayland | daemon
@@ -88,6 +92,24 @@ A restore of the daemon's own does **not** appear here: since v0.8.7 there is no
 3. **Hash after every transformation.** Normalisation and image routing may change bytes; the fingerprint is computed last so the persisted hash always matches the persisted bytes.
 
 > **Invariant — what may be modified before storage.** Text and markup are stored byte for byte, with exactly one lossless exception: `text/uri-list` is decoded to plain paths. No repair, no rewriting, and no markup stripping: a `text/html` offer is persisted verbatim. `strip_html_tags` is reserved for preview generation and plain-text egress, never applied at ingress. **Raster images are rewritten only when `[image] sanitize = true`**, by the sandboxed, bounded, metadata-stripping pipeline of [06](06_local_image_pipeline.md); by default (and for GIF, SVG, AVIF and non-image types in either mode) the bytes pass through untouched. When sanitisation is enabled, PNG, BMP, JPEG and WebP leave as `image/png`.
+
+### 1.4 Whitespace-only text (daemon ingestion path only)
+
+A selection that carries nothing but spaces, tabs or newlines is not history: it would take a slot and evict something the user actually copied. Before a job is forwarded, daemon ingestion drops it with `is_whitespace_only_text` ([`crates/wayland/src/handlers/data_control/device.rs`](../crates/wayland/src/handlers/data_control/device.rs)):
+
+```rust
+fn is_whitespace_only_text(mime: &str, data: &[u8]) -> bool {
+    crate::core::utils::is_text_like_mime(mime) && std::str::from_utf8(data).is_ok_and(|s| s.trim().is_empty())
+}
+```
+
+| Input | Outcome |
+| :--- | :--- |
+| Text-like MIME, valid UTF-8, `trim()` empty | Discarded before the queue; the reader permit is released with the payload, and nothing is counted as shed because this is a deliberate filter, not overload |
+| Binary MIME (`image/png`, `application/octet-stream`, ...) | Kept: `is_text_like_mime` gates the test, so a binary payload is never decoded in search of spaces |
+| Invalid UTF-8 | Kept: blankness cannot be proven, so the bytes are stored rather than silently dropped |
+
+The explicit paths are deliberately unaffected. `y4p paste-from <mime>` calls the read path directly (Action Mode, [01](01_wayland_streaming_io.md) section 5) and returns a blank selection verbatim, and `y4p store` persists exactly what stdin carried, under the 32 MiB bound ([04](04_strict_cli_and_stable_id.md) section 6). Only the daemon's automatic ingestion filters.
 
 ---
 

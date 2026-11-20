@@ -93,6 +93,18 @@ pub enum DaemonExit { Clean, StartFailed, ConnectionLost }
 
 Only an exit that was actually asked for is clean. This is what makes `contrib/systemd/y4p.service`'s `Restart=on-failure` do something useful.
 
+### 1.3 IPC requests cannot hold the loop either
+
+`accept_and_dispatch` ([`crates/daemon/src/ipc.rs`](../crates/daemon/src/ipc.rs)) reads exactly one request line per connection, under the same two bounds that keep a hostile or broken client from stalling the poll thread:
+
+| Bound | Value | Effect |
+| :--- | :--- | :--- |
+| Socket read timeout | `IPC_STATUS_TIMEOUT_MS` = 1000 ms (`SO_RCVTIMEO`) | A client that connects and then stalls, or never sends the delimiter, is disconnected instead of parking the daemon in `read` |
+| Request line length | `MAX_REQUEST_BYTES` = 128 bytes | The longest legitimate request is one command byte plus a 20-digit `i64` and the delimiter, so 128 is generous; a longer line without a delimiter is cut off rather than growing the daemon's buffer |
+| Decoding | `Command::decode` | A line with an unknown command byte or a non-numeric id dispatches nothing: the connection closes |
+
+The same constant bounds the CLI's read of a `status` reply, so neither side can wait longer than the other is prepared to answer.
+
 ---
 
 ## 2. Ingestion: Bounded Read, Normalise, Forward
@@ -117,6 +129,9 @@ Turning a compositor pipe into a stored record is a sequence of distinct decisio
       |
       v
  [normalise] normalise_payload(mime, bytes)   (uri-list decode, magic-byte relabel)
+      |
+      v
+ [filter]    daemon ingestion path: text-like payload that trims to nothing -> return (not a shed)
       |
       v
  [forward]   ingest::enqueue(job_tx, ClipboardJob, 2 s)   (daemon mode; bounded, may shed)
@@ -211,6 +226,26 @@ There is deliberately **no catch-all**. An offer outside those three groups (`ap
 
 > **Invariant — one reader slot, however many candidates.** The `ReaderPermit` is acquired once on the event loop, before the ingest thread is spawned, and is held until a payload has been queued or shed. Trying three candidates does not take three of the eight slots.
 
+### 2.5 Whitespace-only text never becomes history (daemon ingestion path only)
+
+An editor, a terminal or a "copy line" action happily sets a selection that is nothing but spaces, tabs and newlines. Left alone, such a selection consumes a history slot and evicts something the user actually copied, so daemon ingestion drops it before the job is queued ([`device.rs`](../crates/wayland/src/handlers/data_control/device.rs)):
+
+```rust
+fn is_whitespace_only_text(mime: &str, data: &[u8]) -> bool {
+    crate::core::utils::is_text_like_mime(mime) && std::str::from_utf8(data).is_ok_and(|s| s.trim().is_empty())
+}
+```
+
+The rule is deliberately narrow:
+
+| Input | Outcome |
+| :--- | :--- |
+| Text-like MIME whose bytes are valid UTF-8 and `trim()` to nothing | Dropped before `ingest::enqueue`; the reader permit is released with the payload and **nothing is counted as shed**, because this is an intentional filter, not overload |
+| Binary MIME (`image/png`, `application/octet-stream`, ...) | Kept untouched: `is_text_like_mime` gates the check, so a binary payload is never decoded in search of spaces |
+| Invalid UTF-8 | Kept: blankness cannot be proven, so the bytes are stored rather than silently lost |
+
+Action Mode is untouched by construction: `y4p paste-from <mime>` calls `read_first_candidate` directly, so an explicit request still returns a blank selection verbatim (section 5).
+
 ---
 
 ## 3. Self-Ingestion Without a Counter
@@ -269,7 +304,7 @@ For every payload kind the only transformation is markup stripping: if the store
 
 `list_offer_types` shares that connection and poll loop through one private `run_action_mode` helper, but configures `WaylandState::new_list_types`: the Selection handler records `OfferData.mimes` in `offered_mimes` and returns before selecting candidates, taking a reader slot or opening a pipe. `y4p paste-from -l` prints them one per line.
 
-> **Invariant — one boundary guard, two consumers.** `paste-from` returns exactly the bytes the daemon would have forwarded to the worker (before image routing, which is a persistence concern). `paste-from -l` returns exactly the MIME types the compositor advertised, in its order.
+> **Invariant — one boundary guard, two consumers.** `paste-from` returns exactly the bytes the daemon would have forwarded to the worker (before image routing, which is a persistence concern) — with one deliberate exception: the daemon drops whitespace-only text (section 2.5) that an explicit request still receives. `paste-from -l` returns exactly the MIME types the compositor advertised, in its order.
 
 ---
 
