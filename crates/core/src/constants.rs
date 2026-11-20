@@ -26,14 +26,21 @@ pub const IPC_CMD_WIPE:    u8 = 0x07;
 pub const IPC_DELIMITER:   u8 = b'\n';
 
 // Bounds the CLI's read of a `status` response so a stuck/misbehaving
-// daemon can't hang the client indefinitely.
+// daemon can't hang the client indefinitely. The daemon answers `status` from
+// its poll thread without taking the writer mutex (the reply closure reads the
+// paused flag, metrics and ingest counters only), so this budget does not have
+// to cover an image conversion. The same value bounds the daemon's read of one
+// IPC request line, so a stalled client cannot hold the poll thread.
 pub const IPC_STATUS_TIMEOUT_MS: u64 = 1000;
 
 // Bounds the CLI's wait for a `delete`/`wipe` acknowledgement. Both are
 // synchronous mutations answered by the daemon's single writer connection, and
-// `wipe` (SQLite `VACUUM` plus removal of the cache directory) can take far
-// longer than a status reply, so it gets its own, larger budget.
-pub const IPC_MUTATION_TIMEOUT_MS: u64 = 10_000;
+// that mutex may be held by a worker job running `magick` (bounded by
+// `IMAGE_TRANSCODE_TIMEOUT_SECS`, 15 s). `wipe` then runs SQLite `VACUUM` plus
+// directory removal, so the budget must exceed the converter's worst case with
+// headroom: 10 s was shorter than a legitimate wait and could report failure
+// after the mutation had been applied.
+pub const IPC_MUTATION_TIMEOUT_MS: u64 = 20_000;
 
 // Filename of the IPC control socket. Resolution of the *directory* it lives
 // in (XDG_RUNTIME_DIR preferred, /tmp as a last-resort fallback) is handled
