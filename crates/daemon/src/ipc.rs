@@ -5,8 +5,16 @@
 
 use crate::core::constants::*;
 use crate::worker::DbWorker;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
+
+/// Upper bound on one framed request line. The longest legitimate request is a
+/// `restore`/`delete` naming an `i64` in decimal ASCII (one command byte, up to
+/// 20 digits and the delimiter), so 128 bytes is generous. A client that sends
+/// more without a delimiter is disconnected instead of growing this process's
+/// buffer.
+const MAX_REQUEST_BYTES: u64 = 128;
 
 /// Decoded IPC request; wire values match `IPC_CMD_*`.
 pub enum Command {
@@ -60,9 +68,19 @@ pub fn accept_and_dispatch(
     status: impl FnOnce() -> String,
 ) -> Option<Command> {
     let (stream, _) = listener.accept().ok()?;
+    // A client that connects and then stalls (or sends an unterminated line)
+    // must not hold the poll thread: the read is bounded in time and in bytes.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(IPC_STATUS_TIMEOUT_MS)));
     let mut reader = std::io::BufReader::new(stream);
     let mut buf = Vec::new();
-    reader.read_until(IPC_DELIMITER, &mut buf).ok()?;
+    {
+        let mut request = (&mut reader).take(MAX_REQUEST_BYTES);
+        request.read_until(IPC_DELIMITER, &mut buf).ok()?;
+    }
+    if buf.last() != Some(&IPC_DELIMITER) {
+        // Timed out, or the line exceeded the cap without a delimiter.
+        return None;
+    }
 
     let cmd = Command::decode(&buf)?;
     match &cmd {
@@ -141,7 +159,7 @@ mod tests {
             db.insert_raw("text/plain", row).unwrap();
         }
         let listener = UnixListener::bind(store.socket_path()).unwrap();
-        let worker = DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false);
+        let worker = DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false).unwrap();
         (listener, worker)
     }
 
@@ -230,5 +248,37 @@ mod tests {
         let mut reply = String::new();
         std::io::BufReader::new(client).read_to_string(&mut reply).unwrap();
         assert!(reply.is_empty(), "nothing is written back");
+    }
+
+    // --- bound on the daemon's request read ---
+
+    #[test]
+    fn a_client_that_never_sends_a_newline_is_disconnected_after_the_read_timeout() {
+        let store = PrivateStore::new("ipc-stall");
+        let (listener, worker) = daemon(&store, &[]);
+        let _client = UnixStream::connect(store.socket_path()).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(accept_and_dispatch(&listener, &worker, String::new).is_none());
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(IPC_STATUS_TIMEOUT_MS),
+            "the read must wait for its bounded timeout before giving up",
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the poll thread must not hang");
+    }
+
+    #[test]
+    fn an_unterminated_oversized_line_is_rejected_without_waiting_for_the_timeout() {
+        let store = PrivateStore::new("ipc-oversize");
+        let (listener, worker) = daemon(&store, &[]);
+        let mut client = UnixStream::connect(store.socket_path()).unwrap();
+        client.write_all(&vec![b'x'; usize::try_from(MAX_REQUEST_BYTES).unwrap() + 32]).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(accept_and_dispatch(&listener, &worker, String::new).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(IPC_STATUS_TIMEOUT_MS),
+            "the byte cap must end the read before the timeout does",
+        );
     }
 }

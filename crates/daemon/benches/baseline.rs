@@ -540,7 +540,8 @@ fn ingest_once(
 
 fn bench_ingest(mode: &Mode, rows: &mut Vec<Row>) -> Result<(), String> {
     let metrics = Arc::new(DaemonMetrics::new());
-    let worker = DbWorker::spawn(ClipboardDb::open()?, Arc::clone(&metrics), false, 8, false);
+    let worker = DbWorker::spawn(ClipboardDb::open()?, Arc::clone(&metrics), false, 8, false)
+        .map_err(|e| format!("database worker: {e}"))?;
     let tx = worker.sender();
 
     let ops: u64 = if mode.full { 12 } else { 1 };

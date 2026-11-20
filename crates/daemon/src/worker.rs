@@ -44,35 +44,47 @@ pub struct DbWorker {
 }
 
 impl DbWorker {
-    pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize, sanitize_images: bool) -> Self {
+    pub fn spawn(
+        db: ClipboardDb,
+        metrics: Arc<DaemonMetrics>,
+        verbose: bool,
+        max_history: usize,
+        sanitize_images: bool,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
         let db = Arc::new(Mutex::new(db));
         let writer = Arc::clone(&db);
 
-        std::thread::spawn(move || {
-            while let Ok(job) = rx.recv() {
-                let ClipboardJob { mime, payload } = job;
-                let stored = match writer.lock() {
-                    Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history, sanitize_images),
-                    // Only reachable if a writer panicked mid-transaction. The
-                    // job is dropped rather than the worker stopped, exactly as
-                    // an unstorable payload is.
-                    Err(_) => Err("database lock poisoned; payload dropped".to_string()),
-                };
-                match stored {
-                    Ok(Some((mime, len))) => {
-                        metrics.record_ingress();
-                        if verbose {
-                            println!("{}", log_save(&mime, len));
+        // `Builder::spawn` reports a refused thread instead of panicking like
+        // `thread::spawn`; under `panic = "abort"` that difference is a clean
+        // start failure versus a whole-process abort.
+        std::thread::Builder::new()
+            .name("y4p-worker".to_owned())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let ClipboardJob { mime, payload } = job;
+                    let stored = match writer.lock() {
+                        Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history, sanitize_images),
+                        // Only reachable if a writer panicked mid-transaction.
+                        // The job is dropped rather than the worker stopped,
+                        // exactly as an unstorable payload is.
+                        Err(_) => Err("database lock poisoned; payload dropped".to_string()),
+                    };
+                    match stored {
+                        Ok(Some((mime, len))) => {
+                            metrics.record_ingress();
+                            if verbose {
+                                println!("{}", log_save(&mime, len));
+                            }
                         }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
                     }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("{}worker failed to persist data: {}", LOG_ERROR, e),
                 }
-            }
-        });
+            })
+            .map_err(|e| format!("could not start the database worker: {e}"))?;
 
-        Self { tx, db }
+        Ok(Self { tx, db })
     }
 
     /// Clone of the submission channel, handed to the ingestion path so jobs
@@ -356,7 +368,7 @@ mod tests {
         for payload in seed {
             db.insert_raw("text/plain", payload).unwrap();
         }
-        DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false)
+        DbWorker::spawn(db, Arc::new(DaemonMetrics::new()), false, 100, false).unwrap()
     }
 
     #[test]
@@ -392,7 +404,7 @@ mod tests {
     fn a_queued_job_and_a_mutation_never_interleave_on_the_connection() {
         let store = PrivateStore::new("worker-serialised");
         let metrics = Arc::new(DaemonMetrics::new());
-        let worker = DbWorker::spawn(store.open(), Arc::clone(&metrics), false, 100, false);
+        let worker = DbWorker::spawn(store.open(), Arc::clone(&metrics), false, 100, false).unwrap();
         let tx = worker.sender();
 
         // The store is empty, so the queued payload will be row 1. Deleting it
