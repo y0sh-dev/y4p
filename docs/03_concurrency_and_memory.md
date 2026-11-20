@@ -19,27 +19,40 @@ pub struct DbWorker {
     db: Arc<Mutex<ClipboardDb>>,
 }
 
-pub fn spawn(db: ClipboardDb, metrics: Arc<DaemonMetrics>, verbose: bool, max_history: usize, sanitize_images: bool) -> Self {
+pub fn spawn(
+    db: ClipboardDb,
+    metrics: Arc<DaemonMetrics>,
+    verbose: bool,
+    max_history: usize,
+    sanitize_images: bool,
+) -> Result<Self, String> {
     let (tx, rx) = mpsc::sync_channel::<ClipboardJob>(INGEST_QUEUE_CAPACITY);
     let db = Arc::new(Mutex::new(db));
     let writer = Arc::clone(&db);
 
-    std::thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
-            let ClipboardJob { mime, payload } = job;
-            let stored = match writer.lock() {
-                Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history, sanitize_images),
-                Err(_) => Err("database lock poisoned; payload dropped".to_string()),
-            };
-            /* metrics + logging */
-        }
-    });
+    // `Builder::spawn` reports a refused thread instead of panicking; under
+    // `panic = "abort"` that is a clean start failure, not a process abort.
+    std::thread::Builder::new()
+        .name("y4p-worker".to_owned())
+        .spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let ClipboardJob { mime, payload } = job;
+                let stored = match writer.lock() {
+                    Ok(mut db) => store_materialised(&mut db, ClipboardJob::from_payload(mime, payload), max_history, sanitize_images),
+                    Err(_) => Err("database lock poisoned; payload dropped".to_string()),
+                };
+                /* metrics + logging */
+            }
+        })
+        .map_err(|e| format!("could not start the database worker: {e}"))?;
 
-    Self { tx, db }
+    Ok(Self { tx, db })
 }
 ```
 
 The connection is not moved into the thread; it is shared with the event loop through the `DbWorker` (section 2.2). The mutex, not ownership, is what makes "one writer" true, and the worker takes it once per job: a job is materialised, optionally routed, hashed and persisted without releasing it, so two jobs can never interleave either.
+
+`spawn` is itself fallible: a refused thread is an `Err(String)` that `start_daemon` prints and turns into `DaemonExit::StartFailed`, so a host that cannot create the thread fails to start cleanly instead of aborting the whole process ([01](01_wayland_streaming_io.md) section 1.2).
 
 Every other part of the daemon that wants something persisted builds a `ClipboardJob` and offers it to a cloned `mpsc::SyncSender` (bounded; see section 2.1). The event loop does not send jobs: for `delete` and `wipe` it calls the worker's own methods, which take the same mutex.
 
@@ -136,7 +149,7 @@ Why drop the newest rather than evict the oldest: `std` offers no way to remove 
 | `DbWorker::wipe()` | Runs the whole `ClipboardDb::wipe()` under the same mutex, so `VACUUM`, `PRAGMA shrink_memory;`, the cache clear and `malloc_trim(0)` all happen in the daemon process, on the daemon's connection, with no ingestion job in flight |
 | Poisoned lock | Mapped to `Err(String)` (`database lock poisoned; ...`) and reported as `ERR:<message>`; never `unwrap()`/`expect()` |
 
-The event loop executes a mutation inside `ipc::accept_and_dispatch`, on the poll thread, and writes the reply back on the same `UnixStream`: `OK:true`, `OK:false` or `OK` on success, `ERR:<message>` otherwise (one line, terminated by `IPC_DELIMITER`). The CLI reads one line under `IPC_MUTATION_TIMEOUT_MS` (10 000 ms), much longer than `IPC_STATUS_TIMEOUT_MS` (1000 ms) because a `VACUUM` over a large database legitimately takes seconds.
+The event loop executes a mutation inside `ipc::accept_and_dispatch`, on the poll thread, and writes the reply back on the same `UnixStream`: `OK:true`, `OK:false` or `OK` on success, `ERR:<message>` otherwise (one line, terminated by `IPC_DELIMITER`). The CLI reads one line under `IPC_MUTATION_TIMEOUT_MS` (20 000 ms), much longer than `IPC_STATUS_TIMEOUT_MS` (1000 ms) because the writer mutex may be held by a converter (bounded at 15 s) and a `VACUUM` over a large database legitimately takes seconds on top; 20 s keeps headroom over both without letting a broken daemon hang the client indefinitely.
 
 Only a *failed connect* makes the CLI act on its own handle. Once connected, a timeout or an `ERR:` reply is reported and the command exits non-zero: falling back to a local write while the daemon owns the connection would reintroduce the race this section removes.
 

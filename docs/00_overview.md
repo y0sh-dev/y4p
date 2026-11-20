@@ -65,10 +65,13 @@ y4p/
 │   ├── daemon/         y4p-daemon   event loop, IPC socket, background worker
 │   └── cli/            y4p-cli      strict argument parsing, command handlers, formatting
 ├── docs/               this directory (`history/` keeps the archived measurements)
-├── contrib/systemd/    `y4p.service`, the user unit bundled with the project
+├── contrib/
+│   ├── systemd/        `y4p.service`, the user unit bundled with the project
+│   ├── packaging/      `PKGBUILD`, the Arch Linux package recipe
+│   └── examples/       `y4p-fzf.sh`, a minimal fzf history picker
 └── scripts/
     ├── check.sh        workspace-wide tests + strict clippy
-    └── e2e_compositor.sh   headless compositor matrix (skips when none is installed)
+    └── e2e_compositor.sh   live compositor matrix (headless, or the current session with `E2E_USE_LIVE_WAYLAND=1`)
 ```
 
 ### 2.1 Crate responsibility matrix
@@ -76,14 +79,14 @@ y4p/
 | Crate | Single responsibility | Workspace dependencies | Third-party dependencies | Tests |
 | :--- | :--- | :--- | :--- | ---: |
 | `y4p-core` | Shared plumbing: constants, XDG paths, `y4p.toml` parser, MIME helpers, the `Payload` vocabulary, pipe-sizing / kernel-copy primitives, exit flag | none | `libc`, `percent-encoding` | 138 |
-| `y4p-storage` | Persistence: SQL store, schema gate (`SCHEMA_VERSION = 4`), inline payloads, legacy chunk reads, blob cache and its LRU quota, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 87 |
+| `y4p-storage` | Persistence: SQL store, schema gate (`SCHEMA_VERSION = 4`), inline payloads, legacy chunk reads, blob cache and its LRU quota, `ClipboardDb` facade | core | `rusqlite` (bundled SQLite), `sha3` | 88 |
 | `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 157 |
-| `y4p-wayland` | Compositor I/O: offers, MIME candidates, bounded reads, normalisation, egress; ingestion backpressure (reader gate, bounded queue) | core | `wayland-client`, `wayland-protocols`, `libc` | 95 |
-| `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `DbWorker` (optional image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 37 |
-| `y4p-cli` | Argument parsing, validation, output formatting, `stats` and `doctor` reports; returns `CliAction` to the root | core, storage | `unicode-width` | 20 |
+| `y4p-wayland` | Compositor I/O: offers, MIME candidates, bounded reads, normalisation, egress; ingestion backpressure (reader gate, bounded queue) | core | `wayland-client`, `wayland-protocols`, `libc` | 101 |
+| `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `DbWorker` (optional image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 39 |
+| `y4p-cli` | Argument parsing, validation, output formatting, `stats` and `doctor` reports; returns `CliAction` to the root | core, storage | `unicode-width` | 24 |
 | `y4p` (root) | Wiring only | all of the above | `libc`, `ctrlc` | 0 |
 
-Total: **534** tests across the six crates, plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. The root has no tests of its own. Nothing in the test suite talks to a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), ingestion through real pipes and a real database, and the live matrix is a separate script (`scripts/e2e_compositor.sh`) that skips when no headless compositor is installed.
+Total: **547** tests across the six crates, plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. The root has no tests of its own. Nothing in the test suite talks to a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), ingestion through real pipes and a real database, and the live matrix is a separate script (`scripts/e2e_compositor.sh`) that starts a headless compositor, reuses the current session with `E2E_USE_LIVE_WAYLAND=1`, or prints `[SKIP]` and exits 0 when no compositor is installed.
 
 ### 2.2 Dependency direction
 
@@ -174,7 +177,7 @@ Ingestion has one road: the compositor pipe is drained into a bounded `Vec<u8>` 
 | 1. Gate | `y4p-wayland` | Sensitive hints rejected and the concurrent-reader limit (8) enforced, both before any pipe is opened. A pipe that still cannot be allocated (`EMFILE`) is shed, counted and logged |
 | 2. Select | `y4p-wayland` | Allowlisted candidate array (`select_mime_candidates`: `MIME_PRIORITY_ORDER`, then `image/*`, then `text/*`), tried in order until one delivers |
 | 3. Read | `y4p-wayland` | One bounded read per selection (`MAX_PAYLOAD_BYTES` = 32 MiB, one probe byte) under a single 5 s deadline |
-| 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes |
+| 4. Normalise | `y4p-wayland` | `text/uri-list` decoded; mislabelled images re-identified by magic bytes; on the daemon path, whitespace-only text is dropped before the queue ([01](01_wayland_streaming_io.md) section 2.5) |
 | 5. Forward | `y4p-wayland` -> `y4p-daemon` | `ClipboardJob { mime, payload }` over a bounded `sync_channel` (64 slots); overload is shed and counted |
 | 6. Route (opt-in) | `y4p-daemon` worker | When `[image] sanitize = true`, raster images are privacy-stripped and re-encoded by `y4p-image` (original kept on any failure). By default the bytes pass through untouched |
 | 7. Fingerprint | `y4p-daemon` worker | SHA3-256 over the **final** bytes |

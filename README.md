@@ -85,6 +85,16 @@ y4p stats
 y4p doctor
 ```
 
+### Package or manual install
+
+The bundled [`contrib/packaging/PKGBUILD`](contrib/packaging/PKGBUILD) installs the Arch Linux layout; a manual build into the local prefix (`/usr/local`) needs no package at all. The systemd unit is the same file either way, because it starts the daemon as `/usr/bin/env y4p daemon` and therefore follows `PATH`:
+
+| File | Package (`PKGBUILD`) | Manual build |
+| :--- | :--- | :--- |
+| Binary | `/usr/bin/y4p` | `/usr/local/bin/y4p` |
+| systemd user unit | `/usr/lib/systemd/user/y4p.service` | `~/.config/systemd/user/y4p.service` |
+| Zsh completions | `/usr/share/zsh/site-functions/_y4p` | `completions/` (add to `fpath`) |
+
 ### Run as a user service
 
 A `systemd` user unit ships in [`contrib/systemd/y4p.service`](contrib/systemd/y4p.service). It uses `Restart=on-failure`, which only works because `y4p daemon` reports a failed start or a lost compositor connection as a non-zero exit and a requested stop as `0`:
@@ -110,6 +120,12 @@ For every command, its flags, and detailed examples, run:
 y4p help
 ```
 
+### Interactive pickers
+
+[`contrib/examples/y4p-fzf.sh`](contrib/examples/y4p-fzf.sh) is a minimal `fzf` history picker. It lists `y4p list --raw --id`, previews with `y4p show --id` and restores with `y4p copy-to --id`, so a clipboard event between selection and restore cannot change what gets pasted. It needs `fzf` only: `Y4P_BIN` overrides the binary and `Y4P_FZF_RANGE` the default `0-200` window.
+
+For Rofi, the companion project [`y4p-rofi`](https://github.com/y0sh-dev/y4p-rofi) provides the same workflow as a Rofi script mode.
+
 <details>
 <summary><strong>Verification & Tests</strong></summary>
 
@@ -123,9 +139,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Full automated verification suite (both of the above)
 bash scripts/check.sh
 
-# Live compositor matrix (cage or sway + wl-clipboard + ImageMagick);
-# prints [SKIP] and exits 0 when no headless compositor is installed
+# Live compositor matrix (cage, sway or Hyprland + wl-clipboard + ImageMagick);
+# prints [SKIP] and exits 0 when no compositor is installed at all
 bash scripts/e2e_compositor.sh
+
+# Reuse the compositor you are already running instead of starting one,
+# which is how the matrix runs on Hyprland and other compositors that
+# cannot provide a second headless instance
+E2E_USE_LIVE_WAYLAND=1 bash scripts/e2e_compositor.sh
 ```
 
 </details>
@@ -168,7 +189,7 @@ Project governance, planning and references:
 
 - [`.github/POLICY.md`](.github/POLICY.md): Shared contribution policy and engineering standards.
 - [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and historical targets; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
-- [`ROADMAP_v0.10.md`](ROADMAP_v0.10.md): The v0.9.x subtraction milestones towards v0.10.0.
+- [`ROADMAP_v1.0.md`](ROADMAP_v1.0.md): The v0.10.x milestones towards v1.0.0: feature freeze, live E2E matrix, packaging and final documentation.
 - [`README_ja.md`](README_ja.md): Japanese README (日本語版).
 
 ---

@@ -40,7 +40,7 @@ Following `v0.10.0` (**Subtraction**), `v1.0.0` (**Boring**) freezes all new fea
   - Bundle `contrib/packaging/PKGBUILD` in Git (AUR registration remains out of scope whilst new AUR registrations are suspended; Nix is out of scope).
   - Bundle minimal `fzf` helper script(s) under `contrib/examples/` and reference `y4p-rofi` as the companion Rofi integration.
 
-- [ ] **v0.10.6: Final 1.0 Documentation Synchronisation**
+- [x] **v0.10.6: Final 1.0 Documentation Synchronisation**
   - Synchronise `README.md`, `README_ja.md`, and `docs/` with installation, `y4p.toml`, `systemd`, `PKGBUILD`, and helper/companion references.
 
 ### Phase 4: Formal Release (`v1.0.0`)

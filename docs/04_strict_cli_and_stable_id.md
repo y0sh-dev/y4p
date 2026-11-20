@@ -192,6 +192,8 @@ For an interactive user this is a slightly less forgiving CLI. For a script, the
 | `delete`, `wipe` | IPC mutation (`IPC_CMD_DELETE` `0x06` + decimal ID, `IPC_CMD_WIPE` `0x07`), answered on the same connection. **Only when `UnixStream::connect` fails** does the CLI fall back to its own `ClipboardDb`; once connected, a timeout or an `ERR:` reply is an error and the command exits non-zero, never a second attempt against the file ([03](03_concurrency_and_memory.md) section 2.2) |
 | `daemon`, `paste-from`, `doctor` | `y4p-cli` only validates and returns a `CliAction` (`RunDaemon`, `PasteFrom` / `ListTypes`, `Doctor`); the composition root (`src/main.rs`) performs the actual daemon / Wayland call, so `y4p-cli` depends on neither crate |
 
+`y4p store` reads stdin under the same bound as compositor ingestion: `read_payload` wraps `core::payload::read_bounded` with `MAX_PAYLOAD_BYTES` (32 MiB) and one probe byte, so an oversized stream is rejected with `payload exceeds the 33554432-byte limit.` and nothing is written — the buffer is never truncated and a partial read is never persisted. The ceiling is enforced again in `ClipboardDb::insert_with_hash`, the single storage entry point for every producer, so an oversized payload cannot reach the database even if it bypassed stdin.
+
 The socket lives at `$XDG_RUNTIME_DIR/y4p/y4p.sock`, falling back to `/tmp/y4p.<uid>.sock` only when no session runtime directory exists ([`crates/core/src/lib.rs`](../crates/core/src/lib.rs)).
 
 ---
