@@ -158,7 +158,13 @@ pub fn start_daemon(mut db: ClipboardDb, verbose: bool) -> DaemonExit {
     // handlers. Loaded before the worker so ingestion can be told whether
     // image sanitisation is enabled.
     let config = Arc::new(crate::core::config::Config::load());
-    let writer = DbWorker::spawn(db, metrics.clone(), verbose, max_history, config.should_sanitize_images());
+    let writer = match DbWorker::spawn(db, metrics.clone(), verbose, max_history, config.should_sanitize_images()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            eprintln!("{}{}", LOG_ERROR, e);
+            return DaemonExit::StartFailed;
+        }
+    };
 
     let Some((conn, mut event_queue)) = wayland::create_connection() else {
         eprintln!("{}{}", LOG_ERROR, MSG_WAYLAND_CONN_FAIL);

@@ -21,7 +21,7 @@ use cache::{Adoption, FileCache};
 use db::SqliteStore;
 use schema::SchemaManager;
 
-use crate::core::constants::{CACHE_QUOTA_BYTES, SQLITE_TIMEOUT_MS};
+use crate::core::constants::{CACHE_QUOTA_BYTES, MAX_PAYLOAD_BYTES, SQLITE_TIMEOUT_MS};
 
 /// A single metadata row, shared by `fetch_metadata` and `search_metadata` so
 /// callers (and future callers) don't have to keep re-deriving the same
@@ -106,6 +106,16 @@ impl ClipboardDb {
     /// bytes the cache does not hold. If the row then fails to commit, a file
     /// this call placed is taken back out.
     pub fn insert_with_hash(&mut self, mime: &str, data: &[u8], hash: &str, max_history: usize) -> Result<i64, String> {
+        // The 32 MiB cap is an ingestion invariant, but this is the single
+        // storage entry point for every producer (daemon worker, CLI `store`,
+        // tests), so it is enforced here as well rather than trusted.
+        if data.len() as u64 > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "payload of {} bytes exceeds the {}-byte limit",
+                data.len(),
+                MAX_PAYLOAD_BYTES
+            ));
+        }
         let cache_class = !db::is_skipped(mime, data.len() as u64) && db::is_cache_class(mime);
         let placed = if cache_class {
             Some(self.cache.store(hash, data).map_err(|e| format!("cache write failed: {}", e))?)
@@ -320,6 +330,20 @@ mod tests {
 
     fn inode(path: &Path) -> u64 {
         fs::metadata(path).unwrap().ino()
+    }
+
+    // --- the storage-side payload ceiling ---
+
+    #[test]
+    fn a_payload_over_the_limit_is_refused_before_any_store_is_touched() {
+        let mut f = Fixture::new("oversize");
+        let oversized = vec![0u8; usize::try_from(MAX_PAYLOAD_BYTES).unwrap() + 1];
+
+        let err = f.db.insert_with_hash("text/plain", &oversized, "h-oversize", 100).unwrap_err();
+
+        assert!(err.contains("exceeds"), "{err}");
+        assert_eq!(f.db.get_total_count(), 0, "no row may be written");
+        assert_eq!(f.cache_files(), 0, "no cache file may be written");
     }
 
     // --- cache deduplication and rotation through `insert_raw` ---
