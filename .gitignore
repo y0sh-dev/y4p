@@ -28,6 +28,6 @@ Thumbs.db
 
 # --- Agent Local Metadata ---
 .protocols/
-report.md
+report*.md
 status.md
 
