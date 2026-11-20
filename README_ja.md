@@ -8,7 +8,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Wayland-lightgreen.svg)](https://wayland.freedesktop.org)
-[![Version](https://img.shields.io/badge/version-0.10.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` は、Wayland向けにネイティブ設計された、スタンドアロンのクリップボードマネージャーです。
 
@@ -196,8 +196,9 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 - [`.github/POLICY.md`](.github/POLICY.md): コントリビューション方針および品質基準（英語）。
 - [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）と歴史的な目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
-- [`ROADMAP_v1.0.md`](ROADMAP_v1.0.md): v1.0.0 へ向かう v0.10.x のマイルストーン（機能凍結・実コンポジタE2E・パッケージング・最終ドキュメント整備／英語）。
 - [`README.md`](README.md): 英語版README。
+
+> **プロジェクト状態（`v1.0.0` — Boring）:** `y4p` は `v1.0.0` をもって機能完成（事実上の開発終了）と位置づけています。`wlroots` や `aquamarine` 等の上流 Wayland コンポジタ／ライブラリに本プロジェクトが深刻な影響を受ける破壊的変更がない限り、今後の更新は予定していません。
 
 ---
 

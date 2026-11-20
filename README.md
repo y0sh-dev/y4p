@@ -8,7 +8,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Wayland-lightgreen.svg)](https://wayland.freedesktop.org)
-[![Version](https://img.shields.io/badge/version-0.10.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/y0sh-dev/y4p/releases/latest)
 
 `y4p` is a standalone clipboard manager, built natively for Wayland.
 
@@ -189,8 +189,9 @@ Project governance, planning and references:
 
 - [`.github/POLICY.md`](.github/POLICY.md): Shared contribution policy and engineering standards.
 - [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): Quantitative baseline (latency, allocations, memory bounds) and historical targets; reproduce with `cargo bench -p y4p-daemon --bench baseline`.
-- [`ROADMAP_v1.0.md`](ROADMAP_v1.0.md): The v0.10.x milestones towards v1.0.0: feature freeze, live E2E matrix, packaging and final documentation.
 - [`README_ja.md`](README_ja.md): Japanese README (日本語版).
+
+> **Project Status (`v1.0.0` — Boring):** `y4p` is feature-complete and effectively finished as of `v1.0.0`. Unless upstream Wayland compositors or libraries (such as `wlroots` or `aquamarine`) introduce breaking changes that seriously affect this project, no further updates are planned.
 
 ---
 
