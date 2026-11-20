@@ -36,7 +36,7 @@ Following `v0.10.0` (**Subtraction**), `v1.0.0` (**Boring**) freezes all new fea
 
 ### Phase 3: Packaging, Helpers, & Final Documentation (`v0.10.5` – `v0.10.6`)
 
-- [ ] **v0.10.5: Packaging & Helper Scripts**
+- [x] **v0.10.5: Packaging & Helper Scripts**
   - Bundle `contrib/packaging/PKGBUILD` in Git (AUR registration remains out of scope whilst new AUR registrations are suspended; Nix is out of scope).
   - Bundle minimal `fzf` helper script(s) under `contrib/examples/` and reference `y4p-rofi` as the companion Rofi integration.
 
