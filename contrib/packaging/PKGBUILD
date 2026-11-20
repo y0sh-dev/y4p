@@ -1,6 +1,6 @@
 # Maintainer: yosana <https://github.com/y0sh-dev>
 pkgname=y4p
-pkgver=0.10.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='A robust, unified clipboard manager for Wayland with SQLite storage'
 arch=('x86_64' 'aarch64')
