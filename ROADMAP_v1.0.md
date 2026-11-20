@@ -22,9 +22,9 @@ Following `v0.10.0` (**Subtraction**), `v1.0.0` (**Boring**) freezes all new fea
     4. Align `IPC_STATUS_TIMEOUT_MS` / `IPC_MUTATION_TIMEOUT_MS` above the maximum `IMAGE_TRANSCODE_TIMEOUT_SECS` (15 s) writer lock hold (`crates/core/src/constants.rs`).
   - **Clearance Criteria**: `P0 = 0` and `P1 = 0` (P2 items deferred under 1.0 feature freeze).
 
-- [ ] **v0.10.2: `y4p doctor` & `systemd` Live Verification**
-  - Verify `y4p doctor` passes across live Sway and Hyprland sessions.
-  - Verify `contrib/systemd/y4p.service` startup, restart, and socket hand-over behaviour.
+- [x] **v0.10.2: `y4p doctor` & `systemd` Live Verification**
+  - Verify `y4p doctor` passes across live Sway and Hyprland sessions (verified on live Hyprland: 17 passed, 0 warnings, 0 failed; Sway unverified locally as `sway` is not installed).
+  - Verify `contrib/systemd/y4p.service` startup, restart, and socket hand-over behaviour (`systemd-analyze verify` exit 0; `systemctl --user status y4p.service` active/running).
 
 ### Phase 2: Live Compositor E2E Matrix (`v0.10.3` – `v0.10.4`)
 

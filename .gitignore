@@ -28,6 +28,7 @@ Thumbs.db
 
 # --- Agent Local Metadata ---
 .protocols/
+.ignore
 report*.md
 *sample.md
 status.md

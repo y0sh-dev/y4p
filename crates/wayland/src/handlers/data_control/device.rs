@@ -329,7 +329,21 @@ fn ingest_candidates<F>(
 {
     let deadline = Instant::now() + read_timeout;
     let job = match read_first_candidate(candidates, deadline, open) {
-        FallbackOutcome::Ready { mime, payload } => ClipboardJob::from_payload(mime, payload),
+        FallbackOutcome::Ready { mime, payload } => {
+            // A selection that carries nothing but whitespace — the stray
+            // empty line or run of blanks an editor or terminal copies — is
+            // not worth a history entry. This is a deliberate ingestion
+            // filter, not overload, so nothing is counted as shed; the permit
+            // is simply released with this stack frame.
+            //
+            // Only this daemon path filters: Action Mode calls
+            // `read_first_candidate` directly, so `y4p paste-from` still
+            // returns such a selection verbatim.
+            if payload.as_bytes().is_some_and(|data| is_whitespace_only_text(&mime, data)) {
+                return;
+            }
+            ClipboardJob::from_payload(mime, payload)
+        }
         FallbackOutcome::TimedOut => {
             let total = stats.record_shed_timeout();
             ingest::report_shed("pipe read timed out", total);
@@ -346,6 +360,17 @@ fn ingest_candidates<F>(
         let total = stats.record_shed_queue();
         ingest::report_shed("worker queue full", total);
     }
+}
+
+/// True when `data` is a text-like payload whose whole content is whitespace.
+///
+/// `mime` gates the check: a binary payload must never be decoded as UTF-8 in
+/// search of spaces, and an image of near-blank pixels is still an image. Only
+/// bytes that are valid UTF-8 and trim to nothing (spaces, tabs, newlines,
+/// carriage returns and other Unicode whitespace alike) qualify, so an
+/// undecodable byte sequence is always kept rather than silently dropped.
+fn is_whitespace_only_text(mime: &str, data: &[u8]) -> bool {
+    crate::core::utils::is_text_like_mime(mime) && std::str::from_utf8(data).is_ok_and(|s| s.trim().is_empty())
 }
 
 enum DrainOutcome {
@@ -890,6 +915,70 @@ mod tests {
 
         assert!((stats.shed_readers(), stats.shed_timeout(), stats.shed_queue()) == (0, 0, 0), "an unusable selection is not overload");
         assert!(rx.try_recv().is_err());
+    }
+
+    // --- whitespace-only ingestion filter ---
+
+    #[test]
+    fn whitespace_only_text_is_neither_queued_nor_counted_as_shed() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        let stats = IngestStats::default();
+        let (gate, permit) = gate_with_one_permit();
+
+        ingest_one(filled_pipe(b"   \n\t  "), "text/plain".to_owned(), &tx, &stats, permit, Duration::ZERO);
+
+        assert!(rx.try_recv().is_err(), "a blank selection must not reach the worker");
+        assert_eq!((stats.shed_readers(), stats.shed_timeout(), stats.shed_queue()), (0, 0, 0), "filtering is not overload");
+        assert_eq!(gate.active(), 0, "the permit is released with the dropped payload");
+    }
+
+    #[test]
+    fn whitespace_only_legacy_string_atoms_are_filtered_too() {
+        for mime in ["UTF8_STRING", "STRING", "text/plain; charset=utf-8"] {
+            let (tx, rx) = sync_channel::<ClipboardJob>(1);
+            ingest_one(filled_pipe(b"\n\r\n \t"), mime.to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO);
+            assert!(rx.try_recv().is_err(), "{mime} whitespace must not be queued");
+        }
+    }
+
+    #[test]
+    fn text_with_one_visible_character_is_still_queued() {
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        ingest_one(filled_pipe(b" a "), "text/plain".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO);
+        assert_eq!(only_job(&rx).payload.as_bytes(), Some(b" a ".as_slice()));
+    }
+
+    #[test]
+    fn whitespace_bytes_under_a_binary_mime_are_still_queued() {
+        // `is_text_like_mime` gates the filter: a binary payload is never
+        // decoded as UTF-8 in search of spaces, so these bytes stay.
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        ingest_one(filled_pipe(b"   \n"), "image/png".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO);
+        assert_eq!(only_job(&rx).payload.as_bytes(), Some(b"   \n".as_slice()));
+    }
+
+    #[test]
+    fn an_undecodable_text_payload_is_still_queued() {
+        // Invalid UTF-8 cannot be proven blank, so it is kept rather than
+        // silently dropped.
+        let bytes = b"\xff\xfe   \n";
+        let (tx, rx) = sync_channel::<ClipboardJob>(1);
+        ingest_one(filled_pipe(bytes), "text/plain".to_owned(), &tx, &IngestStats::default(), None, Duration::ZERO);
+        assert_eq!(only_job(&rx).payload.as_bytes(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn action_mode_still_returns_a_whitespace_only_selection() {
+        // `y4p paste-from` is an explicit request, so it gets exactly what the
+        // selection holds — blank lines and all.
+        let candidates = mimes(&["text/plain"]);
+        let outcome = read_first_candidate(&candidates, Instant::now() + Duration::from_secs(5), |_| Some(filled_pipe(b"   \n")));
+
+        let FallbackOutcome::Ready { mime, payload } = outcome else {
+            panic!("Action Mode must receive the payload verbatim");
+        };
+        assert_eq!(mime, "text/plain");
+        assert_eq!(payload.as_bytes(), Some(b"   \n".as_slice()));
     }
 
     // --- read_pipe_payload ---
