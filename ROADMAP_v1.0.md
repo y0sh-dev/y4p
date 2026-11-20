@@ -13,7 +13,7 @@ Following `v0.10.0` (**Subtraction**), `v1.0.0` (**Boring**) freezes all new fea
 
 ### Phase 1: Feature Freeze & Final Static Audit (`v0.10.1` – `v0.10.2`)
 
-- [ ] **v0.10.1: Feature Freeze, Final Static Audit (`report_finally.md`), & P0/P1 Fixes**
+- [x] **v0.10.1: Feature Freeze, Final Static Audit (`report_finally.md`), & P0/P1 Fixes**
   - Freeze all new feature additions; accept bug fixes and reliability hardening only.
   - Clear all P0/P1 findings from `report_finally.md`:
     1. Bound `accept_and_dispatch` IPC socket reads (`SO_RCVTIMEO` + line cap) so a stalled client cannot hang the daemon poll loop (`crates/daemon/src/ipc.rs`).
