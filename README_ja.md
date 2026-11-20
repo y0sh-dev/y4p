@@ -91,6 +91,16 @@ y4p stats
 y4p doctor
 ```
 
+### パッケージ導入と手動インストール
+
+同梱の [`contrib/packaging/PKGBUILD`](contrib/packaging/PKGBUILD) はArch Linux向けの配置を行い、手動ビルドではローカルのプレフィックス（`/usr/local`）へ配置するためパッケージは不要です。systemdユニットはどちらの場合も同じファイルです。`/usr/bin/env y4p daemon` として起動するため、`PATH` 上のバイナリをそのまま利用します。
+
+| ファイル | パッケージ（`PKGBUILD`） | 手動ビルド |
+| :--- | :--- | :--- |
+| バイナリ | `/usr/bin/y4p` | `/usr/local/bin/y4p` |
+| systemdユーザーユニット | `/usr/lib/systemd/user/y4p.service` | `~/.config/systemd/user/y4p.service` |
+| Zsh補完 | `/usr/share/zsh/site-functions/_y4p` | `completions/`（`fpath` に追加） |
+
 ### ユーザーサービスとして常駐させる
 
 `systemd` のユーザーユニットが [`contrib/systemd/y4p.service`](contrib/systemd/y4p.service) にあります。`Restart=on-failure` が機能するのは、`y4p daemon` が起動失敗・コンポジタ切断を非0で、要求された停止だけを `0` で終えるためです。
@@ -116,6 +126,12 @@ fpath+=(/path/to/y4p/completions)
 y4p help
 ```
 
+### 対話的なピッカー
+
+[`contrib/examples/y4p-fzf.sh`](contrib/examples/y4p-fzf.sh) は最小構成の `fzf` 履歴ピッカーです。`y4p list --raw --id` で一覧し、`y4p show --id` でプレビュー、`y4p copy-to --id` で復元するため、選択から復元までの間にクリップボードが更新されても、貼り付けられる内容が入れ替わることはありません。必要なのは `fzf` のみで、`Y4P_BIN` でバイナリ、`Y4P_FZF_RANGE` で既定の `0-200` の範囲を変更できます。
+
+Rofi連携では、コンパニオンプロジェクト [`y4p-rofi`](https://github.com/y0sh-dev/y4p-rofi) が同じ操作をRofiのスクリプトモードとして提供します。
+
 <details>
 <summary><strong>検証とテスト</strong></summary>
 
@@ -129,9 +145,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 # 上記2つをまとめた自動検証スクリプト
 bash scripts/check.sh
 
-# 実コンポジタでのマトリクス試験（cage/sway + wl-clipboard + ImageMagick）。
-# ヘッドレスコンポジタが無い環境では [SKIP] を出して exit 0
+# 実コンポジタでのマトリクス試験（cage/sway/Hyprland + wl-clipboard + ImageMagick）。
+# コンポジタが1つも導入されていない環境では [SKIP] を出して exit 0
 bash scripts/e2e_compositor.sh
+
+# 既に起動中のコンポジタをそのまま使う（Hyprlandなど、2つ目の
+# ヘッドレスインスタンスを用意できない環境向け）
+E2E_USE_LIVE_WAYLAND=1 bash scripts/e2e_compositor.sh
 ```
 
 </details>
@@ -176,7 +196,7 @@ cp y4p.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/y4p/y4p.toml"
 
 - [`.github/POLICY.md`](.github/POLICY.md): コントリビューション方針および品質基準（英語）。
 - [`docs/history/PERFORMANCE.md`](docs/history/PERFORMANCE.md): 性能の定量ベースライン（レイテンシ、アロケーション、メモリ上限）と歴史的な目標（英語）。再現は `cargo bench -p y4p-daemon --bench baseline`。
-- [`ROADMAP_v0.10.md`](ROADMAP_v0.10.md): v0.10.0 (Subtraction) へ向かう v0.9.x の削減マイルストーン（英語）。
+- [`ROADMAP_v1.0.md`](ROADMAP_v1.0.md): v1.0.0 へ向かう v0.10.x のマイルストーン（機能凍結・実コンポジタE2E・パッケージング・最終ドキュメント整備／英語）。
 - [`README.md`](README.md): 英語版README。
 
 ---
