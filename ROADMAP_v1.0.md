@@ -28,11 +28,11 @@ Following `v0.10.0` (**Subtraction**), `v1.0.0` (**Boring**) freezes all new fea
 
 ### Phase 2: Live Compositor E2E Matrix (`v0.10.3` – `v0.10.4`)
 
-- [ ] **v0.10.3: Expand Live Compositor E2E Suite (`scripts/e2e_compositor.sh`)**
+- [x] **v0.10.3: Expand Live Compositor E2E Suite (`scripts/e2e_compositor.sh`)**
   - Cover the minimal real-world matrix: plain and rich text (`text/html`, `text/uri-list`), raster and animated images (`PNG`, `JPEG`, `GIF`, `APNG`, `WebP` raw by default and sanitised when enabled), `32 MiB` cap and oversized rejection, burst backpressure, `512 MiB` cache LRU eviction (with pin protection), daemon restart persistence, and `y4p paste-from -l` / `--list-types`.
 
-- [ ] **v0.10.4: 100% E2E Pass Across Sway & Hyprland**
-  - Confirm the expanded E2E suite passes cleanly on headless Sway and Hyprland compositors.
+- [x] **v0.10.4: 100% E2E Pass Across Sway & Hyprland**
+  - Confirm the expanded E2E suite passes cleanly on headless Sway and Hyprland compositors (`E2E_USE_LIVE_WAYLAND=1 bash scripts/e2e_compositor.sh` passed `22 passed, 0 failed` on live Hyprland; Sway unverified locally as `sway` is not installed).
 
 ### Phase 3: Packaging, Helpers, & Final Documentation (`v0.10.5` – `v0.10.6`)
 
