@@ -30,7 +30,7 @@ Engineered with strict zero-loss integrity and defence-in-depth resource control
 ## Features
 
 - **Unified Daemon**: Single-process architecture managing clipboard monitoring, IPC serving, and disk persistence without external daemon orchestration.
-- **Hybrid Storage**: Fast, searchable SQLite metadata with whole-payload SHA3 deduplication; large binaries live in a content-addressed cache directory bounded by a 512 MiB LRU quota.
+- **Hybrid Storage**: Fast, searchable SQLite metadata with whole-payload SHA3 deduplication; images and GIF-like payloads live in a content-addressed cache directory bounded by a 512 MiB LRU quota.
 - **Pristine by Default**: Copied images are stored byte for byte. Metadata-stripping image sanitisation is an explicit opt-in (`[image] sanitize = true`) and requires ImageMagick only then.
 - **Script-First CLI**: Deterministic command interface with immutable entry IDs and strict argument parsing for shell pipeline integration (`fzf`, `rofi`).
 - **Zero-Loss Integrity**: Pinned entries are strictly immune to history rotation and cache eviction; schema migrations are additive and idempotent.
@@ -140,7 +140,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 bash scripts/check.sh
 
 # Live compositor matrix (cage, sway or Hyprland + wl-clipboard + ImageMagick);
-# prints [SKIP] and exits 0 when no compositor is installed at all
+# prints [SKIP] and exits 0 when the compositor or a required tool is missing
 bash scripts/e2e_compositor.sh
 
 # Reuse the compositor you are already running instead of starting one,
@@ -157,7 +157,7 @@ E2E_USE_LIVE_WAYLAND=1 bash scripts/e2e_compositor.sh
 
 `y4p` works out of the box with sensible defaults and zero mandatory configuration.
 
-To customise behaviour — history limits, MIME filtering, or opt-in image sanitisation — place a `y4p.toml` file at `$XDG_CONFIG_HOME/y4p/y4p.toml` (defaulting to `~/.config/y4p/y4p.toml`).
+To customise behaviour — history limits, MIME filtering, or opt-in image sanitisation — place a `y4p.toml` file at `$XDG_CONFIG_HOME/y4p/y4p.toml` (defaulting to `~/.config/y4p/y4p.toml`, and to `./y4p/y4p.toml` only when `HOME` is unset too).
 
 A documented reference template is provided in [`y4p.toml.example`](y4p.toml.example):
 
