@@ -2,7 +2,8 @@
 #
 # y4p loads configuration on startup from:
 #   $XDG_CONFIG_HOME/y4p/y4p.toml
-#   (falls back to ~/.config/y4p/y4p.toml if XDG_CONFIG_HOME is unset)
+#   (falls back to ~/.config/y4p/y4p.toml if XDG_CONFIG_HOME is unset,
+#    and to ./y4p/y4p.toml if HOME is unset too)
 #
 # If the configuration file is missing or contains syntax errors, y4p
 # falls back safely to built-in defaults without crashing or refusing to start.

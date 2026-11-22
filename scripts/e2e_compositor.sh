@@ -440,11 +440,11 @@ else
 fi
 
 # --- 16. Case 10: pin and daemon restart persistence -----------------------
-# A payload well above the inline threshold lives in its own <hash>.cache file
-# (direct ingestion, no spool) and is streamed back out with sendfile(2). It is
-# pinned, then the daemon is stopped and started again: the row, its pin marker
-# and the cache file must all still be there, and copy-to must restore the
-# exact bytes.
+# A PNG payload is cache-backed by MIME rather than by size: it lives in its
+# own <hash>.cache file (direct ingestion, no spool) and is streamed back out
+# with sendfile(2). It is pinned, then the daemon is stopped and started
+# again: the row, its pin marker and the cache file must all still be there,
+# and copy-to must restore the exact bytes.
 generated "$WORK/case10.png" -size 320x320 plasma:fractal
 before_pin=$(entry_count)
 if copy_file image/png "$WORK/case10.png" && wait_for_entries_at_least $((before_pin + 1)); then

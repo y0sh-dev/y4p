@@ -20,8 +20,8 @@
 
 ## 3. Architecture & Workspace Topology
 - Inward-only layered dependency: `core` <- `storage` / `image` / `wayland` <- `daemon` / `cli`.
-- Persisted payloads: Hybrid storage (SQLite v4 metadata + SHA3-256 FastCDC chunked cache).
-- Kernel egress: Zero-copy pipe streaming via `splice(2)` / `vmsplice(2)` / `sendfile(2)`.
+- Persisted payloads: Hybrid storage (SQLite v4 metadata with SHA3-256 whole-payload deduplication; payloads are inline or in `<hash>.cache`, with no new chunk writes).
+- Kernel egress: Zero-copy `sendfile(2)` for cache-backed payloads; userspace writes for in-memory payloads.
 
 ## 4. Key Verification Commands
 - **Primary Check**: `bash scripts/check.sh` (Standard gate: tests + strict linter).
