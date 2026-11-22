@@ -14,7 +14,7 @@ pub fn run(args: &[String]) -> Option<bool> {
     let ctx = ArgContext::parse(args);
 
     // Strict validation: 'daemon' permits only --verbose/-v and zero positional arguments
-    if !ctx.unknown_flags.is_empty() || ctx.raw || ctx.full || ctx.force {
+    if !ctx.unknown_flags.is_empty() || ctx.raw || ctx.full || ctx.force || ctx.use_id {
         eprintln!("{}command 'daemon' does not support specified options.", LOG_ERROR);
         return None;
     }
@@ -36,4 +36,25 @@ pub fn run(args: &[String]) -> Option<bool> {
     }
 
     Some(ctx.verbose)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        let mut all = vec!["y4p".to_owned(), "daemon".to_owned()];
+        all.extend(rest.iter().map(|s| (*s).to_owned()));
+        all
+    }
+
+    #[test]
+    fn id_is_refused_and_verbose_is_the_only_accepted_flag() {
+        assert_eq!(run(&args(&["--id"])), None);
+        assert_eq!(run(&args(&["-i"])), None);
+        assert_eq!(run(&args(&[])), Some(false));
+        assert_eq!(run(&args(&["--verbose"])), Some(true));
+        assert_eq!(run(&args(&["-v"])), Some(true));
+    }
 }

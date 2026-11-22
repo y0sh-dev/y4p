@@ -429,7 +429,7 @@ impl SqliteStore {
 
     /// Returns whether a row was deleted plus its hash (if it had one), so
     /// the facade can clean up the matching cache file regardless of which
-    /// bit fired — mirrors the pre-split behavior exactly.
+    /// bit fired — mirrors the pre-split behaviour exactly.
     pub fn delete_by_id(&mut self, id: i64) -> Result<(bool, Option<String>)> {
         let tx = self.conn.transaction()?;
         let (hash, chunked): (Option<String>, bool) = tx.query_row(

@@ -79,7 +79,7 @@ fn dir_usage(dir: &Path) -> Option<DirUsage> {
     Some(usage)
 }
 
-/// Th size of a regular file, or `None` when it is absent or not one.
+/// The size of a regular file, or `None` when it is absent or not one.
 fn file_size(path: &Path) -> Option<u64> {
     let metadata = std::fs::metadata(path).ok()?;
     metadata.is_file().then_some(metadata.len())
