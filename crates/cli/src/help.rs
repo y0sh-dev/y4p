@@ -84,10 +84,16 @@ pub fn print_help() {
     println!("    unpin <target>     - Clear a record's pinned protection.");
     println!("                         Flags: --id (-i).");
 
+    println!("\nUTILITY COMMANDS:");
+    println!("    help               - Display this help information.");
+    println!("    version            - Display version information.");
+
     println!("\nGLOBAL OPTIONS:");
     println!("    -h, --help         - Show this help information.");
     println!("    -V, --version      - Show version information.");
-    println!("    -v, --verbose      - Enable detailed system and transfer logging.");
+
+    println!("\nVERBOSE LOGGING:");
+    println!("    -v, --verbose      - Detailed logging; accepted by daemon, copy-to and store.");
 
 
     println!("\nPRACTICAL EXAMPLES:");
@@ -105,7 +111,7 @@ pub fn print_help() {
     println!("    $ y4p pin 3 && y4p unpin --id 118");
 
     println!("\nTECHNICAL NOTES:");
-    println!("    - Storage: Secured at ~/.local/share/y4p/ (mode 600).");
+    println!("    - Storage: Secured at ~/.local/share/y4p/ (directory 0700, database 0600).");
     // BUGFIX: was documented as a fixed "/tmp/y4p.<uid>.sock" path;
     // the socket now prefers $XDG_RUNTIME_DIR (see core::get_socket_path)
     // and only falls back to /tmp when no session runtime dir is set.

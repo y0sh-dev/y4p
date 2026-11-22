@@ -9,12 +9,19 @@ use crate::core::payload::PayloadError;
 use crate::utils::ArgContext;
 use std::io::{self, Read, Write};
 
+/// Whether `ctx` carries any flag `store` does not support. Only `--verbose`/`-v`
+/// is meaningful here; `--id` in particular is refused rather than silently
+/// accepted, because `store` has no existing entry to address.
+fn has_unsupported_flag(ctx: &ArgContext) -> bool {
+    !ctx.unknown_flags.is_empty() || ctx.raw || ctx.full || ctx.force || ctx.use_id
+}
+
 /// Ingest data from stdin, persist to database, and synchronise to system clipboard.
 pub fn run(args: &[String], db: &mut ClipboardDb) {
     let ctx = ArgContext::parse(args);
 
     // Strict validation: 'store' only permits --verbose/-v
-    if !ctx.unknown_flags.is_empty() || ctx.raw || ctx.full || ctx.force {
+    if has_unsupported_flag(&ctx) {
         eprintln!("{}command 'store' does not support specified options.", LOG_ERROR);
         return;
     }
@@ -102,6 +109,28 @@ fn read_payload<R: Read>(reader: R, limit: u64) -> Result<Vec<u8>, PayloadError>
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        let mut all = vec!["y4p".to_owned(), "store".to_owned()];
+        all.extend(rest.iter().map(|s| (*s).to_owned()));
+        all
+    }
+
+    #[test]
+    fn only_verbose_is_accepted_and_id_is_refused_like_the_other_flags() {
+        for rest in [["--id"], ["-i"], ["--raw"], ["-A"], ["--force"], ["--nope"]] {
+            assert!(
+                has_unsupported_flag(&ArgContext::parse(&args(&rest))),
+                "{rest:?} must be refused by store"
+            );
+        }
+        for rest in [["--verbose"], ["-v"]] {
+            assert!(
+                !has_unsupported_flag(&ArgContext::parse(&args(&rest))),
+                "{rest:?} must be accepted by store"
+            );
+        }
+    }
 
     #[test]
     fn a_payload_within_the_limit_is_read_whole() {

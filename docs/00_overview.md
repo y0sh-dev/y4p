@@ -69,6 +69,7 @@ y4p/
 │   ├── systemd/        `y4p.service`, the user unit bundled with the project
 │   ├── packaging/      `PKGBUILD`, the Arch Linux package recipe
 │   └── examples/       `y4p-fzf.sh`, a minimal fzf history picker
+├── completions/        `_y4p`, the Zsh completion definition
 └── scripts/
     ├── check.sh        workspace-wide tests + strict clippy
     └── e2e_compositor.sh   live compositor matrix (headless, or the current session with `E2E_USE_LIVE_WAYLAND=1`)
@@ -83,10 +84,10 @@ y4p/
 | `y4p-image` | Untrusted-image handling: routing, sandboxed `magick` runs, breaker, throttle | core | `libc` | 157 |
 | `y4p-wayland` | Compositor I/O: offers, MIME candidates, bounded reads, normalisation, egress; ingestion backpressure (reader gate, bounded queue) | core | `wayland-client`, `wayland-protocols`, `libc` | 101 |
 | `y4p-daemon` | Process lifecycle: poll loop (with compositor-disconnect handling), IPC, `DbWorker` (optional image route + hash + write) | core, storage, wayland, image | `wayland-client`, `libc`, `sha3` | 39 |
-| `y4p-cli` | Argument parsing, validation, output formatting, `stats` and `doctor` reports; returns `CliAction` to the root | core, storage | `unicode-width` | 24 |
+| `y4p-cli` | Argument parsing, validation, output formatting, `stats` and `doctor` reports; returns `CliAction` to the root | core, storage | `unicode-width` | 26 |
 | `y4p` (root) | Wiring only | all of the above | `libc`, `ctrlc` | 0 |
 
-Total: **547** tests across the six crates, plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. The root has no tests of its own. Nothing in the test suite talks to a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), ingestion through real pipes and a real database, and the live matrix is a separate script (`scripts/e2e_compositor.sh`) that starts a headless compositor, reuses the current session with `E2E_USE_LIVE_WAYLAND=1`, or prints `[SKIP]` and exits 0 when no compositor is installed.
+Total: **549** tests across the six crates, plus the benchmark harness in smoke mode, all run by `bash scripts/check.sh`. The root has no tests of its own. Nothing in the test suite talks to a live compositor: the daemon's event loop is covered through real socket pairs (`read_compositor_events`), ingestion through real pipes and a real database, and the live matrix is a separate script (`scripts/e2e_compositor.sh`) that starts a headless compositor, reuses the current session with `E2E_USE_LIVE_WAYLAND=1`, or prints `[SKIP]` and exits 0 when the compositor, wl-clipboard or ImageMagick is missing.
 
 ### 2.2 Dependency direction
 
@@ -124,7 +125,7 @@ These are the properties the rest of the documentation assumes. They are deliber
 | 2 | **Schema backwards compatibility.** New rows are stored inline (`clipboard.content`, `is_chunked = 0`) or in `<hash>.cache`; nothing writes `chunks` / `manifest` or sets `is_chunked = 1`. Legacy v4 chunked rows stay readable, searchable, rotatable, deletable and wipable. | [02](02_hybrid_storage_and_pin.md) sections 1, 2 and 6 |
 | 3 | **Panic-free resident layers.** `daemon`, `wayland`, `storage` (and `image`, `core`) build with `clippy::unwrap_used` / `expect_used` / `panic` denied; `panic = "abort"` in the release profile makes an unwrap a whole-process abort, so there are none. Only `#[cfg(test)]` code and the CLI's exit-on-error paths carve out an exception. | `[workspace.lints.clippy]` in the root manifest, `bash scripts/check.sh` |
 | 4 | **Bounded ingestion and cache.** At most `INGEST_MAX_CONCURRENT_READERS` readers, at most `INGEST_QUEUE_CAPACITY` queued jobs, no payload above `MAX_PAYLOAD_BYTES` (32 MiB), and no cache directory above `CACHE_QUOTA_BYTES` (512 MiB) once evictable rows exist. Overload is shed, counted and reported, never absorbed. | [01](01_wayland_streaming_io.md) section 2, [03](03_concurrency_and_memory.md) section 2, [02](02_hybrid_storage_and_pin.md) section 8 |
-| 5 | **One writer, serialised over IPC.** All writes, ingress jobs and IPC `delete` / `wipe` alike, run on the single `DbWorker` connection (`Arc<Mutex<ClipboardDb>>`), so SQLite never sees two writers and `wipe` releases memory in the process that holds it. | [03](03_concurrency_and_memory.md) sections 1, 2.2 and 3 |
+| 5 | **One writer inside the daemon, serialised over IPC.** Daemon-side writes — ingress jobs and IPC `delete` / `wipe` alike — run on the single `DbWorker` connection (`Arc<Mutex<ClipboardDb>>`), so the daemon never has two writers and `wipe` releases memory in the process that holds it. Short-lived CLI commands that mutate the store (`pin`, `unpin`, `store`, and the MRU bump in `copy-to`) use their own handle; WAL plus `SQLITE_TIMEOUT_MS` serialises those cross-process writers. | [03](03_concurrency_and_memory.md) sections 1, 2.2 and 3 |
 
 ---
 

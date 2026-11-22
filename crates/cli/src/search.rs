@@ -13,7 +13,8 @@ use super::list::{self, IndexItem};
 pub fn run(args: &[String], db: &ClipboardDb) {
     let ctx = ArgContext::parse(args);
 
-    // Strict validation: 'search' only supports --raw/-R and --verbose/-v
+    // Strict validation: 'search' supports --raw/-R and --id/-i; --full and
+    // --force are refused.
     if !ctx.unknown_flags.is_empty() || ctx.full || ctx.force {
         eprintln!("{}command 'search' does not support specified options.", LOG_ERROR);
         return;

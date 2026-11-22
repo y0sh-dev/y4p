@@ -17,14 +17,14 @@ So every record carries two coordinates:
 | MRU position | rank in `ORDER BY timestamp DESC` | default | **No** |
 | Stable ID | SQLite `id` (`AUTOINCREMENT`, immutable) | `--id` / `-i` | **Yes** |
 
-The two are computed so they always agree with each other. `fetch_metadata` (plain `list`) derives a row's position from its rank in `ORDER BY timestamp DESC`. `search_metadata` derives the identical number for a search hit with a per-row correlated count ([`crates/storage/src/db.rs:L186`](../crates/storage/src/db.rs)):
+The two are computed so they always agree with each other. `fetch_metadata` (plain `list`) derives a row's position from its rank in `ORDER BY timestamp DESC`. `search_metadata` derives the identical number for a search hit with a per-row correlated count ([`crates/storage/src/db.rs:L307`](../crates/storage/src/db.rs)):
 
 ```sql
 SELECT (SELECT COUNT(*) FROM clipboard c2 WHERE c2.timestamp > c1.timestamp) AS abs_idx,
        id, timestamp, mime, size, preview, is_pinned
 FROM clipboard c1
 WHERE {TEXT_MIME_SQL_PREDICATE}              -- shared constant, see 02
-  AND (preview LIKE ?1 OR content LIKE ?1)   -- one clause per keyword, joined with AND
+  AND (preview LIKE ?1 OR {BODY_TEXT_SQL} LIKE ?1)   -- one clause per keyword, joined with AND
 ORDER BY timestamp DESC LIMIT ?N
 ```
 
